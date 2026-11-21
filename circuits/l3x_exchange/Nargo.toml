@@ -1,0 +1,8 @@
+[package]
+name = "l3x_exchange"
+type = "lib"
+authors = [""]
+
+[dependencies]
+l3x_types = { path = "../l3x_types" }
+schnorr = { git = "https://github.com/noir-lang/schnorr", tag = "v0.4.0" }

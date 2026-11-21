@@ -13,7 +13,6 @@ import {
   SHAPE,
   TARGET,
   bytesToFields,
-  daAbsorb,
   daFinalize,
   daHash,
   daIv,
@@ -27,7 +26,6 @@ import {
   run,
   stateRoot,
   timed,
-  trees,
   vkPath,
   vkTree,
 } from './lib.ts';
@@ -51,6 +49,8 @@ export type Running = {
   daLen: number;
   withdrawals: bigint;
   withdrawalsCount: number;
+  withdrawalsAmount: bigint;
+  batch: bigint;
   time: bigint;
 };
 
@@ -69,6 +69,8 @@ export function runningFields(r: Running): bigint[] {
     BigInt(r.daLen),
     r.withdrawals,
     BigInt(r.withdrawalsCount),
+    r.withdrawalsAmount,
+    r.batch,
     r.time,
   ];
 }
@@ -86,6 +88,8 @@ export const runningToNoir = (r: Running) => ({
   da_len: r.daLen,
   withdrawals: hex(r.withdrawals),
   withdrawals_count: r.withdrawalsCount,
+  withdrawals_amount: r.withdrawalsAmount.toString(),
+  batch: r.batch.toString(),
   time: r.time.toString(),
 });
 
@@ -104,6 +108,8 @@ const runningFromNoir = (o: any): Running => ({
   daLen: Number(BigInt(o.da_len)),
   withdrawals: BigInt(o.withdrawals),
   withdrawalsCount: Number(BigInt(o.withdrawals_count)),
+  withdrawalsAmount: BigInt(o.withdrawals_amount),
+  batch: BigInt(o.batch),
   time: BigInt(o.time),
 });
 
@@ -114,11 +120,26 @@ const nodeFromNoir = (o: any): NodeOutput => ({
 });
 
 /** Running values at the start of a batch: the chain tip, with per-batch accumulators empty. */
-export function batchStart(state: bigint, priorityHead: bigint, priorityCursor: bigint, time: bigint): Running {
-  return { state, actionLog: 0n, priorityHead, priorityCursor, da: daIv(), daLen: 0, withdrawals: 0n, withdrawalsCount: 0, time };
+export function batchStart(state: bigint, priorityHead: bigint, priorityCursor: bigint, time: bigint, batch: bigint): Running {
+  return {
+    state,
+    actionLog: 0n,
+    priorityHead,
+    priorityCursor,
+    da: daIv(),
+    daLen: 0,
+    withdrawals: 0n,
+    withdrawalsCount: 0,
+    withdrawalsAmount: 0n,
+    batch,
+    time,
+  };
 }
 
-const padTo = (xs: bigint[], n: number) => [...xs, ...Array<bigint>(n - xs.length).fill(0n)].map(hex);
+export const copyRunning = (r: Running): Running => ({ ...r, da: [...r.da] });
+
+export const padTo = (xs: bigint[], n: number) => [...xs, ...Array<bigint>(n - xs.length).fill(0n)].map(hex);
+const MAX_WD_BATCH = 16;
 
 export function ultraGates(pkg: string, target: string): number {
   const out = run(BB, ['gates', '-b', join(TARGET, `${pkg}.json`), '-t', target]);
@@ -146,16 +167,20 @@ export class Prover {
   readonly api: Barretenberg;
   readonly manifest: any;
   private layers: bigint[][] = [];
+  private params = 0n;
 
   private constructor(api: Barretenberg, manifest: any) {
     this.api = api;
     this.manifest = manifest;
   }
 
-  static async create(api: Barretenberg, manifest: any): Promise<Prover> {
+  /** `paramsHash` is the deployment's exchange parameters (default: the manifest's). */
+  static async create(api: Barretenberg, manifest: any, paramsHash?: bigint): Promise<Prover> {
     const p = new Prover(api, manifest);
+    p.params = paramsHash ?? BigInt(manifest.paramsHash);
     p.layers = await vkTree(api, manifest.vkTree.leaves.map((x: string) => BigInt(x)));
     assert(p.layers[p.layers.length - 1][0] === BigInt(manifest.vkTree.root), 'VK tree root != manifest');
+    p.configHashValue = await l3xHash(api, [DS.CONFIG, p.vkTreeRoot, p.params]);
     return p;
   }
 
@@ -163,10 +188,11 @@ export class Prover {
     return BigInt(this.manifest.vkTree.root);
   }
   get paramsHash(): bigint {
-    return BigInt(this.manifest.paramsHash);
+    return this.params;
   }
+  configHashValue = 0n;
   get configHash(): bigint {
-    return BigInt(this.manifest.configHash);
+    return this.configHashValue;
   }
 
   membership(pkg: string) {
@@ -280,8 +306,8 @@ export class Prover {
     return { aggOut, chonkVk, chonkProof: fields.slice(2), ms, sizes };
   }
 
-  /** P-segment leaf. P0 effect: the accounts root absorbs the actions hash. */
-  async tube(start: Running, accountsRoot: bigint, otherRoot: bigint, count: number = SHAPE.MAX_CLIENT_PROOFS, log = console.log) {
+  /** P-segment leaf. P1 executes no client-proof actions; the tube only logs the aggregation. */
+  async tube(start: Running, count: number = SHAPE.MAX_CLIENT_PROOFS, log = console.log) {
     const seg = await this.chonkSegment(count, log);
     const node = await this.proveNode('tube', {
       chonk_vk: seg.chonkVk.map(hex),
@@ -289,45 +315,9 @@ export class Prover {
       agg: seg.aggOut,
       config_hash: hex(this.configHash),
       start: runningToNoir(start),
-      accounts_root: hex(accountsRoot),
-      other_root: hex(otherRoot),
     });
-    const accountsOut = await l3xHash(this.api, [DS.ACCOUNTS, accountsRoot, BigInt(seg.aggOut.actions_hash)]);
-    assert(node.out.end.state === (await trees(this.api, accountsOut, otherRoot)), 'tube end state mismatch');
     log(`  tube: ${node.ms.toFixed(0)} ms`);
-    return { node, accountsRoot: accountsOut, chonk: seg };
-  }
-
-  /** X-segment leaf carrying one L3 block. P0 effect: each consumed entry is absorbed into the accounts root. */
-  async xSegment(
-    start: Running,
-    accountsRoot: bigint,
-    otherRoot: bigint,
-    blockTime: bigint,
-    entries: bigint[],
-    daFields: bigint[],
-    configHash = this.configHash,
-  ) {
-    assert(entries.length <= SHAPE.MAX_PRIORITY, 'too many priority entries for one X-segment');
-    assert(daFields.length <= SHAPE.X_DA_MAX, 'too many DA fields for one X-segment');
-    const node = await this.proveNode('x_segment', {
-      config_hash: hex(configHash),
-      start: runningToNoir(start),
-      accounts_root: hex(accountsRoot),
-      other_root: hex(otherRoot),
-      block_time: blockTime.toString(),
-      priority_n: entries.length,
-      priority_entries: padTo(entries, SHAPE.MAX_PRIORITY),
-      da_n: daFields.length,
-      da_fields: padTo(daFields, SHAPE.X_DA_MAX),
-    });
-    let accounts = accountsRoot;
-    for (const e of entries) accounts = await l3xHash(this.api, [DS.ACCOUNTS, accounts, e]);
-    let [da, len] = [start.da, start.daLen];
-    for (const x of daFields) [da, len] = await daAbsorb(this.api, da, len, x);
-    assert(node.out.end.daLen === len && node.out.end.da.every((x, i) => x === da[i]), 'x_segment DA sponge mismatch');
-    assert(node.out.end.state === (await trees(this.api, accounts, otherRoot)), 'x_segment end state mismatch');
-    return { node, accountsRoot: accounts };
+    return { node, chonk: seg };
   }
 
   padding(at: Running, configHash = this.configHash): Promise<ProvedNode> {
@@ -350,16 +340,16 @@ export class Prover {
   rootInputs(
     left: ProvedNode,
     right: ProvedNode,
-    endAccounts: bigint,
-    endOther: bigint,
+    endState: unknown,
+    withdrawalRecords: bigint[],
     batchNumber: bigint,
     lo: ChildOverrides = {},
     ro: ChildOverrides = {},
   ) {
     return {
       ...this.mergeInputs(left, right, lo, ro),
-      end_accounts_root: hex(endAccounts),
-      end_other_root: hex(endOther),
+      end_state: endState,
+      withdrawal_records: padTo(withdrawalRecords, MAX_WD_BATCH),
       batch_number: batchNumber.toString(),
     };
   }
@@ -375,18 +365,20 @@ export class Prover {
   }
 }
 
-export type SegmentSpec =
-  | { kind: 'p'; count?: number }
-  | { kind: 'x'; blockTime: bigint; entries?: bigint[]; daFields?: bigint[] };
+/** A segment as the engine built it: the circuit, its inputs, and the transition it must prove. */
+export type SegmentWitness = { pkg: string; label: string; inputs: Record<string, unknown>; expectedEnd: Running };
 
-export type BatchSpec = {
+export type BatchWitness = {
   batchNumber: bigint;
-  /** Chain tip at the start of the batch (see batchStart). */
   start: Running;
-  /** Opening of start.state. */
-  accountsRoot: bigint;
-  otherRoot: bigint;
-  segments: SegmentSpec[];
+  segments: SegmentWitness[];
+  /** The state at the end of the batch, as Noir input, and the header values it determines. */
+  endState: unknown;
+  endAccountsRoot: bigint;
+  marketDataHash: bigint;
+  withdrawalRecords: bigint[];
+  withdrawalsRoot: bigint;
+  daPayload: bigint[];
 };
 
 export type ProvedBatch = {
@@ -396,44 +388,31 @@ export type ProvedBatch = {
   rootVk: bigint[];
   daPayload: bigint[];
   end: Running;
-  accountsRoot: bigint;
-  otherRoot: bigint;
   shape: string;
   ms: Record<string, number>;
-  sizes: Record<string, number>;
 };
 
-/** Proves a batch: leaves in order, then merges of adjacent nodes until two remain, then the root. */
-export async function proveBatch(prover: Prover, spec: BatchSpec, log = console.log): Promise<ProvedBatch> {
+/**
+ * Proves a batch: every segment (checking the circuit's output against the engine's expected
+ * transition, the engine/circuit differential check), merges of adjacent nodes until two remain
+ * (padding a single segment), then the root.
+ */
+export async function proveBatch(prover: Prover, w: BatchWitness, log = console.log): Promise<ProvedBatch> {
   const api = prover.api;
   const ms: Record<string, number> = {};
-  const sizes: Record<string, number> = {};
-  let running = spec.start;
-  let accounts = spec.accountsRoot;
-  const other = spec.otherRoot;
   const leaves: ProvedNode[] = [];
   const names: string[] = [];
-  const daPayload: bigint[] = [];
-
-  for (const [i, seg] of spec.segments.entries()) {
-    if (seg.kind === 'p') {
-      const r = await prover.tube(running, accounts, other, seg.count, log);
-      accounts = r.accountsRoot;
-      leaves.push(r.node);
-      ms.chonk_prove = (ms.chonk_prove ?? 0) + r.chonk.ms.chonk_prove;
-      ms.client_proof_mean = r.chonk.ms.client_proof_mean;
-      Object.assign(sizes, r.chonk.sizes);
-      names.push('tube');
-    } else {
-      const r = await prover.xSegment(running, accounts, other, seg.blockTime, seg.entries ?? [], seg.daFields ?? []);
-      accounts = r.accountsRoot;
-      leaves.push(r.node);
-      daPayload.push(...(seg.daFields ?? []));
-      names.push('x');
-      log(`  x_segment ${i}: ${r.node.ms.toFixed(0)} ms (${seg.entries?.length ?? 0} priority entries, ${seg.daFields?.length ?? 0} DA fields)`);
-    }
-    const node = leaves[leaves.length - 1];
-    ms[`${node.pkg}_${i}`] = node.ms;
+  let running = w.start;
+  for (const [i, seg] of w.segments.entries()) {
+    const node = await prover.proveNode(seg.pkg, seg.inputs);
+    const got = nodeFields(node.out);
+    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd });
+    const bad = got.findIndex((x, j) => x !== want[j]);
+    assert(bad < 0, `${seg.label}: circuit output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
+    ms[`${seg.pkg}_${i}`] = node.ms;
+    log(`  ${seg.label}: ${node.ms.toFixed(0)} ms`);
+    leaves.push(node);
+    names.push(seg.pkg.replace('seg_', ''));
     running = node.out.end;
   }
 
@@ -453,7 +432,6 @@ export async function proveBatch(prover: Prover, spec: BatchSpec, log = console.
       if (i + 1 < level.length) {
         const m = await prover.merge(level[i], level[i + 1]);
         ms[`merge_${merges++}`] = m.ms;
-        log(`  merge: ${m.ms.toFixed(0)} ms`);
         next.push(m);
         nextShape.push(`merge(${shape[i]}, ${shape[i + 1]})`);
       } else {
@@ -464,20 +442,21 @@ export async function proveBatch(prover: Prover, spec: BatchSpec, log = console.
     level = next;
     shape = nextShape;
   }
+  if (merges) log(`  ${merges} merge(s): ${Object.entries(ms).filter(([k]) => k.startsWith('merge')).map(([, v]) => v.toFixed(0)).join(', ')} ms`);
 
-  const root = await prover.proveRoot(prover.rootInputs(level[0], level[1], accounts, other, spec.batchNumber));
+  const root = await prover.proveRoot(prover.rootInputs(level[0], level[1], w.endState, w.withdrawalRecords, w.batchNumber));
   assert(root.verified, 'root proof does not verify');
   ms.root_prove = root.ms;
   log(`  root: ${root.ms.toFixed(0)} ms`);
 
   // Rebuild the header in TS; it must hash to the root's public input.
-  const s = spec.start;
+  const s = leaves[0].out.start;
   const e = level[1].out.end;
-  const n = spec.batchNumber;
+  const n = w.batchNumber;
   const header = [
     await stateRoot(api, s.state, s.priorityCursor, n - 1n, s.time),
     await stateRoot(api, e.state, e.priorityCursor, n, e.time),
-    accounts,
+    w.endAccountsRoot,
     n,
     s.time,
     e.time,
@@ -485,29 +464,27 @@ export async function proveBatch(prover: Prover, spec: BatchSpec, log = console.
     e.priorityCursor,
     s.priorityHead,
     e.priorityHead,
-    e.withdrawals,
+    w.withdrawalsRoot,
     BigInt(e.withdrawalsCount),
+    e.withdrawalsAmount,
     e.actionLog,
     await daFinalize(api, e.da, e.daLen),
-    0n,
+    w.marketDataHash,
     prover.configHash,
   ];
   const headerHash = await l3xHash(api, [DS.HEADER, ...header]);
   assert(headerHash === root.headerHash, 'TS header hash != root circuit output');
   assert(headerHash === root.publicInputs[0], 'TS header hash != root proof public input');
-  assert((await daHash(api, daPayload)) === header[13], 'flat DA hash != segment sponge');
+  assert((await daHash(api, w.daPayload)) === header[14], 'flat DA hash != segment sponge');
 
   return {
     header,
     headerHash,
     rootProof: root.proof,
     rootVk: readVkJson('root').vk.map((x) => BigInt(x)),
-    daPayload,
+    daPayload: w.daPayload,
     end: e,
-    accountsRoot: accounts,
-    otherRoot: other,
     shape: `root(${shape[0]}, ${shape[1]})`,
     ms,
-    sizes,
   };
 }

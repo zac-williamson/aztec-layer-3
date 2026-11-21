@@ -3,12 +3,12 @@
 // (VK tree membership, roles, chaining, configuration) but not recursion constraints, so a forged
 // VK hash is caught by barretenberg, as a proving error or a proof that does not verify.
 //   A. rogue_app (verifies nothing, returns any output) in the IVC app slot, under init_kernel.
-//   B. rogue_segment (claims any transition) as a root child, borrowing x_segment's VK tree slot.
-//   C. rogue_segment as a root child with its VK hash replaced by x_segment's.
+//   B. rogue_segment (claims any transition) as a root child, borrowing seg_block's VK tree slot.
+//   C. rogue_segment as a root child with its VK hash replaced by seg_block's.
 //   D. rogue_segment listed in the VK tree, but in the client subtree.
-//   E. rogue_segment as a merge child, borrowing x_segment's slot.
+//   E. rogue_segment as a merge child, borrowing seg_block's slot.
 //   F. two valid segments that do not chain.
-//   G. a valid segment proved under another configuration.
+//   G. a valid segment proved under other exchange parameters.
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { AztecClientBackend } from '@aztec-foundation/bb.js';
@@ -21,13 +21,15 @@ import {
   hex,
   randomField,
   readCircuit,
-  trees,
   readJson,
   readVkBinary,
   readVkJson,
   vkPath,
   vkTree,
 } from './lib.ts';
+import { Engine } from './p1/engine.ts';
+import * as M from './p1/model.ts';
+import { genesisState, testParams } from './p1/params.ts';
 import { type NodeOutput, type Running, Prover, batchStart, newApi, nodeToNoir } from './pipeline.ts';
 
 const CircuitKind = { App: 0, Kernel: 1, HidingKernel: 2 } as const;
@@ -58,10 +60,12 @@ async function expectRejected(test: string, attempt: () => Promise<boolean>, exp
 async function main() {
   const manifest = readJson(join(OUT, 'manifest.json'));
   const api = await newApi();
-  const prover = await Prover.create(api, manifest);
+  const h = M.hasher(api);
+  const { params } = await testParams(h);
+  const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
   const config = prover.configHash;
   const results: Outcome[] = [];
-  const genesis = batchStart(BigInt(manifest.genesisTrees), 0n, 0n, 0n);
+  const genesis = batchStart(BigInt(manifest.genesisTrees), 0n, 0n, 0n, 1n);
   const now = BigInt(Math.floor(Date.now() / 1000));
 
   // A. Rogue app in the IVC. The rogue output claims 10 actions that were never authorized.
@@ -87,29 +91,28 @@ async function main() {
   );
 
   // A rogue segment claiming a transition from genesis to accounts of the attacker's choosing.
-  const forgedAccounts = randomField();
-  const forgedEnd: Running = { ...genesis, state: await trees(api, forgedAccounts, 0n), time: now };
+  const g = await genesisState(api);
+  const forgedState: M.State = { ...g.state, accountsRoot: randomField() };
+  const forgedEnd: Running = { ...genesis, state: await M.treesOf(h, forgedState), time: now };
+  const forgedOpening = M.stateToNoir(forgedState);
   const rogueOut = (configHash: bigint): NodeOutput => ({ configHash, start: genesis, end: forgedEnd });
   const rogue = await prover.proveNode('rogue_segment', { out: nodeToNoir(rogueOut(config)) });
   const pad = await prover.padding(forgedEnd);
-  const borrowed = prover.membership('x_segment');
+  const borrowed = prover.membership('seg_block');
 
   results.push(
     await expectRejected(
       'B: rogue segment in a borrowed VK tree slot (root)',
-      async () => {
-        const inputs = prover.rootInputs(rogue, pad, forgedAccounts, 0n, 1n, { membership: borrowed });
-        return (await prover.proveRoot(inputs)).verified;
-      },
+      async () => (await prover.proveRoot(prover.rootInputs(rogue, pad, forgedOpening, [], 1n, { membership: borrowed }))).verified,
       'child VK not in VK tree',
     ),
   );
 
   results.push(
     await expectRejected('C: rogue segment with a forged VK hash (root)', async () => {
-      const inputs = prover.rootInputs(rogue, pad, forgedAccounts, 0n, 1n, {
+      const inputs = prover.rootInputs(rogue, pad, forgedOpening, [], 1n, {
         membership: borrowed,
-        vk_hash: manifest.vkHashByPkg.x_segment,
+        vk_hash: manifest.vkHashByPkg.seg_block,
       });
       return (await prover.proveRoot(inputs)).verified;
     }),
@@ -129,7 +132,7 @@ async function main() {
         const p = await prover.padding(forgedEnd, altConfig);
         const padSlot = manifest.vkTree.slots.padding;
         const inputs = {
-          ...prover.rootInputs(r, p, forgedAccounts, 0n, 1n, { membership: { index: slot, path: vkPath(layers, slot).map(hex) } }, {
+          ...prover.rootInputs(r, p, forgedOpening, [], 1n, { membership: { index: slot, path: vkPath(layers, slot).map(hex) } }, {
             membership: { index: padSlot, path: vkPath(layers, padSlot).map(hex) },
           }),
           vk_tree_root: hex(altRoot),
@@ -144,21 +147,28 @@ async function main() {
     await expectRejected(
       'E: rogue segment in a borrowed VK tree slot (merge)',
       async () => {
-        const merge = readCircuit('merge');
-        await new Noir(merge as any).execute(prover.mergeInputs(rogue, pad, { membership: borrowed }) as any);
+        await new Noir(readCircuit('merge') as any).execute(prover.mergeInputs(rogue, pad, { membership: borrowed }) as any);
         return true;
       },
       'child VK not in VK tree',
     ),
   );
 
-  const x = await prover.xSegment(genesis, 0n, 0n, now, [], [1n, 2n, 3n]);
+  // An honest block segment from genesis, built by the engine.
+  const honest = async (p: M.Params) => {
+    const engine = await Engine.create(api, p, prover.vkTreeRoot);
+    await engine.beginBatch(1n, 0n, 0n, 0n);
+    await engine.block(now);
+    const w = await engine.endBatch();
+    return { node: await prover.proveNode('seg_block', w.segments[0].inputs), w };
+  };
+  const x = await honest(params);
   results.push(
     await expectRejected(
       'F: segments that do not chain (root)',
       async () => {
         const gap = await prover.padding({ ...x.node.out.end, time: x.node.out.end.time + 1n });
-        return (await prover.proveRoot(prover.rootInputs(x.node, gap, x.accountsRoot, 0n, 1n))).verified;
+        return (await prover.proveRoot(prover.rootInputs(x.node, gap, x.w.endState, [], 1n))).verified;
       },
       'children do not chain',
     ),
@@ -166,11 +176,11 @@ async function main() {
 
   results.push(
     await expectRejected(
-      'G: segment proved under another configuration (root)',
+      'G: segment proved under other parameters (root)',
       async () => {
-        const other = await prover.xSegment(genesis, 0n, 0n, now, [], [1n, 2n, 3n], config + 1n);
+        const other = await honest({ ...params, imrPpm: params.imrPpm + 1n });
         const p = await prover.padding(other.node.out.end);
-        return (await prover.proveRoot(prover.rootInputs(other.node, p, other.accountsRoot, 0n, 1n))).verified;
+        return (await prover.proveRoot(prover.rootInputs(other.node, p, other.w.endState, [], 1n))).verified;
       },
       'left child config mismatch',
     ),

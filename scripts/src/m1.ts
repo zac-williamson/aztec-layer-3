@@ -17,7 +17,7 @@ async function main() {
   const n = SHAPE.MAX_CLIENT_PROOFS;
 
   // Chonk path: client proofs, IVC, tube.
-  const tube = await prover.tube(batchStart(BigInt(manifest.genesisTrees), 0n, 0n, 0n), 0n, 0n, n);
+  const tube = await prover.tube(batchStart(BigInt(manifest.genesisTrees), 0n, 0n, 0n, 1n), n);
   const chonk = {
     agg_app_mega_gates: tube.chonk.sizes.agg_app_mega_gates,
     kernel_mega_gates: ['init_kernel', 'tail_kernel', 'hiding_kernel'].map((k) => tube.chonk.sizes[`${k}_mega_gates`]),

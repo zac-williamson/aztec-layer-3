@@ -1,13 +1,17 @@
 [workspace]
 members = [
     "l3x_types",
+    "l3x_exchange",
     "client_auth",
     "agg_app",
     "init_kernel",
     "tail_kernel",
     "hiding_kernel",
     "tube",
-    "x_segment",
+    "seg_block",
+    "seg_priority",
+    "seg_trade",
+    "seg_refresh",
     "padding",
     "merge",
     "root",

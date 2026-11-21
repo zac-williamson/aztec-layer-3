@@ -23,12 +23,12 @@ import {
   hex,
   readVkJson,
   run,
-  stateRoot,
   toBytes32,
-  trees,
   vkTree,
   writeJson,
 } from './lib.ts';
+import { hasher, paramsHash as paramsHashOf } from './p1/model.ts';
+import { genesisState, testParams } from './p1/params.ts';
 
 type VkSpec = { scheme: 'ultra_honk'; target: string } | { scheme: 'chonk'; kind: 'app' | 'kernel' | 'hiding' };
 type Step = { pkg: string; vk: VkSpec; pinned?: string[] };
@@ -43,8 +43,11 @@ const STEPS: Step[] = [
   { pkg: 'tail_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['INIT_KERNEL_VK_HASH'] },
   { pkg: 'hiding_kernel', vk: { scheme: 'chonk', kind: 'hiding' }, pinned: ['TAIL_KERNEL_VK_HASH'] },
   { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH'] },
-  { pkg: 'x_segment', vk: ROLLUP },
   { pkg: 'padding', vk: ROLLUP },
+  { pkg: 'seg_block', vk: ROLLUP },
+  { pkg: 'seg_priority', vk: ROLLUP },
+  { pkg: 'seg_trade', vk: ROLLUP },
+  { pkg: 'seg_refresh', vk: ROLLUP },
   { pkg: 'merge', vk: ROLLUP },
   { pkg: 'root', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'rogue_app', vk: { scheme: 'chonk', kind: 'app' } },
@@ -60,8 +63,11 @@ const PUBLISHES: Record<string, string> = {
   tail_kernel: 'TAIL_KERNEL_VK_HASH',
   hiding_kernel: 'CHONK_VK_HASH',
   tube: 'TUBE_VK_HASH',
-  x_segment: 'X_SEGMENT_VK_HASH',
   padding: 'PADDING_VK_HASH',
+  seg_block: 'SEG_BLOCK_VK_HASH',
+  seg_priority: 'SEG_PRIORITY_VK_HASH',
+  seg_trade: 'SEG_TRADE_VK_HASH',
+  seg_refresh: 'SEG_REFRESH_VK_HASH',
   merge: 'MERGE_VK_HASH',
   root: 'ROOT_VK_HASH',
   rogue_app: 'ROGUE_APP_VK_HASH',
@@ -80,12 +86,13 @@ const VK_SLOTS: Record<string, number> = {
   hiding_kernel: ROLE.CHONK * S + 3,
   tube: ROLE.TUBE * S + 0,
   padding: ROLE.SEGMENT * S + 0,
-  x_segment: ROLE.SEGMENT * S + 1,
+  seg_block: ROLE.SEGMENT * S + 1,
+  seg_priority: ROLE.SEGMENT * S + 2,
+  seg_trade: ROLE.SEGMENT * S + 3,
+  seg_refresh: ROLE.SEGMENT * S + 4,
   merge: ROLE.MERGE * S + 0,
 };
 
-// P0 has no exchange parameters; P1 commits market parameters, fees and deadlines here.
-const PARAMS_HASH = 0n;
 
 function writePinned(pkg: string, names: string[], hashes: Record<string, string>) {
   const lines = names.map((n) => {
@@ -132,9 +139,12 @@ async function main() {
   for (const [pkg, slot] of Object.entries(VK_SLOTS)) leaves[slot] = BigInt(hashes[PUBLISHES[pkg]]);
   const layers = await vkTree(api, leaves);
   const vkTreeRoot = layers[layers.length - 1][0];
-  const configHash = await configHashOf(api, vkTreeRoot, PARAMS_HASH);
-  const genesisTrees = await trees(api, 0n, 0n);
-  const genesisStateRoot = await stateRoot(api, genesisTrees, 0n, 0n, 0n);
+  // Default exchange parameters for tests; a deployment chooses its own (scripts/src/p1/params.ts).
+  const h = hasher(api);
+  const { params } = await testParams(h);
+  const paramsHash = await paramsHashOf(h, params);
+  const configHash = await configHashOf(api, vkTreeRoot, paramsHash);
+  const genesis = await genesisState(api);
   await api.destroy();
 
   const vkHashByPkg = Object.fromEntries(Object.entries(PUBLISHES).map(([pkg, name]) => [pkg, hashes[name]]));
@@ -143,10 +153,11 @@ async function main() {
     hashes,
     vkHashByPkg,
     vkTree: { root: vkTreeRoot, slots: VK_SLOTS, leaves },
-    paramsHash: PARAMS_HASH,
+    params,
+    paramsHash,
     configHash,
-    genesisTrees,
-    genesisStateRoot,
+    genesisTrees: genesis.trees,
+    genesisStateRoot: genesis.stateRoot,
     timings,
   });
   console.log(`vk tree root       ${hex(vkTreeRoot)}`);

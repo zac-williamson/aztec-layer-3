@@ -1,0 +1,70 @@
+//! Exchange state and rules shared by the P1 segment circuits, the root and the Bridge
+//! (SPEC.md §6–§10, P1 profile in §15).
+pub mod consts;
+pub mod tree;
+pub mod account;
+pub mod state;
+pub mod da;
+pub mod params;
+pub mod request;
+pub mod sig;
+pub mod book;
+pub mod trade;
+
+pub fn book_empty_root() -> Field {
+    book::empty_root()
+}
+
+use consts::{DS_ORACLE, DS_WD, DS_WD_NODE, MAX_WD_BATCH, WD_HEIGHT};
+use l3x_types::hash::hash;
+
+/// A withdrawal or refund record (SPEC.md §10.4, C0 profile): the vault pays `recipient`
+/// `amount` once, on proof of inclusion in the batch's withdrawals tree.
+pub fn withdrawal_record(recipient: Field, amount: u64, salt: Field, batch: u64, index: u32) -> Field {
+    hash([DS_WD, recipient, amount as Field, salt, batch as Field, index as Field])
+}
+
+/// Root of a batch's withdrawals tree over its records in order, zero-padded.
+pub fn withdrawals_root(records: [Field; MAX_WD_BATCH]) -> Field {
+    let mut layer = records;
+    let mut width = MAX_WD_BATCH;
+    for _ in 0..WD_HEIGHT {
+        width = width / 2;
+        for i in 0..MAX_WD_BATCH / 2 {
+            if i < width {
+                layer[i] = hash([DS_WD_NODE, layer[2 * i], layer[2 * i + 1]]);
+            }
+        }
+    }
+    layer[0]
+}
+
+/// The message an oracle publisher signs for an index update (SPEC.md §8.4).
+pub fn oracle_message(domain: Field, price: u64, time: u64) -> Field {
+    hash([DS_ORACLE, domain, price as Field, time as Field])
+}
+
+#[test]
+fn withdrawals_root_matches_paths() {
+    let mut records: [Field; MAX_WD_BATCH] = [0; MAX_WD_BATCH];
+    for i in 0..5 {
+        records[i] = (i + 11) as Field;
+    }
+    let root = withdrawals_root(records);
+    // Path of record 3, built level by level.
+    let mut path: [Field; WD_HEIGHT] = [0; WD_HEIGHT];
+    let mut layer = records;
+    let mut idx: u32 = 3;
+    let mut width = MAX_WD_BATCH;
+    for level in 0..WD_HEIGHT {
+        path[level] = layer[idx ^ 1];
+        width = width / 2;
+        for i in 0..MAX_WD_BATCH / 2 {
+            if i < width {
+                layer[i] = hash([DS_WD_NODE, layer[2 * i], layer[2 * i + 1]]);
+            }
+        }
+        idx = idx / 2;
+    }
+    assert(tree::merkle_root(DS_WD_NODE, records[3], 3, path) == root);
+}

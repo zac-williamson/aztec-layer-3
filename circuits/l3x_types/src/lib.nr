@@ -20,7 +20,7 @@ pub global CHONK_PROOF_LENGTH: u32 = 1221;
 pub global MAX_CLIENT_PROOFS: u32 = 10;
 pub global CLIENT_PUBLIC_INPUTS: u32 = 3;
 pub global MAX_PRIORITY: u32 = 8;
-pub global HEADER_LEN: u32 = 16;
+pub global HEADER_LEN: u32 = 17;
 /// DA fields one settlement carries. Aztec allows FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH = 4096 fields of
 /// public logs per transaction, each log costing 2 header fields. The Bridge emits the DA log
 /// (2 + tag + payload) and the BatchSettled event (2 + tag + 5), leaving 4085; 4080 keeps slack.
@@ -69,14 +69,19 @@ pub struct Running {
     /// DA sponge state and number of DA fields absorbed (da_iv() and 0 at the start of a batch).
     pub da: [Field; 4],
     pub da_len: u32,
-    /// Hash chain over withdrawal records and their count; zero at the start of every batch.
+    /// Hash chain over withdrawal records, their count and total amount; zero at the start of
+    /// every batch.
     pub withdrawals: Field,
     pub withdrawals_count: u32,
+    pub withdrawals_amount: u64,
+    /// Number of the batch being proved. No segment changes it, so chaining makes it uniform
+    /// across the batch, and the root checks it against the header.
+    pub batch: u64,
     /// L3 time of the latest block.
     pub time: u64,
 }
 
-pub global RUNNING_LEN: u32 = 12;
+pub global RUNNING_LEN: u32 = 14;
 
 impl Running {
     pub fn to_fields(self) -> [Field; RUNNING_LEN] {
@@ -92,6 +97,8 @@ impl Running {
             self.da_len as Field,
             self.withdrawals,
             self.withdrawals_count as Field,
+            self.withdrawals_amount as Field,
+            self.batch as Field,
             self.time as Field,
         ]
     }
@@ -155,6 +162,7 @@ pub struct BatchHeader {
     pub priority_head_end: Field,
     pub withdrawals_root: Field,
     pub withdrawals_count: u64,
+    pub withdrawals_amount: u64,
     pub action_log_root: Field,
     pub da_hash: Field,
     pub market_data_hash: Field,
@@ -182,6 +190,7 @@ impl BatchHeader {
             self.priority_head_end,
             self.withdrawals_root,
             self.withdrawals_count as Field,
+            self.withdrawals_amount as Field,
             self.action_log_root,
             self.da_hash,
             self.market_data_hash,
@@ -203,10 +212,11 @@ impl BatchHeader {
             priority_head_end: f[9],
             withdrawals_root: f[10],
             withdrawals_count: to_u64_checked(f[11]),
-            action_log_root: f[12],
-            da_hash: f[13],
-            market_data_hash: f[14],
-            config_hash: f[15],
+            withdrawals_amount: to_u64_checked(f[12]),
+            action_log_root: f[13],
+            da_hash: f[14],
+            market_data_hash: f[15],
+            config_hash: f[16],
         }
     }
 
@@ -215,19 +225,15 @@ impl BatchHeader {
         hash(
             [
                 DS_HEADER, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
-                f[12], f[13], f[14], f[15],
+                f[12], f[13], f[14], f[15], f[16],
             ],
         )
     }
 }
 
-/// State root (SPEC.md §6.2, reduced): exchange trees, priority cursor, batch number, last time.
+/// State root (SPEC.md §6.2): exchange trees, priority cursor, batch number, last time.
 pub fn state_root(trees: Field, priority_cursor: u64, batch_number: u64, last_time: u64) -> Field {
     hash([DS_STATE, trees, priority_cursor as Field, batch_number as Field, last_time as Field])
-}
-
-pub fn genesis_state_root() -> Field {
-    state_root(trees(0, 0), 0, 0, 0)
 }
 
 /// Priority queue (SPEC.md §10.1): entry binds payload, submitter and time; heads chain entries.
@@ -299,6 +305,7 @@ fn test_header_roundtrip() {
         priority_head_end: 10,
         withdrawals_root: 11,
         withdrawals_count: 12,
+        withdrawals_amount: 17,
         action_log_root: 13,
         da_hash: 14,
         market_data_hash: 15,

@@ -1,0 +1,69 @@
+// Reading the Bridge's public record from an Aztec node: event metadata from the compiled
+// artifact, decoded public events, and the Mode R DA logs.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { loadContractArtifact } from '@aztec-labs/aztec.js/abi';
+import { EventSelector, decodeFunctionSignature } from '@aztec-labs/stdlib/abi';
+import { getPublicEvents } from '@aztec-labs/aztec.js/events';
+import { Fr } from '@aztec-labs/aztec.js/fields';
+import { Tag } from '@aztec-labs/stdlib/logs';
+import { ROOT } from '../lib.ts';
+
+export const DA_LOG_TAG = 0x6c33782e64612e7631n;
+
+export function rawArtifact(name: 'l3x_bridge-L3XBridge' | 'l3x_token-L3XToken'): any {
+  return JSON.parse(readFileSync(join(ROOT, 'contracts', 'target', `${name}.json`), 'utf8'));
+}
+
+export const artifact = (name: 'l3x_bridge-L3XBridge' | 'l3x_token-L3XToken') => loadContractArtifact(rawArtifact(name));
+
+/** Event metadata, built from the artifact the same way `aztec codegen` builds it. */
+export async function eventMeta(raw: any, name: string) {
+  const ev = raw.outputs.structs.events.find((e: any) => e.path.split('::').at(-1) === name);
+  if (!ev) throw new Error(`no event ${name}`);
+  return {
+    abiType: ev,
+    eventSelector: await EventSelector.fromSignature(decodeFunctionSignature(name, ev.fields)),
+    fieldNames: ev.fields.map((f: any) => f.name),
+  };
+}
+
+/** Every public event of one kind the contract has emitted, oldest first. */
+export async function allPublicEvents<T = any>(node: any, meta: any, contractAddress: any): Promise<T[]> {
+  const out: T[] = [];
+  let afterEvent: any;
+  for (;;) {
+    const page = await getPublicEvents<T>(node, meta, { contractAddress, ...(afterEvent ? { afterEvent } : {}) } as any);
+    out.push(...page.events.map((e) => e.event));
+    if (!page.nextCursor) return out;
+    afterEvent = page.nextCursor;
+  }
+}
+
+export const big = (x: any): bigint => (typeof x === 'bigint' ? x : BigInt(x?.toBigInt?.() ?? x?.toString?.() ?? x));
+
+/** Every DA log of the Bridge, as (batch, payload), in batch order (SPEC.md §9.5). */
+export async function daLogs(node: any, contractAddress: any): Promise<{ batch: bigint; payload: bigint[]; blockNumber: number }[]> {
+  const out: { batch: bigint; payload: bigint[]; blockNumber: number }[] = [];
+  let afterLog: any;
+  for (;;) {
+    const [logs] = await node.getPublicLogsByTags({
+      contractAddress,
+      tags: [{ tag: new Tag(new Fr(DA_LOG_TAG)), ...(afterLog ? { afterLog } : {}) }],
+    });
+    if (!logs?.length) break;
+    for (const l of logs) {
+      const f = l.logData.map(big);
+      if (f[0] !== DA_LOG_TAG) continue;
+      out.push({ batch: f[1], payload: f.slice(2), blockNumber: Number(l.blockNumber) });
+    }
+    const last = logs[logs.length - 1];
+    if (!last.cursor && !last.logCursor) break;
+    afterLog = last.cursor ?? last.logCursor;
+  }
+  out.sort((a, b) => (a.batch < b.batch ? -1 : 1));
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].batch !== BigInt(i + 1)) throw new Error(`DA logs are missing batch ${i + 1}`);
+  }
+  return out;
+}

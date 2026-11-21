@@ -1,0 +1,28 @@
+use crate::consts::DS_REQ;
+use l3x_types::{hash::hash, priority_entry};
+
+/// A priority request as the Bridge queued it (SPEC.md §7.3, §10.1). The Bridge stores only the
+/// entry; the segment receives this preimage and the hash chain binds it.
+///   Register: a = master_auth, b = enc_commitment
+///   Deposit:  a = account index, b = amount (the Bridge has already pulled the funds)
+pub struct Request {
+    pub kind: Field,
+    pub a: Field,
+    pub b: Field,
+    pub sender: Field,
+    pub time: u64,
+}
+
+impl Request {
+    pub fn payload_hash(self) -> Field {
+        payload_hash(self.kind, self.a, self.b)
+    }
+
+    pub fn entry(self) -> Field {
+        priority_entry(self.payload_hash(), self.sender, self.time)
+    }
+}
+
+pub fn payload_hash(kind: Field, a: Field, b: Field) -> Field {
+    hash([DS_REQ, kind, a, b, 0])
+}
