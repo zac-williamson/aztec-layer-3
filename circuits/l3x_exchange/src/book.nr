@@ -108,3 +108,42 @@ pub fn replace(root: Field, index: Field, old: Order, new: Order, path: [Sibling
     let after = walk(new.leaf(), new.ask_lots(), new.bid_lots(), index, path);
     (after.root, before)
 }
+
+/// Never an order: prices are positive and below 2^24, so every order index lies in
+/// [2^48, 2^72). Walks from these slots prove that a side of the book is empty.
+pub global LEFTMOST: Field = 0;
+pub global RIGHTMOST: Field = 0xffffffffffffffffffff; // 2^80 − 1
+
+/// The best ask price, or 0 if the book holds no asks. With `has`, the order at (price, seq) is an
+/// ask with no ask to its left. Without, the walk from the rightmost slot, which is empty, sees no
+/// ask to its left, so there is none anywhere.
+pub fn best_ask(root: Field, has: bool, price: u32, seq: u64, order: Order, path: [Sibling; BOOK_HEIGHT]) -> u64 {
+    if has {
+        assert((order.side == SIDE_ASK) & (order.lots > 0), "best ask is not an ask");
+        let w = walk(order.leaf(), order.lots, 0, order_index(SIDE_ASK, price, seq), path);
+        assert(w.root == root, "best ask path");
+        assert(w.asks_left == 0, "not the best ask");
+        price as u64
+    } else {
+        let w = walk(0, 0, 0, RIGHTMOST, path);
+        assert(w.root == root, "empty ask side path");
+        assert(w.asks_left == 0, "the book has asks");
+        0
+    }
+}
+
+/// The best bid price, or 0 if the book holds no bids; the mirror image of best_ask.
+pub fn best_bid(root: Field, has: bool, price: u32, seq: u64, order: Order, path: [Sibling; BOOK_HEIGHT]) -> u64 {
+    if has {
+        assert((order.side == SIDE_BID) & (order.lots > 0), "best bid is not a bid");
+        let w = walk(order.leaf(), 0, order.lots, order_index(SIDE_BID, price, seq), path);
+        assert(w.root == root, "best bid path");
+        assert(w.bids_right == 0, "not the best bid");
+        price as u64
+    } else {
+        let w = walk(0, 0, 0, LEFTMOST, path);
+        assert(w.root == root, "empty bid side path");
+        assert(w.bids_right == 0, "the book has bids");
+        0
+    }
+}

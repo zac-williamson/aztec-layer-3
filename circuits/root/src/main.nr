@@ -1,5 +1,9 @@
 use bb_proof_verification::verify_root_rolluphonk_proof;
-use l3x_exchange::{consts::{DS_WD_CHAIN, MAX_WD_BATCH}, state::State, withdrawals_root};
+use l3x_exchange::{
+    consts::{DS_WD_CHAIN, MAX_WD_BATCH},
+    state::{market_data, market_data_hash, State},
+    withdrawals_root,
+};
 use l3x_types::{
     BatchHeader, config_hash, da_finalize, da_iv, hash::hash, merge::{Child, combine}, state_root,
 };
@@ -37,8 +41,8 @@ fn main(
     assert(s.withdrawals == 0, "withdrawals must start empty");
     assert(s.withdrawals_count == 0, "withdrawals must start empty");
     assert(s.withdrawals_amount == 0, "withdrawals must start empty");
-    // The new state root opens to the accounts root and market data, so exits can rely on
-    // published data alone.
+    // The new state root opens to the accounts root and the markets, so exits can rely on published
+    // data alone: the header carries the accounts root and a hash of every market's public data.
     assert(e.state == end_state.trees(), "end state opening");
 
     // The withdrawals tree over the batch's records, in the order the segments created them.
@@ -69,7 +73,7 @@ fn main(
         withdrawals_amount: e.withdrawals_amount,
         action_log_root: e.action_log,
         da_hash: da_finalize(e.da, e.da_len),
-        market_data_hash: end_state.market.data_hash(),
+        market_data_hash: market_data_hash(market_data(end_state.markets)),
         config_hash: config,
     };
     header.hash()

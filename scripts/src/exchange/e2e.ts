@@ -1,23 +1,26 @@
-// P1 end to end on an in-process Aztec 6.0.0 local network, with client proving and node
-// transaction-proof verification on (SPEC.md §15, P1 exit criterion):
+// End to end on an in-process Aztec 6.0.0 local network, with client proving and node
+// transaction-proof verification on (SPEC.md §15, the P1 exit criterion, extended for P2.1):
 //
-//  1. Deploy the collateral token and the Bridge. Alice and Bob register (their encryption keys
-//     reach the operator as constrained private events) and deposit; Bob also deposits to an
-//     account that does not exist.
+//  1. Deploy the collateral token and the Bridge, whose genesis holds the operator's insurance and
+//     fee accounts. Alice and Bob register (their encryption keys reach the operator as
+//     constrained private events) and deposit; Bob also deposits to an account that does not exist.
 //  2. The operator reads the queue and the delivered keys from the chain, executes everything in
-//     its engine, proves the batch (block + oracle update + priority segments, merged, root) and
-//     settles it. Bob claims his refund from the vault using only the published DA.
-//  3. Batch 2: the index moves to 2100; Alice rests a bid, Bob sells into it with an IOC order,
-//     Alice cancels the rest and Bob withdraws. Bob claims the withdrawal using the DA alone.
-//     Batch 3: the index moves to 2200 and both accounts are refreshed.
+//     its engine, proves the batch (a block with 2-of-3 signed indices for three markets, priority
+//     segments, merged, root) and settles it. Bob claims his refund using only the published DA.
+//  3. Batch 2: Alice rests a bid in market 0 and Bob sells into it; Alice offers in market 1 and
+//     Bob buys; Alice cancels her rest and Bob withdraws. Bob claims the withdrawal from the DA.
+//     Batch 3, an hour of L2 time later: new indices, so funding is applied; fees are swept and
+//     the accounts refreshed.
 //  4. The operator stops. Alice queues one more deposit, which nobody processes; after t_force
 //     anyone can activate desert mode.
 //  5. For each user, a fresh exit client, given only the node, the Bridge address and the user's
-//     seed, rebuilds the frozen accounts tree from the DA logs and opens the user's leaf. Each
-//     registers a claim valued at the frozen index (Alice long, Bob short); Alice's unprocessed
-//     deposit is refunded; after the claim window both withdraw, and the vault is empty.
+//     seed, rebuilds the frozen accounts tree from the deployment event and the DA logs and opens
+//     the user's leaf. Each registers a claim valued at the frozen indices with funding accrued to
+//     the freeze; Alice's unprocessed deposit is refunded; after the claim window both withdraw.
+//     What remains in the vault is the fee account's balance plus funding rounding, which the
+//     protocol accounts claim later (not yet built).
 //
-// Writes scripts/out/p1-e2e.json.
+// Writes scripts/out/e2e.json.
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getInitialTestAccountsData } from '@aztec-labs/accounts/testing';
@@ -28,14 +31,14 @@ import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
 import { OUT, SHAPE, hex, randomField, readJson, timed, writeJson } from '../lib.ts';
 import { type ProvedBatch, Prover, assert, newApi, proveBatch } from '../pipeline.ts';
 import { allPublicEvents, artifact, big, daLogs, eventMeta, rawArtifact } from './chain.ts';
-import { Engine, signAction } from './engine.ts';
+import { Engine, signAction, signUpdate } from './engine.ts';
 import * as X from './rules.ts';
 import { exitFromDa, withdrawalPath } from './exit.ts';
-import { keysFromSeed, sign } from './grumpkin.ts';
+import { keysFromSeed } from './grumpkin.ts';
 import * as M from './model.ts';
-import { testParams } from './params.ts';
+import { protocolAccounts, testParams } from './params.ts';
 
-const log = (m: string) => console.log(`[p1-e2e] ${m}`);
+const log = (m: string) => console.log(`[e2e] ${m}`);
 const T_FORCE = 3600n;
 const T_CLAIM = 86_400n;
 const ALICE_SEED = 0xa11cen;
@@ -71,8 +74,10 @@ async function main() {
     const wait = { waitForStatus: TxStatus.CHECKPOINTED, timeout: 1800, interval: 0.5 };
     const l2Time = async () => BigInt(((await node.getBlock((await node.getBlockNumber()) as any)) as any).header.globalVariables.timestamp);
 
-    // Deployment-specific parameters: this chain, a fresh instance id, the test oracle key.
-    const { params, oracleSk } = await testParams(h, BigInt(info.l1ChainId), randomField());
+    // Deployment-specific parameters: this chain, a fresh instance id, the test oracle keys; the
+    // protocol accounts belong to the operator.
+    const { params, oracleSks } = await testParams(h, BigInt(info.l1ChainId), randomField());
+    const protocol = await protocolAccounts(h, [big(operator), big(operator)]);
     const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
     log(`config hash ${hex(prover.configHash)}`);
 
@@ -87,6 +92,9 @@ async function main() {
       token.address,
       T_FORCE,
       T_CLAIM,
+      [operator, operator],
+      protocol.map((p) => p.pub.masterAuth),
+      protocol.map((p) => p.pub.encCommitment),
     ]).send({ from: operator, wait } as any);
     const bridge = (bridgeDep as any).contract;
     report.bridge = bridge.address.toString();
@@ -111,13 +119,14 @@ async function main() {
       log(`${name} registered (private, key delivered to the operator) in ${ms.toFixed(0)} ms`);
       report[`${name}RegisterMs`] = Math.round(ms);
     }
-    await asOf(alice).methods.deposit(0n, 1_000_000n).send({ from: alice, wait });
-    await asOf(bob).methods.deposit(1n, 2_000_000n).send({ from: bob, wait });
+    const [A, B] = [2n, 3n]; // after the insurance (0) and fee (1) accounts
+    await asOf(alice).methods.deposit(A, 1_000_000n).send({ from: alice, wait });
+    await asOf(bob).methods.deposit(B, 2_000_000n).send({ from: bob, wait });
     await asOf(bob).methods.deposit(42n, 777n).send({ from: bob, wait }); // no account 42: refund
     log(`deposits queued; vault holds ${await balance(bridge.address)}`);
 
     // 2. The operator reads the queue and its delivered keys from the chain, and settles batch 1.
-    const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root));
+    const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol);
     const raw = rawArtifact('l3x_bridge-L3XBridge');
     const delivered = await (wallet as any).getPrivateEvents(await eventMeta(raw, 'KeyDelivered'), {
       contractAddress: bridge.address,
@@ -137,9 +146,9 @@ async function main() {
     }
     const sim = async (method: string, args: unknown[] = []) => (await bridge.methods[method](...args).simulate({ from: operator })).result;
 
-    async function settle(name: string, b: ProvedBatch, market: [bigint, bigint]) {
+    async function settle(name: string, b: ProvedBatch) {
       const da = [...b.daPayload, ...Array<bigint>(SHAPE.DA_MAX - b.daPayload.length).fill(0n)];
-      const args = [b.header, b.rootProof, b.rootVk, da, b.daPayload.length, market];
+      const args = [b.header, b.rootProof, b.rootVk, da, b.daPayload.length, b.marketData];
       const [, ms] = await timed(() => bridge.methods.settle(...args).send({ from: operator, wait }));
       const t = (await sim('get_tip')) as any[];
       assert(big(t[0]) === b.header[1], `${name}: tip != header`);
@@ -156,19 +165,15 @@ async function main() {
       const w = await engine.endBatch();
       log(`${name}: ${w.segments.map((x) => x.label).join(' | ')}`);
       const b = await proveBatch(prover, w, (m) => log(m));
-      const market: [bigint, bigint] = [engine.market.indexPrice, engine.market.indexTime];
-      report[name] = { shape: b.shape, ms: b.ms, daFields: b.daPayload.length, settleMs: await settle(name, b, market) };
+      report[name] = { shape: b.shape, ms: b.ms, daFields: b.daPayload.length, settleMs: await settle(name, b) };
       return b;
     }
-    const oracle = async (price: bigint, time: bigint) => ({
-      price,
-      time,
-      sig: await sign(h, oracleSk, await M.oracleMessage(h, engine.domain, price, time)),
-    });
+    // Publishers 0 and 2 sign; the threshold is two of three.
+    const update = (market: bigint, price: bigint, time: bigint) => signUpdate(h, engine.domain, oracleSks, [0, 2], market, price, price, time);
 
     await runBatch('batch1', async () => {
       const t = await l2Time();
-      await engine.block(t, await oracle(2000n, t));
+      await engine.block(t, [await update(0n, 2000n, t), await update(1n, 30_000n, t), await update(2n, 100n, t)]);
       await engine.priority(requests);
     });
 
@@ -187,14 +192,17 @@ async function main() {
     const act = (who: keyof typeof users, account: bigint, nonce: bigint, kind: bigint, p: bigint[]) =>
       signAction(h, engine.domain, users[who].keys, kind, account, nonce, p);
     const { BID, ASK } = M.SIDE;
+    const { PLACE, CANCEL, WITHDRAW } = X.KIND_ACT;
     await runBatch('batch2', async () => {
       const t = await l2Time();
-      await engine.block(t, await oracle(2100n, t));
+      await engine.block(t, [await update(0n, 2100n, t)]);
       await engine.trade([
-        await act('alice', 0n, 1n, X.KIND_ACT.PLACE, [BID, 2100n, 100n, X.TIF.GTC]),
-        await act('bob', 1n, 1n, X.KIND_ACT.PLACE, [ASK, 2090n, 60n, X.TIF.IOC]),
-        await act('alice', 0n, 2n, X.KIND_ACT.CANCEL, [BID, 2100n, 0n, 0n]),
-        await act('bob', 1n, 2n, X.KIND_ACT.WITHDRAW, [1000n, big(bob), 0n, 0n]),
+        await act('alice', A, 1n, PLACE, [0n, BID, 2100n, 100n, X.TIF.GTC, 0n]),
+        await act('bob', B, 1n, PLACE, [0n, ASK, 2090n, 60n, X.TIF.IOC, 0n]),
+        await act('alice', A, 2n, CANCEL, [0n, BID, 2100n, 0n]),
+        await act('alice', A, 3n, PLACE, [1n, ASK, 30_000n, 2n, X.TIF.POST_ONLY, 0n]),
+        await act('bob', B, 2n, PLACE, [1n, BID, 30_010n, 2n, X.TIF.IOC, 0n]),
+        await act('bob', B, 3n, WITHDRAW, [1000n, big(bob)]),
       ]);
       assert(engine.rejected.length === 0, `engine refused ${JSON.stringify(engine.rejected.map((r) => r.reason))}`);
     });
@@ -207,14 +215,18 @@ async function main() {
     assert((await balance(bob)) === bobBefore + 1000n, 'withdrawal not paid');
     log('bob claimed his 1000 withdrawal using the DA and his key alone');
 
+    // An hour of L2 time later funding is due; the next indices apply it.
+    await (node as any).warpL2TimeAtLeastBy(Number(params.fundingInterval + 60n));
     await runBatch('batch3', async () => {
       const t = await l2Time();
-      await engine.block(t, await oracle(2200n, t));
-      await engine.refresh(2);
+      await engine.block(t, [await update(0n, 2200n, t), await update(1n, 30_300n, t)]);
+      await engine.maintenance({ sweep: true, refresh: 4 });
     });
+    log(`funding applied: market 0 cum ${engine.markets[0].cumFunding}, market 1 cum ${engine.markets[1].cumFunding} (micro-units per lot)`);
+    assert(engine.markets[0].cumFunding > 0n && engine.markets[1].cumFunding > 0n, 'funding not applied');
 
     // 4. The operator stops. Alice queues a deposit nobody processes; after t_force, desert mode.
-    await asOf(alice).methods.deposit(0n, 5_000n).send({ from: alice, wait });
+    await asOf(alice).methods.deposit(A, 5_000n).send({ from: alice, wait });
     const pendingIndex = BigInt(requests.length);
     // The local network's sequencer builds every block at the next slot, so L2 time is moved with its
     // debug API rather than waited for.
@@ -231,42 +243,36 @@ async function main() {
     const exits: Record<string, any> = {};
     for (const [name, seed, addr] of [['alice', ALICE_SEED, alice], ['bob', BOB_SEED, bob]] as const) {
       const [exit, exitMs] = await timed(() => exitFromDa(h, node, bridge.address, seed, frozen));
-      log(`${name}: exit client rebuilt the frozen tree from ${exit.batches} DA logs in ${exitMs.toFixed(0)} ms; position ${exit.priv.size} at notional ${exit.priv.entry}, collateral ${exit.priv.collateral}; equity at index ${exit.indexPrice}: ${exit.equity}`);
+      const ps = exit.priv.positions.map((p, m) => `m${m} ${p.size}`).filter((x) => !x.endsWith(' 0'));
+      log(`${name}: exit client rebuilt the frozen tree from ${exit.batches} DA logs in ${exitMs.toFixed(0)} ms; positions ${ps.join(', ')}, collateral ${exit.priv.collateral}; equity at the frozen indices: ${exit.equity}`);
+      const want = X.equityAt(engine.accts.get(exit.index)!.priv, engine.markets.map((m) => m.indexPrice), engine.markets.map((m) => m.cumFunding));
+      assert(exit.equity === want, `${name}: exit equity ${exit.equity} != engine ${want}`);
       exits[name] = { ...exit, ms: Math.round(exitMs) };
       await asOf(addr)
-        .methods.exit_register(
-          exit.index,
-          addr,
-          exit.pub.masterAuth,
-          exit.pub.encCommitment,
-          exit.pub.class,
-          M.enc(exit.priv.collateral),
-          M.enc(exit.priv.size),
-          M.enc(exit.priv.entry),
-          exit.priv.blind,
-          exit.path,
-          exit.indexPrice,
-          exit.indexTime,
-        )
+        .methods.exit_register(exit.index, addr, exit.pub.masterAuth, exit.pub.encCommitment, exit.pub.class, exit.plaintext, exit.path, exit.marketData)
         .send({ from: addr, wait });
     }
-    await asOf(alice).methods.desert_refund(pendingIndex, 0n, 5_000n, alice).send({ from: alice, wait });
+    await asOf(alice).methods.desert_refund(pendingIndex, A, 5_000n, alice).send({ from: alice, wait });
     log(`advancing L2 time past the claim window (${T_CLAIM} s)`);
     await (node as any).warpL2TimeAtLeastBy(Number(T_CLAIM + 60n));
     for (const [name, addr] of [['alice', alice], ['bob', bob]] as const) {
       await asOf(addr).methods.exit_withdraw(exits[name].index).send({ from: addr, wait });
     }
     const paid = { alice: (await balance(alice)) - before.alice, bob: (await balance(bob)) - before.bob };
-    // Alice: long 60 entered at 2100, valued at 2200: 1,000,000 + 60 · 100. Bob: the mirror image,
-    // less his 1000 withdrawal.
-    assert(paid.alice === 5_000n + 1_006_000n, `alice received ${paid.alice}`);
-    assert(paid.bob === 1_993_000n, `bob received ${paid.bob}`);
+    // The vault covers every claim, so each user receives exactly its equity at the frozen indices,
+    // Alice also her refunded deposit.
+    assert(paid.alice === 5_000n + exits.alice.equity, `alice received ${paid.alice}`);
+    assert(paid.bob === exits.bob.equity, `bob received ${paid.bob}`);
+    // What remains is the fee account's swept balance plus the funding rounding the users' claims
+    // gave up (at most one unit per position): the protocol accounts' share, claimable later.
     const vault = await balance(bridge.address);
-    assert(vault === 0n, `vault left with ${vault}`);
-    log(`alice received 5000 refund + 1006000; bob received 1993000; the vault is empty`);
+    const fees = engine.accts.get(M.FEE_INDEX)!.priv.collateral + engine.accts.get(M.INSURANCE_INDEX)!.priv.collateral;
+    assert(vault >= fees && vault - fees <= 4n, `vault left with ${vault}, protocol balances ${fees}`);
+    log(`alice received 5000 refund + ${exits.alice.equity}; bob received ${exits.bob.equity}; the vault keeps ${vault} (fees ${fees} + rounding)`);
     report.exit = Object.fromEntries(
-      Object.entries(exits).map(([k, e]) => [k, { batches: e.batches, ms: e.ms, size: e.priv.size, entry: e.priv.entry, collateral: e.priv.collateral, equity: e.equity }]),
+      Object.entries(exits).map(([k, e]) => [k, { batches: e.batches, ms: e.ms, positions: e.priv.positions, collateral: e.priv.collateral, equity: e.equity }]),
     );
+    report.vaultResidual = vault;
     report.paid = paid;
     report.status = 'passed';
   } catch (e) {
@@ -275,7 +281,7 @@ async function main() {
     throw e;
   } finally {
     report.finishedAt = new Date().toISOString();
-    writeJson(join(OUT, 'p1-e2e.json'), report);
+    writeJson(join(OUT, 'e2e.json'), report);
     await api.destroy();
     await network.stop();
   }

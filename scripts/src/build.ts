@@ -27,8 +27,8 @@ import {
   vkTree,
   writeJson,
 } from './lib.ts';
-import { hasher, paramsHash as paramsHashOf } from './p1/model.ts';
-import { genesisState, testParams } from './p1/params.ts';
+import { hasher, paramsHash as paramsHashOf } from './exchange/model.ts';
+import { genesisState, testParams } from './exchange/params.ts';
 
 type VkSpec = { scheme: 'ultra_honk'; target: string } | { scheme: 'chonk'; kind: 'app' | 'kernel' | 'hiding' };
 type Step = { pkg: string; vk: VkSpec; pinned?: string[] };
@@ -139,7 +139,7 @@ async function main() {
   for (const [pkg, slot] of Object.entries(VK_SLOTS)) leaves[slot] = BigInt(hashes[PUBLISHES[pkg]]);
   const layers = await vkTree(api, leaves);
   const vkTreeRoot = layers[layers.length - 1][0];
-  // Default exchange parameters for tests; a deployment chooses its own (scripts/src/p1/params.ts).
+  // Default exchange parameters for tests; a deployment chooses its own (scripts/src/exchange/params.ts).
   const h = hasher(api);
   const { params } = await testParams(h);
   const paramsHash = await paramsHashOf(h, params);

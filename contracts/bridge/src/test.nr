@@ -5,9 +5,12 @@ use crate::L3XBridge;
 use aztec::{protocol::{address::AztecAddress, traits::ToField}, test::helpers::test_environment::TestEnvironment};
 use bb_proof_verification::{UltraHonkVerificationKey, UltraHonkZKProof};
 use l3x_exchange::{
-    account::{account_leaf, AccountPriv, AccountPub, enc_commitment, master_auth_of},
-    consts::{ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, MAX_WD_BATCH, WD_HEIGHT},
-    state::{genesis_state_root, market_data_hash},
+    account::{account_leaf, AccountPriv, AccountPub, enc, enc_commitment, master_auth_of, Position},
+    consts::{
+        ACCOUNTS_HEIGHT, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, MAX_WD_BATCH, PROTOCOL_ACCOUNTS,
+        WD_HEIGHT,
+    },
+    state::{genesis_state_root, MARKET_DATA_LEN, market_data_hash},
     tree::merkle_root,
     withdrawal_record, withdrawals_root,
 };
@@ -32,6 +35,17 @@ struct Env {
     bridge: AztecAddress,
 }
 
+/// The protocol accounts' master authorizations and encryption-key commitments in these tests.
+global PROTOCOL_MAUTH: [Field; PROTOCOL_ACCOUNTS] = [0x101, 0x102];
+global PROTOCOL_ENC: [Field; PROTOCOL_ACCOUNTS] = [0x201, 0x202];
+
+unconstrained fn protocol_pubs(operator: AztecAddress) -> [AccountPub; PROTOCOL_ACCOUNTS] {
+    [
+        AccountPub { owner: operator.to_field(), master_auth: PROTOCOL_MAUTH[0], enc_commitment: PROTOCOL_ENC[0], class: 0 },
+        AccountPub { owner: operator.to_field(), master_auth: PROTOCOL_MAUTH[1], enc_commitment: PROTOCOL_ENC[1], class: 0 },
+    ]
+}
+
 unconstrained fn setup() -> Env {
     let mut env = TestEnvironment::new();
     let operator = env.create_light_account();
@@ -43,7 +57,17 @@ unconstrained fn setup() -> Env {
     );
     let bridge = env.deploy("L3XBridge").with_public_initializer(
         operator,
-        L3XBridge::interface().constructor(operator, ROOT_VK, CONFIG, token, T_FORCE, T_CLAIM),
+        L3XBridge::interface().constructor(
+            operator,
+            ROOT_VK,
+            CONFIG,
+            token,
+            T_FORCE,
+            T_CLAIM,
+            [operator, operator],
+            PROTOCOL_MAUTH,
+            PROTOCOL_ENC,
+        ),
     );
     let _ = env.call_public(operator, L3XToken::at(token).mint(alice, 10_000));
     let _ = env.call_public(alice, L3XToken::at(token).approve(bridge, 10_000));
@@ -64,6 +88,17 @@ unconstrained fn payload() -> [Field; DA_MAX] {
         p[i] = (i + 1) as Field;
     }
     p
+}
+
+/// Market data with market 0 at index `price` (published at `time`, marked at the index) and
+/// cumulative funding `cum`; the other markets unlisted.
+unconstrained fn md(price: u64, time: u64, cum: i64) -> [Field; MARKET_DATA_LEN] {
+    let mut d: [Field; MARKET_DATA_LEN] = [0; MARKET_DATA_LEN];
+    d[0] = price as Field;
+    d[1] = time as Field;
+    d[2] = price as Field;
+    d[3] = enc(cum);
+    d
 }
 
 unconstrained fn tip(e: Env) -> (Field, Field, u64, u64, u64, u64) {
@@ -92,19 +127,23 @@ unconstrained fn next_header(e: Env, now: u64, consume: u64) -> BatchHeader {
         withdrawals_amount: 0,
         action_log_root: 0,
         da_hash: da_hash_flat(payload(), TEST_DA_LEN),
-        market_data_hash: market_data_hash(PRICE, now),
+        market_data_hash: market_data_hash(md(PRICE, now, 0)),
         config_hash: CONFIG,
     }
 }
 
-/// Settles `h` in a block at time `now` with a dummy proof; the market data is (PRICE, max_time).
+/// Settles `h` in a block at time `now` with a dummy proof; the market data is md(PRICE, max_time, 0).
 unconstrained fn settle(e: Env, from: AztecAddress, h: BatchHeader, now: u64) {
+    settle_with(e, from, h, now, md(PRICE, h.max_time, 0));
+}
+
+unconstrained fn settle_with(e: Env, from: AztecAddress, h: BatchHeader, now: u64, data: [Field; MARKET_DATA_LEN]) {
     e.env.set_next_block_timestamp(now);
     let proof: UltraHonkZKProof = [0; 458];
     let vk: UltraHonkVerificationKey = [0; 115];
     e.env.call_private(
         from,
-        L3XBridge::at(e.bridge).settle(h.to_fields(), proof, vk, payload(), TEST_DA_LEN, [PRICE as Field, h.max_time as Field]),
+        L3XBridge::at(e.bridge).settle(h.to_fields(), proof, vk, payload(), TEST_DA_LEN, data),
     );
 }
 
@@ -140,7 +179,9 @@ unconstrained fn single_record_path() -> [Field; WD_HEIGHT] {
 unconstrained fn genesis_tip() {
     let e = setup();
     let (state_root, accounts_root, batch_number, last_time, cursor, count) = tip(e);
-    assert(state_root == genesis_state_root());
+    assert(state_root == genesis_state_root(protocol_pubs(e.operator)));
+    let (owners, mauths, encs) = e.env.view_public(L3XBridge::at(e.bridge).get_protocol_accounts());
+    assert((owners[0] == e.operator) & (mauths == PROTOCOL_MAUTH) & (encs == PROTOCOL_ENC));
     assert((accounts_root, batch_number, last_time, cursor, count) == (0, 0, 0, 0, 0));
 }
 
@@ -207,7 +248,7 @@ unconstrained fn market_data_mismatch_rejected() {
     let e = setup();
     let now = now_plus(e, 10);
     let mut h = next_header(e, now, 0);
-    h.market_data_hash = market_data_hash(PRICE + 1, now);
+    h.market_data_hash = market_data_hash(md(PRICE + 1, now, 0));
     settle(e, e.operator, h, now);
 }
 
@@ -332,7 +373,7 @@ unconstrained fn lagging_batch_time_rejected() {
     let now = now_plus(e, T_LAG + 100);
     let mut h = next_header(e, now, 0);
     h.max_time = now - T_LAG - 1;
-    h.market_data_hash = market_data_hash(PRICE, h.max_time);
+    h.market_data_hash = market_data_hash(md(PRICE, h.max_time, 0));
     settle(e, e.operator, h, now);
 }
 
@@ -342,7 +383,7 @@ unconstrained fn future_batch_time_rejected() {
     let now = now_plus(e, 10);
     let mut h = next_header(e, now, 0);
     h.max_time = now + 1;
-    h.market_data_hash = market_data_hash(PRICE, h.max_time);
+    h.market_data_hash = market_data_hash(md(PRICE, h.max_time, 0));
     settle(e, e.operator, h, now);
 }
 
@@ -427,19 +468,29 @@ unconstrained fn withdrawal_recipient_cannot_be_redirected() {
 
 // ---- Desert mode (SPEC.md §12) ----
 
-/// Alice holds an account at index 0 with `collateral` and a long position of `size` lots at
-/// entry notional `entry`, settled in batch 1 at index price PRICE; then she deposits 50 more,
+/// Alice holds an account at index 0 with `collateral` and a position in market 0 of `size` lots
+/// at entry notional `entry`, settled in batch 1 at index price PRICE; then she deposits 50 more,
 /// which the operator never processes.
 unconstrained fn desert_world(collateral: i64, size: i64, entry: i64) -> (Env, AccountPub, AccountPriv, [Field; ACCOUNTS_HEIGHT]) {
+    desert_world_with(collateral, Position { size, entry, funding: 0 }, CLASS_USER, 0)
+}
+
+/// As desert_world, with a full market-0 position, an account class, and market 0's cumulative
+/// funding index at the freeze.
+unconstrained fn desert_world_with(collateral: i64, pos: Position, class: Field, cum: i64) -> (Env, AccountPub, AccountPriv, [Field; ACCOUNTS_HEIGHT]) {
     let e = setup();
-    let pubv = AccountPub { owner: e.alice.to_field(), master_auth: master_auth_of(1, 2), enc_commitment: enc_commitment(3), class: CLASS_USER };
-    let privv = AccountPriv { collateral, size, entry, blind: 0x77 };
+    let pubv = AccountPub { owner: e.alice.to_field(), master_auth: master_auth_of(1, 2), enc_commitment: enc_commitment(3), class };
+    let mut privv = AccountPriv::empty(0x77);
+    privv.collateral = collateral;
+    privv.positions[0] = pos;
     let (root, path) = single_account_tree(account_leaf(pubv, privv));
     deposit(e, e.alice, 0, 1000);
     let now = now_plus(e, 10);
     let mut h = next_header(e, now, 1);
     h.new_accounts_root = root;
-    settle(e, e.operator, h, now);
+    let data = md(PRICE, now, cum);
+    h.market_data_hash = market_data_hash(data);
+    settle_with(e, e.operator, h, now, data);
     deposit(e, e.alice, 0, 50);
     (e, pubv, privv, path)
 }
@@ -450,6 +501,10 @@ unconstrained fn activate(e: Env) {
 }
 
 unconstrained fn exit_register(e: Env, pubv: AccountPub, privv: AccountPriv, path: [Field; ACCOUNTS_HEIGHT], price: u64, time: u64) {
+    exit_register_with(e, pubv, privv, path, md(price, time, 0));
+}
+
+unconstrained fn exit_register_with(e: Env, pubv: AccountPub, privv: AccountPriv, path: [Field; ACCOUNTS_HEIGHT], data: [Field; MARKET_DATA_LEN]) {
     let _ = e.env.call_public(
         e.bob,
         L3XBridge::at(e.bridge).exit_register(
@@ -458,13 +513,9 @@ unconstrained fn exit_register(e: Env, pubv: AccountPub, privv: AccountPriv, pat
             pubv.master_auth,
             pubv.enc_commitment,
             pubv.class,
-            (privv.collateral as u64) as Field,
-            (privv.size as u64) as Field,
-            (privv.entry as u64) as Field,
-            privv.blind,
+            privv.plaintext(),
             path,
-            price,
-            time,
+            data,
         ),
     );
 }
@@ -506,6 +557,26 @@ unconstrained fn desert_clamps_negative_equity_to_zero() {
     exit_register(e, pubv, privv, path, PRICE, settled_time);
     let (_, _, _, _, total) = e.env.view_public(L3XBridge::at(e.bridge).get_desert());
     assert(total == 0);
+}
+
+#[test]
+unconstrained fn desert_accrues_funding_to_the_freeze() {
+    // Long 100 lots entered at notional 900 with funding snapshot 0; market 0's cumulative funding
+    // at the freeze is 2.5 per lot, so the position owes 250: 400 + 100 * 10 - 900 - 250 = 250.
+    let (e, pubv, privv, path) = desert_world_with(400, Position { size: 100, entry: 900, funding: 0 }, CLASS_USER, 2_500_000);
+    let (_, _, _, settled_time, _, _) = tip(e);
+    activate(e);
+    exit_register_with(e, pubv, privv, path, md(PRICE, settled_time, 2_500_000));
+    let (_, _, _, _, total) = e.env.view_public(L3XBridge::at(e.bridge).get_desert());
+    assert(total == 250);
+}
+
+#[test(should_fail_with = "protocol accounts claim from the residual")]
+unconstrained fn desert_defers_protocol_accounts() {
+    let (e, pubv, privv, path) = desert_world_with(1000, Position::empty(), CLASS_INSURANCE, 0);
+    let (_, _, _, settled_time, _, _) = tip(e);
+    activate(e);
+    exit_register(e, pubv, privv, path, PRICE, settled_time);
 }
 
 #[test(should_fail_with = "no priority request is overdue")]

@@ -2,7 +2,7 @@ mod test;
 
 use aztec::macros::aztec;
 
-/// L3X settlement contract, the P1 subset of SPEC.md §10 and §12:
+/// L3X settlement contract, the subset of SPEC.md §10 and §12 built so far (P1, and P2.1):
 /// - registration with constrained delivery of the account's encryption key to the operator;
 /// - C0 custody: deposits move into the Bridge's public token balance (the vault) and queue a
 ///   priority request; withdrawals are paid from the vault on proof of inclusion;
@@ -12,7 +12,10 @@ use aztec::macros::aztec;
 ///   UPGRADE_DELAY after a change is scheduled, and the contract cannot change its own class;
 /// - desert mode: once a priority request is overdue, anyone can freeze the exchange; unprocessed
 ///   deposits are refunded, settled withdrawals stay payable, and accounts exit from the frozen
-///   accounts root at the frozen index price, pro rata if the vault falls short.
+///   accounts root at the frozen index prices with funding accrued to the freeze, pro rata if the
+///   vault falls short.
+/// The genesis state holds the protocol accounts (insurance and fee) with zero balances; the
+/// contract computes it from their public parts, so no deployer can seed balances.
 #[aztec]
 pub contract L3XBridge {
     use aztec::{
@@ -26,10 +29,14 @@ pub contract L3XBridge {
     };
     use bb_proof_verification::{UltraHonkVerificationKey, UltraHonkZKProof, verify_honk_proof};
     use l3x_exchange::{
-        account::{account_leaf, AccountPriv, AccountPub, enc_commitment},
-        consts::{ACCOUNTS_HEIGHT, DS_ACCT_NODE, DS_WD_NODE, KIND_DEPOSIT, KIND_REGISTER, MAX_DEPOSIT, WD_HEIGHT},
+        account::{account_leaf, AccountPub, enc_commitment, from_plaintext},
+        consts::{
+            ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, KIND_DEPOSIT, KIND_REGISTER, MAX_DEPOSIT,
+            PLAINTEXT_LEN, PROTOCOL_ACCOUNTS, WD_HEIGHT,
+        },
         request::payload_hash,
-        state::{genesis_state_root, market_data_hash},
+        state::{genesis_state_root, index_and_funding, MARKET_DATA_LEN, market_data_hash},
+        trade::equity_at,
         tree::merkle_root,
         withdrawal_record,
     };
@@ -67,8 +74,7 @@ pub contract L3XBridge {
         da_len: u32,
         withdrawals_count: u64,
         withdrawals_amount: u64,
-        index_price: u64,
-        index_time: u64,
+        market_data: [Field; MARKET_DATA_LEN],
     }
 
     /// Private event that delivers a new account's encryption key to the operator.
@@ -76,6 +82,15 @@ pub contract L3XBridge {
     struct KeyDelivered {
         enc_commitment: Field,
         k_enc: Field,
+    }
+
+    /// Emitted once, at deployment: the protocol accounts' public parts, from which exit clients
+    /// rebuild the genesis accounts tree (SPEC.md §12).
+    #[event]
+    struct ProtocolAccounts {
+        owners: [AztecAddress; PROTOCOL_ACCOUNTS],
+        master_auths: [Field; PROTOCOL_ACCOUNTS],
+        enc_commitments: [Field; PROTOCOL_ACCOUNTS],
     }
 
     #[event]
@@ -117,7 +132,8 @@ pub contract L3XBridge {
         equity: u128,
     }
 
-    /// Fixed at deployment.
+    /// Fixed at deployment, including the public parts of the protocol accounts (insurance at
+    /// index 0, fee at index 1), which exit clients need to rebuild the genesis accounts tree.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Config {
         genesis_operator: AztecAddress,
@@ -126,6 +142,9 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
+        protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
+        protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
     }
 
     /// The exchange tip, the priority cursor and count, and settled but unpaid withdrawals.
@@ -206,6 +225,9 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
+        protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
+        protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
     ) {
         self.storage.config.initialize(
             Config {
@@ -215,12 +237,31 @@ pub contract L3XBridge {
                 token,
                 t_force,
                 t_claim,
+                protocol_owners,
+                protocol_master_auths,
+                protocol_enc_commitments,
             },
         );
         // The Bridge computes the genesis state itself, so no deployer can seed balances.
+        let mut protocol = [AccountPub { owner: 0, master_auth: 0, enc_commitment: 0, class: 0 }; PROTOCOL_ACCOUNTS];
+        for i in 0..PROTOCOL_ACCOUNTS {
+            protocol[i] = AccountPub {
+                owner: protocol_owners[i].to_field(),
+                master_auth: protocol_master_auths[i],
+                enc_commitment: protocol_enc_commitments[i],
+                class: 0,
+            };
+        }
+        self.emit(
+            ProtocolAccounts {
+                owners: protocol_owners,
+                master_auths: protocol_master_auths,
+                enc_commitments: protocol_enc_commitments,
+            },
+        );
         self.storage.tip.write(
             Tip {
-                state_root: genesis_state_root(),
+                state_root: genesis_state_root(protocol),
                 accounts_root: 0,
                 batch_number: 0,
                 last_time: 0,
@@ -300,7 +341,7 @@ pub contract L3XBridge {
         vk: UltraHonkVerificationKey,
         da_payload: [Field; DA_MAX],
         da_len: u32,
-        market_data: [Field; 2],
+        market_data: [Field; MARKET_DATA_LEN],
     ) {
         let genesis = self.storage.config.read();
         let operator = self.storage.operator.get_current_value();
@@ -317,20 +358,19 @@ pub contract L3XBridge {
         let h = BatchHeader::from_fields(header);
         assert(h.config_hash == config, "config mismatch");
         assert(da_hash_flat(da_payload, da_len) == h.da_hash, "da hash");
-        let price = market_data[0] as u64;
-        let time = market_data[1] as u64;
-        assert(
-            (price as Field == market_data[0]) & (time as Field == market_data[1]),
-            "market data out of range",
-        );
-        assert(market_data_hash(price, time) == h.market_data_hash, "market data");
+        assert(market_data_hash(market_data) == h.market_data_hash, "market data");
         verify_honk_proof(vk, proof, [h.hash()], root_vk);
         self.enqueue_self._apply(header, da_payload, da_len, market_data);
     }
 
     #[external("public")]
     #[only_self]
-    fn _apply(header: [Field; HEADER_LEN], da_payload: [Field; DA_MAX], da_len: u32, market_data: [Field; 2]) {
+    fn _apply(
+        header: [Field; HEADER_LEN],
+        da_payload: [Field; DA_MAX],
+        da_len: u32,
+        market_data: [Field; MARKET_DATA_LEN],
+    ) {
         let h = BatchHeader::from_fields(header);
         let now = self.context.timestamp();
         assert(!self.storage.desert.read().active, "desert mode");
@@ -385,8 +425,7 @@ pub contract L3XBridge {
                 da_len,
                 withdrawals_count: h.withdrawals_count,
                 withdrawals_amount: h.withdrawals_amount,
-                index_price: market_data[0] as u64,
-                index_time: market_data[1] as u64,
+                market_data,
             },
         );
     }
@@ -469,9 +508,11 @@ pub contract L3XBridge {
         self.call(L3XToken::at(self.storage.config.read().token).transfer(depositor, amount));
     }
 
-    /// Registers an account's exit claim from its leaf in the frozen accounts root. Positions are
-    /// valued at the frozen index price; negative equity counts as zero. The claim pays only the
-    /// leaf's owner. The opening comes from the account's DA entries (SPEC.md §9.5).
+    /// Registers a user account's exit claim from its leaf in the frozen accounts root. Positions are
+    /// valued at the frozen index prices, with funding accrued to the frozen cumulative indices;
+    /// negative equity counts as zero. The claim pays only the leaf's owner. The opening comes from
+    /// the account's DA entries (SPEC.md §9.5) and the market data from the last BatchSettled event.
+    /// Protocol accounts are paid last, from the residual (SPEC.md §12; not yet built).
     #[external("public")]
     fn exit_register(
         account_index: u32,
@@ -479,33 +520,24 @@ pub contract L3XBridge {
         master_auth: Field,
         enc_key_commitment: Field,
         class: Field,
-        collateral: Field,
-        size: Field,
-        entry: Field,
-        blind: Field,
+        plaintext: [Field; PLAINTEXT_LEN],
         path: [Field; ACCOUNTS_HEIGHT],
-        index_price: u64,
-        index_time: u64,
+        market_data: [Field; MARKET_DATA_LEN],
     ) {
         let mut d = self.storage.desert.read();
         assert(d.active, "not in desert mode");
         assert(self.context.timestamp() <= d.claim_close, "claim window closed");
-        assert(market_data_hash(index_price, index_time) == d.market_data_hash, "market data");
-        let c = collateral as u64;
-        let s = size as u64;
-        let e = entry as u64;
-        assert(
-            (c as Field == collateral) & (s as Field == size) & (e as Field == entry),
-            "opening out of range",
-        );
+        assert(market_data_hash(market_data) == d.market_data_hash, "market data");
+        assert(class == CLASS_USER, "protocol accounts claim from the residual");
         let pubv = AccountPub { owner: owner.to_field(), master_auth, enc_commitment: enc_key_commitment, class };
-        let privv = AccountPriv { collateral: c as i64, size: s as i64, entry: e as i64, blind };
+        let privv = from_plaintext(plaintext);
         assert(
             merkle_root(DS_ACCT_NODE, account_leaf(pubv, privv), account_index, path) == d.accounts_root,
             "not in the frozen accounts tree",
         );
         assert(!self.storage.claims.at(account_index).read().registered, "already claimed");
-        let equity = privv.collateral + privv.size * (index_price as i64) - privv.entry;
+        let (prices, cums) = index_and_funding(market_data);
+        let equity = equity_at(privv, prices, cums);
         let value: u128 = if equity > 0 { (equity as u64) as u128 } else { 0 };
         self.storage.claims.at(account_index).write(
             Claim { registered: true, paid: false, equity: value, owner },
@@ -616,6 +648,15 @@ pub contract L3XBridge {
     fn get_desert() -> (bool, Field, Field, u64, u128) {
         let d = self.storage.desert.read();
         (d.active, d.accounts_root, d.market_data_hash, d.claim_close, d.total_claims)
+    }
+
+    /// The protocol accounts' public parts: (owners, master authorizations, encryption-key
+    /// commitments), insurance first.
+    #[external("public")]
+    #[view]
+    fn get_protocol_accounts() -> ([AztecAddress; PROTOCOL_ACCOUNTS], [Field; PROTOCOL_ACCOUNTS], [Field; PROTOCOL_ACCOUNTS]) {
+        let c = self.storage.config.read();
+        (c.protocol_owners, c.protocol_master_auths, c.protocol_enc_commitments)
     }
 
     #[external("public")]

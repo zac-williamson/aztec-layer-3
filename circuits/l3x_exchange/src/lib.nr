@@ -1,5 +1,5 @@
-//! Exchange state and rules shared by the P1 segment circuits, the root and the Bridge
-//! (SPEC.md §6–§10, P1 profile in §15).
+//! Exchange state and rules shared by the segment circuits, the root and the Bridge
+//! (SPEC.md §6–§10; the P1 and P2 profiles in §15).
 pub mod consts;
 pub mod tree;
 pub mod account;
@@ -10,6 +10,7 @@ pub mod request;
 pub mod sig;
 pub mod book;
 pub mod trade;
+pub mod mark;
 
 pub fn book_empty_root() -> Field {
     book::empty_root()
@@ -39,9 +40,10 @@ pub fn withdrawals_root(records: [Field; MAX_WD_BATCH]) -> Field {
     layer[0]
 }
 
-/// The message an oracle publisher signs for an index update (SPEC.md §8.4).
-pub fn oracle_message(domain: Field, price: u64, time: u64) -> Field {
-    hash([DS_ORACLE, domain, price as Field, time as Field])
+/// The message an oracle publisher signs for an index update (SPEC.md §8.4): the market's index
+/// price, the publishers' external mark, and the publication time.
+pub fn oracle_message(domain: Field, market: u32, price: u64, external: u64, time: u64) -> Field {
+    hash([DS_ORACLE, domain, market as Field, price as Field, external as Field, time as Field])
 }
 
 #[test]

@@ -1,13 +1,14 @@
 use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment},
     consts::{
-        ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_WD_CHAIN, KIND_DEPOSIT,
-        KIND_REGISTER, LOG_PRIORITY, MAX_DEPOSIT, TAG_CHANGE, TAG_WD,
+        ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_WD_CHAIN, KIND_DEPOSIT, KIND_REGISTER,
+        LOG_PRIORITY, MAX_COLLATERAL, MAX_DEPOSIT, TAG_FULL, TAG_WD,
     },
-    da::{absorb, emit_account, open_segment, segment_nonce},
+    da::{absorb, emit_change, emit_full, open_segment, segment_nonce},
     params::Params,
     request::Request,
     state::State,
+    trade::abs,
     tree::update,
     withdrawal_record,
 };
@@ -32,8 +33,9 @@ struct Item {
 }
 
 /// Priority segment (SPEC.md §7.3, §12): executes the next `n` queued requests in order.
-/// Register creates the next account with zero collateral; Deposit credits an existing account
-/// or, if the account does not exist, refunds the depositor. No request can be skipped.
+/// Register creates the next account with zero collateral and no positions; Deposit credits an
+/// existing account or, if the account does not exist, refunds the depositor. No request can be
+/// skipped.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -77,14 +79,12 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field) -> (State, Ru
         assert(enc_commitment(w.k_enc) == req.b, "k_enc does not open the commitment");
         let pubv =
             AccountPub { owner: req.sender, master_auth: req.a, enc_commitment: req.b, class: CLASS_USER };
-        let privv =
-            AccountPriv { collateral: 0, size: 0, entry: 0, blind: blind(w.k_enc, idx, da_nonce, r.da_len) };
+        let privv = AccountPriv::empty(blind(w.k_enc, idx, da_nonce, r.da_len));
         let leaf = account_leaf(pubv, privv);
         st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, 0, leaf, w.acct_path);
-        st.activity_root =
-            update(DS_ACTV_NODE, st.activity_root, idx, 0, Activity::new().hash(), w.actv_path);
+        st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, 0, Activity::new().hash(), w.actv_path);
         st.num_accounts = idx + 1;
-        r = emit_account(r, TAG_CHANGE, idx, leaf, pubv, privv, w.k_enc, da_nonce);
+        r = emit_full(r, TAG_FULL, idx, leaf, pubv, privv, w.k_enc, da_nonce);
     } else {
         assert(req.kind == KIND_DEPOSIT, "unknown request kind");
         let amount = req.b as u64;
@@ -98,10 +98,11 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field) -> (State, Ru
             let old_leaf = account_leaf(w.acct_pub, w.acct_priv);
             let mut privv = w.acct_priv;
             privv.collateral = w.acct_priv.collateral + amount as i64;
+            assert(abs(privv.collateral) < MAX_COLLATERAL, "collateral out of range");
             privv.blind = blind(w.k_enc, idx, da_nonce, r.da_len);
             let leaf = account_leaf(w.acct_pub, privv);
             st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, old_leaf, leaf, w.acct_path);
-            r = emit_account(r, TAG_CHANGE, idx, leaf, w.acct_pub, privv, w.k_enc, da_nonce);
+            r = emit_change(r, idx, leaf, privv, w.k_enc, da_nonce);
         } else {
             // No such account: refund the depositor from the vault (SPEC.md §10.4). The priority
             // entry is public and unique, so it serves as the record's salt.

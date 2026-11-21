@@ -1,6 +1,6 @@
 use crate::{
     account::{AccountPriv, AccountPub, keystream},
-    consts::{DS_DANONCE, PLAINTEXT_LEN, TAG_SEG},
+    consts::{DS_DANONCE, PLAINTEXT_LEN, TAG_CHANGE, TAG_SEG},
 };
 use l3x_types::{da_absorb, hash::hash, Running};
 
@@ -23,9 +23,30 @@ pub fn open_segment(r: Running, da_nonce: Field) -> Running {
     absorb(absorb(r, TAG_SEG), da_nonce)
 }
 
-/// Appends an account entry (change or refresh) at the current DA position. `p.blind` must be
-/// the blind for this position if the entry writes a new leaf.
-pub fn emit_account(
+/// Appends the ciphertexts of an account's opening. `pos` is the entry's first DA position: the
+/// keystream index runs from it, so no two entries share a keystream.
+fn emit_ciphertexts(r: Running, account_index: u32, privv: AccountPriv, k_enc: Field, da_nonce: Field, pos: u32) -> Running {
+    let pt = privv.plaintext();
+    let mut out = r;
+    for i in 0..PLAINTEXT_LEN {
+        out = absorb(out, pt[i] + keystream(k_enc, account_index, da_nonce, pos, i));
+    }
+    out
+}
+
+/// A change entry: the account's public part is unchanged, so only the index, the new leaf and
+/// the encrypted opening are published (SPEC.md §9.5). `privv.blind` must be the blind for the
+/// entry's position.
+pub fn emit_change(r: Running, account_index: u32, leaf: Field, privv: AccountPriv, k_enc: Field, da_nonce: Field) -> Running {
+    let pos = r.da_len;
+    let mut out = absorb(r, TAG_CHANGE);
+    out = absorb(out, account_index as Field);
+    out = absorb(out, leaf);
+    emit_ciphertexts(out, account_index, privv, k_enc, da_nonce, pos)
+}
+
+/// A full entry, with the public part in clear: registration (TAG_FULL) and refresh (TAG_REFRESH).
+pub fn emit_full(
     r: Running,
     tag: Field,
     account_index: u32,
@@ -36,17 +57,12 @@ pub fn emit_account(
     da_nonce: Field,
 ) -> Running {
     let pos = r.da_len;
-    let pt = privv.plaintext();
-    let mut out = r;
-    out = absorb(out, tag);
+    let mut out = absorb(r, tag);
     out = absorb(out, account_index as Field);
     out = absorb(out, leaf);
     out = absorb(out, pubv.owner);
     out = absorb(out, pubv.master_auth);
     out = absorb(out, pubv.enc_commitment);
     out = absorb(out, pubv.class);
-    for i in 0..PLAINTEXT_LEN {
-        out = absorb(out, pt[i] + keystream(k_enc, account_index, da_nonce, pos, i));
-    }
-    out
+    emit_ciphertexts(out, account_index, privv, k_enc, da_nonce, pos)
 }

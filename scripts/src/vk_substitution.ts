@@ -27,9 +27,9 @@ import {
   vkPath,
   vkTree,
 } from './lib.ts';
-import { Engine } from './p1/engine.ts';
-import * as M from './p1/model.ts';
-import { genesisState, testParams } from './p1/params.ts';
+import { Engine } from './exchange/engine.ts';
+import * as M from './exchange/model.ts';
+import { genesisState, protocolAccounts, testParams } from './exchange/params.ts';
 import { type NodeOutput, type Running, Prover, batchStart, newApi, nodeToNoir } from './pipeline.ts';
 
 const CircuitKind = { App: 0, Kernel: 1, HidingKernel: 2 } as const;
@@ -156,7 +156,7 @@ async function main() {
 
   // An honest block segment from genesis, built by the engine.
   const honest = async (p: M.Params) => {
-    const engine = await Engine.create(api, p, prover.vkTreeRoot);
+    const engine = await Engine.create(api, p, prover.vkTreeRoot, await protocolAccounts(h));
     await engine.beginBatch(1n, 0n, 0n, 0n);
     await engine.block(now);
     const w = await engine.endBatch();
@@ -178,7 +178,7 @@ async function main() {
     await expectRejected(
       'G: segment proved under other parameters (root)',
       async () => {
-        const other = await honest({ ...params, imrPpm: params.imrPpm + 1n });
+        const other = await honest({ ...params, maxAge: params.maxAge + 1n });
         const p = await prover.padding(other.node.out.end);
         return (await prover.proveRoot(prover.rootInputs(other.node, p, other.w.endState, [], 1n))).verified;
       },

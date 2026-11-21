@@ -306,7 +306,7 @@ export class Prover {
     return { aggOut, chonkVk, chonkProof: fields.slice(2), ms, sizes };
   }
 
-  /** P-segment leaf. P1 executes no client-proof actions; the tube only logs the aggregation. */
+  /** P-segment leaf. No client-proof actions execute yet (P2.5); the tube only logs the aggregation. */
   async tube(start: Running, count: number = SHAPE.MAX_CLIENT_PROOFS, log = console.log) {
     const seg = await this.chonkSegment(count, log);
     const node = await this.proveNode('tube', {
@@ -375,6 +375,8 @@ export type BatchWitness = {
   /** The state at the end of the batch, as Noir input, and the header values it determines. */
   endState: unknown;
   endAccountsRoot: bigint;
+  /** Every market's public data (SPEC.md §8.4) and its hash, which the header carries. */
+  marketData: bigint[];
   marketDataHash: bigint;
   withdrawalRecords: bigint[];
   withdrawalsRoot: bigint;
@@ -387,6 +389,7 @@ export type ProvedBatch = {
   rootProof: bigint[];
   rootVk: bigint[];
   daPayload: bigint[];
+  marketData: bigint[];
   end: Running;
   shape: string;
   ms: Record<string, number>;
@@ -483,6 +486,7 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
     rootProof: root.proof,
     rootVk: readVkJson('root').vk.map((x) => BigInt(x)),
     daPayload: w.daPayload,
+    marketData: w.marketData,
     end: e,
     shape: `root(${shape[0]}, ${shape[1]})`,
     ms,
