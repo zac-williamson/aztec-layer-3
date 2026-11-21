@@ -10,9 +10,10 @@ export const TEST_ORACLE_SEED = 0x6c33782e6f7261636c65n; // "l3x.oracle"
 export const TEST_INSURANCE_SEED = 0x6c33782e696e73n; // "l3x.ins"
 export const TEST_FEE_SEED = 0x6c33782e666565n; // "l3x.fee"
 
-const market = (imr: bigint, mmr: bigint, band: bigint, jump: bigint, markBand: bigint, maker: bigint, taker: bigint, liq: bigint): M.MarketParams => ({
+const market = (imr: bigint, mmr: bigint, cmr: bigint, band: bigint, jump: bigint, markBand: bigint, maker: bigint, taker: bigint, liq: bigint): M.MarketParams => ({
   imrPpm: imr,
   mmrPpm: mmr,
+  cmrPpm: cmr,
   priceBandPpm: band,
   maxJumpPpm: jump,
   markBandPpm: markBand,
@@ -20,14 +21,15 @@ const market = (imr: bigint, mmr: bigint, band: bigint, jump: bigint, markBand: 
   takerFeePpm: taker,
   liqFeePpm: liq,
 });
-export const UNLISTED: M.MarketParams = market(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n);
+export const UNLISTED: M.MarketParams = market(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n);
 
 /**
  * Test parameters: three oracle publishers with a 2-of-3 threshold, indices at most an hour old
  * for risk-increasing actions, hourly funding, and three listed markets (market 3 is unlisted):
- * - market 0: 10× (IM 10%, MM 6%), maker 2 bp, taker 5 bp;
- * - market 1: 20× (IM 5%, MM 3%), maker 1 bp, taker 4 bp;
- * - market 2: 5× (IM 20%, MM 12%), no maker fee, taker 6 bp, wider bands.
+ * - market 0: 10× (IM 10%, MM 6%, CM 4%), maker 2 bp, taker 5 bp;
+ * - market 1: 20× (IM 5%, MM 3%, CM 2%), maker 1 bp, taker 4 bp;
+ * - market 2: 5× (IM 20%, MM 12%, CM 8%), no maker fee, taker 6 bp, wider bands.
+ * Close-out margins follow SPEC.md §8.3: MM = 0.6·IM, CM = 0.4·IM.
  * Limit prices within 5% of the mark (10% in market 2), index moves of at most 10% per update
  * (20%), marks within 2% of the index (3%), liquidation fees of 1% (1.5%).
  */
@@ -42,9 +44,9 @@ export async function testParams(h: M.H, chainId = 31337n, instance = 1n) {
     maxAge: 3600n,
     fundingInterval: 3600n,
     markets: [
-      market(100_000n, 60_000n, 50_000n, 100_000n, 20_000n, 200n, 500n, 10_000n),
-      market(50_000n, 30_000n, 50_000n, 100_000n, 20_000n, 100n, 400n, 10_000n),
-      market(200_000n, 120_000n, 100_000n, 200_000n, 30_000n, 0n, 600n, 15_000n),
+      market(100_000n, 60_000n, 40_000n, 50_000n, 100_000n, 20_000n, 200n, 500n, 10_000n),
+      market(50_000n, 30_000n, 20_000n, 50_000n, 100_000n, 20_000n, 100n, 400n, 10_000n),
+      market(200_000n, 120_000n, 80_000n, 100_000n, 200_000n, 30_000n, 0n, 600n, 15_000n),
       UNLISTED,
     ],
   };
@@ -86,6 +88,7 @@ export async function genesisState(api: Barretenberg, protocol?: ProtocolAccount
     refreshCursor: 0n,
     numAccounts: BigInt(accts.length),
     feesPending: 0n,
+    insurancePending: 0n,
     insuranceMicro: 0n,
   };
   const trees = await M.treesOf(h, state);

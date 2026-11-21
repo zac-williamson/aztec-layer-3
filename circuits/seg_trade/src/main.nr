@@ -1,17 +1,18 @@
 use l3x_exchange::{
-    account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, master_auth_of, Position},
+    account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, master_auth_of},
     book::{Order, order_index, replace, Sibling, SIDE_ASK, SIDE_BID, walk},
     consts::{
         ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, DS_WD_CHAIN, DS_WDSALT, LOG_SIGNED, MARKETS,
         MAX_COLLATERAL, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS, MAX_PRICE, PPM, TAG_WD,
     },
     da::{absorb, emit_change, open_segment, segment_nonce},
+    matching::{assert_no_crossing, Fill, match_order, Taker},
     params::Params,
     sig::{assert_signed, Signature},
-    state::{Market, State},
+    state::State,
     trade::{
-        abs, ACTION_PAYLOAD, action_msg, covers, equity, exposure_fresh, fee, fill, initial_margin, KIND_CANCEL,
-        KIND_PLACE, KIND_WITHDRAW, settle_funding, TIF_FOK, TIF_GTC, TIF_IOC, TIF_POST_ONLY, worst,
+        abs, ACTION_PAYLOAD, action_msg, covers, equity, exposure_fresh, initial_margin, KIND_CANCEL, KIND_PLACE,
+        KIND_WITHDRAW, TIF_FOK, TIF_GTC, TIF_IOC, TIF_POST_ONLY, worst,
     },
     tree::update,
     withdrawal_record,
@@ -21,23 +22,6 @@ use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
 /// Signed actions per segment, and matching steps per order.
 global TA: u32 = 2;
 global F: u32 = 2;
-
-/// One matching step against the best resting order: a fill, or, when the resting order is the
-/// taker's own, its cancellation (self-trade prevention, SPEC.md §8.1).
-struct Fill {
-    /// The resting order's leaf index, its price and sequence number, and the order before the step.
-    index: Field,
-    price: u32,
-    seq: u64,
-    order: Order,
-    book_path: [Sibling; BOOK_HEIGHT],
-    maker_pub: AccountPub,
-    maker_priv: AccountPriv,
-    maker_acct_path: [Field; ACCOUNTS_HEIGHT],
-    maker_k_enc: Field,
-    maker_actv: Activity,
-    maker_actv_path: [Field; ACCOUNTS_HEIGHT],
-}
 
 /// One signed action. Paths are valid against the roots at the moment each leaf is written.
 struct Action {
@@ -194,71 +178,31 @@ fn place(state: State, running: Running, a: Action, da_nonce: Field, params: Par
 
     // The taker's account and activity, in memory until the end of the action. Funding in this
     // market is settled before its position changes.
-    let mut taker = a.taker_priv;
-    let mut act = a.taker_actv;
-    act.nonce = a.nonce;
     let size_before = a.taker_priv.positions[mid].size;
-    let mut traded = false;
-    let mut remaining = lots;
-    assert(a.n_fills <= F, "too many fills");
-    for j in 0..F {
-        if j < a.n_fills {
-            let f = a.fills[j];
-            assert(f.order.side != side, "maker must be on the other side");
-            assert(f.order.lots > 0, "empty maker order");
-            assert(f.index == order_index(f.order.side, f.price, f.seq), "maker order index");
-            assert(remaining > 0, "order already filled");
-            let mp_price = f.price as u64;
-            // Best price-time: no same-side order lies ahead of it (SPEC.md §6.5).
-            let before = walk(f.order.leaf(), f.order.ask_lots(), f.order.bid_lots(), f.index, f.book_path);
-            assert(before.root == market.book_root, "maker order path");
-            if side == SIDE_BID {
-                assert(before.asks_left == 0, "not the best ask");
-                assert(mp_price <= price, "best ask above the limit");
-            } else {
-                assert(before.bids_right == 0, "not the best bid");
-                assert(mp_price >= price, "best bid below the limit");
-            }
-            if f.order.account_index == idx {
-                // Self-trade prevention: cancel the taker's own resting order and continue.
-                market.book_root = walk(0, 0, 0, f.index, f.book_path).root;
-                if f.order.side == SIDE_BID {
-                    act.open_bid[mid] -= f.order.lots;
-                } else {
-                    act.open_ask[mid] -= f.order.lots;
-                }
-                act.open_orders -= 1;
-            } else {
-                let q = if remaining < f.order.lots { remaining } else { f.order.lots };
-                let left = Order { side: f.order.side, account_index: f.order.account_index, lots: f.order.lots - q };
-                market.book_root = walk(left.leaf(), left.ask_lots(), left.bid_lots(), f.index, f.book_path).root;
-                let (st2, r2, m2) = fill_maker(st, r, market, mid, mp.maker_fee_ppm, f, q, left.lots, da_nonce);
-                st = st2;
-                r = r2;
-                market = m2;
-
-                // Taker side of the fill.
-                if !traded {
-                    let (c, pos, dust) = settle_funding(taker.collateral, taker.positions[mid], market.cum_funding);
-                    taker.collateral = c;
-                    taker.positions[mid] = pos;
-                    st.insurance_micro += dust;
-                    traded = true;
-                }
-                let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
-                let tpos = taker.positions[mid];
-                let (ts, te, tpnl) = fill(tpos.size, tpos.entry, 0 - dm, mp_price as i64);
-                let tfee = fee(q, mp_price, mp.taker_fee_ppm);
-                market = shift_oi(market, tpos.size, ts);
-                taker.positions[mid] = Position { size: ts, entry: te, funding: tpos.funding };
-                taker.collateral = taker.collateral + tpnl - tfee as i64;
-                assert(abs(taker.collateral) < MAX_COLLATERAL, "collateral out of range");
-                st.fees_pending += tfee;
-                remaining -= q;
-            }
-        }
-    }
-    assert(market.oi_long == market.oi_short, "open interest out of balance");
+    let mut act0 = a.taker_actv;
+    act0.nonce = a.nonce;
+    let taker = Taker { index: idx, priv: a.taker_priv, act: act0, traded: false };
+    let (st2, r2, m2, t, remaining, _) = match_order(
+        st,
+        r,
+        market,
+        mid,
+        side,
+        price,
+        lots,
+        taker,
+        a.fills,
+        a.n_fills,
+        mp.maker_fee_ppm,
+        mp.taker_fee_ppm,
+        da_nonce,
+    );
+    st = st2;
+    r = r2;
+    market = m2;
+    let mut taker = t.priv;
+    let mut act = t.act;
+    let traded = t.traded;
     assert(st.fees_pending < MAX_FEES, "fees out of range");
     if tif == TIF_FOK {
         assert(remaining == 0, "fill-or-kill order not filled");
@@ -273,14 +217,7 @@ fn place(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     // is left.
     if remaining > 0 {
         let seq = market.next_seq;
-        let slot = order_index(side, price as u32, seq);
-        let probe = walk(0, 0, 0, slot, a.rest_path);
-        assert(probe.root == market.book_root, "resting slot path");
-        if side == SIDE_BID {
-            assert(probe.asks_left == 0, "crossing asks remain");
-        } else {
-            assert(probe.bids_right == 0, "crossing bids remain");
-        }
+        let slot = assert_no_crossing(market.book_root, side, price, seq, a.rest_path);
         if rests {
             let o = Order { side, account_index: idx, lots: remaining };
             market.book_root = walk(o.leaf(), o.ask_lots(), o.bid_lots(), slot, a.rest_path).root;
@@ -325,55 +262,6 @@ fn place(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     (st, r)
 }
 
-/// The maker side of a fill of `q` lots at the maker's price, leaving `left` lots resting:
-/// settles the maker's funding, applies the fill and the maker fee, writes and publishes the
-/// maker's leaf, and updates its open lots.
-fn fill_maker(
-    state: State,
-    running: Running,
-    market: Market,
-    mid: u32,
-    maker_fee_ppm: u64,
-    f: Fill,
-    q: u64,
-    left: u64,
-    da_nonce: Field,
-) -> (State, Running, Market) {
-    let mut st = state;
-    let mut r = running;
-    let mut mkt = market;
-    let mi = f.order.account_index;
-    let mp_price = f.price as u64;
-    let (mc, mpos, mdust) = settle_funding(f.maker_priv.collateral, f.maker_priv.positions[mid], mkt.cum_funding);
-    st.insurance_micro += mdust;
-    let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
-    let (ms, me, mpnl) = fill(mpos.size, mpos.entry, dm, mp_price as i64);
-    let mfee = fee(q, mp_price, maker_fee_ppm);
-    mkt = shift_oi(mkt, mpos.size, ms);
-    let mut mpriv = f.maker_priv;
-    mpriv.positions[mid] = Position { size: ms, entry: me, funding: mpos.funding };
-    mpriv.collateral = mc + mpnl - mfee as i64;
-    assert(abs(mpriv.collateral) < MAX_COLLATERAL, "collateral out of range");
-    st.fees_pending += mfee;
-    assert(enc_commitment(f.maker_k_enc) == f.maker_pub.enc_commitment, "maker k_enc");
-    mpriv.blind = blind(f.maker_k_enc, mi, da_nonce, r.da_len);
-    let maker_leaf = account_leaf(f.maker_pub, mpriv);
-    st.accounts_root =
-        update(DS_ACCT_NODE, st.accounts_root, mi, account_leaf(f.maker_pub, f.maker_priv), maker_leaf, f.maker_acct_path);
-    r = emit_change(r, mi, maker_leaf, mpriv, f.maker_k_enc, da_nonce);
-    let mut mact = f.maker_actv;
-    if f.order.side == SIDE_BID {
-        mact.open_bid[mid] = f.maker_actv.open_bid[mid] - q;
-    } else {
-        mact.open_ask[mid] = f.maker_actv.open_ask[mid] - q;
-    }
-    if left == 0 {
-        mact.open_orders = f.maker_actv.open_orders - 1;
-    }
-    st.activity_root = update(DS_ACTV_NODE, st.activity_root, mi, f.maker_actv.hash(), mact.hash(), f.maker_actv_path);
-    (st, r, mkt)
-}
-
 fn cancel(state: State, a: Action) -> State {
     let mut st = state;
     // The account's leaf authenticates the signing key.
@@ -402,16 +290,4 @@ fn cancel(state: State, a: Action) -> State {
     st.activity_root =
         update(DS_ACTV_NODE, st.activity_root, a.account_index, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     st
-}
-
-/// Moves one account's contribution to open interest from `before` to `after`.
-fn shift_oi(m: Market, before: i64, after: i64) -> Market {
-    let mut out = m;
-    let long_before = if before > 0 { before as u64 } else { 0 };
-    let long_after = if after > 0 { after as u64 } else { 0 };
-    let short_before = if before < 0 { (0 - before) as u64 } else { 0 };
-    let short_after = if after < 0 { (0 - after) as u64 } else { 0 };
-    out.oi_long = m.oi_long + long_after - long_before;
-    out.oi_short = m.oi_short + short_after - short_before;
-    out
 }

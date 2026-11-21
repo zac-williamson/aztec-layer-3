@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.5, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: its first increment, multiple markets with mark, funding, fees and the protocol accounts, is built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.6, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), and liquidation with the insurance backstop (P2.2), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -673,7 +673,7 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 | M3 | Tube: 1,473,521 gates, 4.5 s, 480-field RollupHonk proof. |
 | M4 | Root, with two RollupHonk verifications and full IPA verification: 8,388,352 gates (≈ 2^23), 42–46 s, 458-field ZK proof. This is a fixed cost per batch. |
 | M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity. |
-| M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. Liquidation and risk-sweep costs await P2.2. |
+| M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. P2.2: `seg_liquidate` 327,161 gates for two liquidation steps (each any of cancel, close with two matching steps, takeover, deficit, ADL); its segments prove in 3.6–6.3 s under load. Risk-sweep costs await phase 3. |
 | M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
@@ -816,7 +816,12 @@ See `README.md`.
 
 ### P2 profile (in progress, 2026-11-21)
 
-P2 is built in increments, each leaving every test green. P2.1 is built: multiple markets, oracles with mark and funding ticks, fees, and the protocol accounts. Where P2.1 narrows the design, the full design remains normative.
+P2 is built in increments, each leaving every test green.
+
+- P2.1: multiple markets, oracles with mark and funding ticks, fees, and the protocol accounts.
+- P2.2: liquidation and the insurance backstop.
+
+Both are built. Where they narrow the design, the full design remains normative.
 
 **State** (§6):
 
@@ -836,14 +841,15 @@ P2 is built in increments, each leaving every test green. P2.1 is built: multipl
 - `other_root = H(DS_OTHER, activity_root, markets_hash, refresh_cursor, num_accounts, fees_pending, insurance_micro)`.
   - `markets_hash = H(DS_MKTS, MarketLeaf_0, …, MarketLeaf_3)`. Every segment opens the four markets once and closes them once, the in-circuit RAM pattern of §9.2.
   - `fees_pending` holds fees not yet credited to the fee account.
-  - `insurance_micro` holds funding remainders, in micro-units, not yet credited to the insurance account.
+  - `insurance_pending` holds liquidation fees, and `insurance_micro` holds funding remainders in micro-units; both are owed to the insurance account.
+  - The maintenance segment's sweep credits all three to their accounts.
 - Genesis holds the insurance account (index 0, class `insurance`) and the fee account (index 1, class `fee`), both with zero balances and a zero blind.
   - The Bridge takes their public parts at deployment, computes the genesis root itself, and publishes the public parts in a `ProtocolAccounts` event.
   - Exit clients rebuild the genesis tree from that event.
 
 **Parameters**, committed in `config_hash`:
 
-- per market: `imr`, `mmr`, `price_band`, `max_jump`, `mark_band`, the maker and taker fee rates (ppm, which are hundredths of a basis point), and a liquidation fee for P2.2;
+- per market: the margin fractions `imr`, `mmr` and `cmr` (§8.3), `price_band`, `max_jump`, `mark_band`, the maker and taker fee rates (ppm, which are hundredths of a basis point), and the liquidation fee;
 - three oracle publishers, with a signature threshold `oracle_k`;
 - `max_age` and `funding_interval`.
 
@@ -851,10 +857,13 @@ P2 is built in increments, each leaving every test green. P2.1 is built: multipl
 
 | Segment | Per proof | Gates | Change from P1 |
 | --- | --- | --- | --- |
-| `seg_block` | one L3 block, ≤ 4 index updates | 161,955 | k-of-n signatures, a mark tick per update with two 80-level top-of-book walks |
-| `seg_priority` | ≤ 4 requests | 99,717 | four position slots |
-| `seg_trade` | ≤ 2 signed actions, ≤ 2 matching steps each | 339,934 | any market; funding settlement, fees, FOK, post-only, reduce-only, self-trade prevention; margin over every market |
-| `seg_refresh` | sweep and ≤ 4 refresh entries | 47,828 | the sweep |
+| `seg_block` | one L3 block, ≤ 4 index updates | 162,273 | k-of-n signatures, a mark tick per update with two 80-level top-of-book walks |
+| `seg_priority` | ≤ 4 requests | 100,033 | four position slots |
+| `seg_trade` | ≤ 2 signed actions, ≤ 2 matching steps each | 340,288 | any market; funding settlement, fees, FOK, post-only, reduce-only, self-trade prevention; margin over every market |
+| `seg_refresh` | sweep and ≤ 4 refresh entries | 48,147 | the sweep |
+| `seg_liquidate` (P2.2) | ≤ 2 liquidation steps | 327,161 | new |
+
+Gate counts are for the P2.2 build.
 
 **Oracles, mark and funding** (§8.4):
 
@@ -921,13 +930,47 @@ P2 is built in increments, each leaving every test green. P2.1 is built: multipl
   - Payouts are valued at the frozen indices with funding accrued: Alice 1,005,366 plus her refunded 5,000 deposit, Bob 1,993,513.
   - The vault keeps 121: the fee account's 119 and 2 units of funding rounding, which the protocol accounts claim once §12's seniority rule is built.
 
+**Liquidation** (P2.2, §8.5):
+
+- Liquidations are operator steps in their own segment. Each step's message is logged as an action. Each precondition is checked at current marks, with fresh indices wherever the accounts involved are exposed.
+- Equity includes unrealized funding. `MM = Σ |size|·mark·mmr` and `CM = Σ |size|·mark·cmr`. Only user accounts can be liquidated.
+
+| Step | Precondition | Effect |
+| --- | --- | --- |
+| Cancel | `equity < MM` | Removes one of the account's resting orders. |
+| Close | `equity < MM`, no open orders | Closes up to the whole position in one market against the book, reduce-only, at prices no worse than the limit below. Pays the liquidation fee to the insurance fund. |
+| Takeover | `equity < CM`, no open orders | The insurance account takes over the position with the lowest unrealized PnL at the mark. Both settle funding first, and the account realizes its PnL. The insurance account must still meet its IM. |
+| Deficit | no positions or orders, negative collateral | The insurance account absorbs the deficit and must still meet its IM. |
+| ADL | `equity < CM`, no open orders, and a takeover would leave the insurance account below its IM | Closes the smaller of the position and an opposite user position, chosen by the operator, at the bankruptcy price. Ranking the counterparties is phase 3. |
+
+- **Close limit.** `mark ∓ mark·mmr_m·E⁺/MM`, the price at which closing keeps `equity/MM` constant (§8.5). The offset is truncated, so the limit lies on the account's side. An underwater account closes no worse than the mark.
+- **Close size.** A close that stops short of its stated size must prove that no liquidity is left within the limit.
+- **Liquidation fee.** `ceil(notional·liq_fee)`, capped at the equity left after the close, and accrued to `insurance_pending`.
+- **Bankruptcy price.** `mark − E/size`: closing the whole position there brings equity to zero. It is rounded so the bankrupt account ends at or above zero, so the counterparty bears less than one tick per lot. If equity is not negative, the price is the mark.
+- **Matching.** Signed orders and closes share one matching routine, `l3x_exchange::matching`.
+- **Engine.** A close's size depends on the steps before it in its segment, so the engine plans each segment in a dry run before executing it. It plans an account's whole waterfall the same way: cancel, close while the book can absorb, takeover lowest PnL first or ADL, then deficit.
+
+**Tests** (P2.2):
+
+- **Native**, batch 4: market 0 falls 13% in two signed updates within one block, which leaves two accounts underwater.
+  - Eve's waterfall: her resting order is cancelled, 30 lots close against the book, the insurance account takes over the rest and absorbs her deficit.
+  - Frank's position is auto-deleveraged against Dave's short at Frank's bankruptcy price, because a takeover would breach the insurance account's IM.
+  - Every step is proved, and conservation holds exactly.
+- **Adversarial:** 11 more witnesses, 36 in all:
+  - liquidating a healthy account or the insurance account;
+  - closing before the orders are cancelled, or below the limit;
+  - a takeover out of PnL order, beyond the insurance account's margin, or of an account above close-out margin;
+  - a deficit with positions left;
+  - an ADL while the insurance account could absorb, or against a same-side position;
+  - a liquidation on a stale index.
+- `EXECUTE_ONLY=1 npm run native` executes every segment and compares it with the engine without proving, in about 10 s.
+
 **Next increments:**
 
-1. P2.2: liquidation (§8.5) and the insurance backstop.
-2. P2.3: session keys, forced priority requests and GTT orders.
-3. P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
-4. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
-5. C1 custody (§10.3), once the D7 token is specified.
+1. P2.3: session keys, forced priority requests and GTT orders.
+2. P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
+3. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
+4. C1 custody (§10.3), once the D7 token is specified.
 
 ## 16. Decisions
 

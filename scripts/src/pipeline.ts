@@ -396,6 +396,39 @@ export type ProvedBatch = {
 };
 
 /**
+ * Executes every segment of a batch without proving and checks each circuit's output against the
+ * engine's expected transition: the differential check of proveBatch in seconds rather than minutes.
+ * Returns the parts of a ProvedBatch the tests chain on (the header's state and accounts roots).
+ */
+export async function executeBatch(prover: Prover, w: BatchWitness, log = console.log): Promise<ProvedBatch> {
+  let running = w.start;
+  for (const seg of w.segments) {
+    const t0 = performance.now();
+    const { returnValue } = await new Noir(readCircuit(seg.pkg) as any).execute(seg.inputs as any);
+    const got = nodeFields(nodeFromNoir(returnValue));
+    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd });
+    const bad = got.findIndex((x, j) => x !== want[j]);
+    assert(bad < 0, `${seg.label}: circuit output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
+    log(`  ${seg.label}: executed in ${(performance.now() - t0).toFixed(0)} ms`);
+    running = seg.expectedEnd;
+  }
+  const api = prover.api;
+  const s = w.start;
+  const e = running;
+  return {
+    header: [await stateRoot(api, s.state, s.priorityCursor, w.batchNumber - 1n, s.time), await stateRoot(api, e.state, e.priorityCursor, w.batchNumber, e.time), w.endAccountsRoot],
+    headerHash: 0n,
+    rootProof: [],
+    rootVk: [],
+    daPayload: w.daPayload,
+    marketData: w.marketData,
+    end: e,
+    shape: `executed ${w.segments.length} segments`,
+    ms: {},
+  };
+}
+
+/**
  * Proves a batch: every segment (checking the circuit's output against the engine's expected
  * transition, the engine/circuit differential check), merges of adjacent nodes until two remain
  * (padding a single segment), then the root.

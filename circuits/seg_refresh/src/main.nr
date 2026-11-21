@@ -23,9 +23,9 @@ struct Item {
 
 /// Maintenance segment (SPEC.md §8.6, §9.5).
 ///
-/// With `sweep`, it first credits the fees collected so far to the fee account and the whole
-/// micro-units of funding remainders to the insurance account, which keeps those balances out of
-/// every trade's witness (SPEC.md §8.8).
+/// With `sweep`, it first credits the fees collected so far to the fee account, and the liquidation
+/// fees and whole units of funding remainders to the insurance account, which keeps those balances
+/// out of every trade's witness (SPEC.md §8.8).
 ///
 /// It then republishes the next `n` accounts after refresh_cursor, in index order and wrapping
 /// around, each as its unchanged leaf with the full opening encrypted under a fresh keystream. Run
@@ -51,7 +51,7 @@ fn main(
         for k in 0..PROTOCOL_ACCOUNTS {
             let w = protocol[k];
             let (idx, class, credit) = if k == INSURANCE_INDEX {
-                (INSURANCE_INDEX, CLASS_INSURANCE, st.insurance_micro / MICRO)
+                (INSURANCE_INDEX, CLASS_INSURANCE, st.insurance_pending + st.insurance_micro / MICRO)
             } else {
                 (FEE_INDEX, CLASS_FEE, st.fees_pending)
             };
@@ -67,6 +67,7 @@ fn main(
             end = emit_change(end, idx, leaf, p, w.k_enc, da_nonce);
         }
         st.insurance_micro = st.insurance_micro % MICRO;
+        st.insurance_pending = 0;
         st.fees_pending = 0;
     }
     let mut cursor = st.refresh_cursor;

@@ -216,6 +216,72 @@ async function main() {
   [t.protocol[0], t.protocol[1]] = [t.protocol[1], t.protocol[0]];
   await expectFail('sweep swaps the protocol accounts', 'seg_refresh', t, 'protocol account class');
 
+  // Liquidation (SPEC.md §8.5). A fresh exchange: P provides liquidity; V (long 120 in market 0 and
+  // 1 in market 1, with an ask resting) and W (long 5) go underwater when market 0 falls 13%. The
+  // insurance account holds 10,000: enough to take over W, not V.
+  const L = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  const lu = await Promise.all([11n, 12n, 13n].map((x) => keysFromSeed(h, x)));
+  const [P, V, W] = [2n, 3n, 4n];
+  const lreqs: M.Request[] = [];
+  for (const [i, k] of lu.entries()) {
+    const encC = await M.encCommitment(h, k.kEnc);
+    L.keyring.set(encC, k.kEnc);
+    const sender = randomField();
+    lreqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender, time: now });
+    lreqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: [5_000_000n, 30_000n, 1_100n][i], sender, time: now });
+  }
+  lreqs.push({ kind: M.KIND.DEPOSIT, a: M.INSURANCE_INDEX, b: 10_000n, sender: randomField(), time: now });
+  await L.beginBatch(1n, 0n, 0n, 0n);
+  await L.block(now, [await update(L, 0n, 2000n, now), await update(L, 1n, 30_000n, now)]);
+  await L.priority(lreqs);
+  const lact = (u: number, nonce: bigint, p: bigint[]) => signAction(h, L.domain, lu[u], PLACE, BigInt(M.PROTOCOL_ACCOUNTS + u), nonce, p);
+  await L.trade([
+    await lact(0, 1n, [0n, ASK, 2000n, 400n, GTC, 0n]),
+    await lact(0, 2n, [1n, ASK, 30_000n, 5n, GTC, 0n]),
+    await lact(1, 1n, [0n, BID, 2000n, 120n, IOC, 0n]),
+    await lact(1, 2n, [1n, BID, 30_000n, 1n, IOC, 0n]),
+    await lact(2, 1n, [0n, BID, 2000n, 5n, IOC, 0n]),
+    await lact(1, 3n, [0n, ASK, 2050n, 1n, GTC, 0n]),
+  ]);
+  await L.block(now + 2n, [await update(L, 0n, 1840n, now + 1n), await update(L, 0n, 1740n, now + 2n)]);
+  await L.trade([await lact(0, 3n, [0n, BID, 1700n, 10n, GTC, 0n])]); // below V's close limit (the mark)
+  assert(L.rejected.length === 0, `liquidation setup rejected: ${L.rejected.map((r) => r.reason)}`);
+  assert(L.health(V).closeout && L.health(W).closeout && !L.health(P).liquidatable, 'liquidation setup health');
+  /** The witness of one liquidation step, built by a relaxed engine that skips its own checks. */
+  const relaxed = async (step: Parameters<Engine['liquidate']>[0][number]) => {
+    const snap = L.snapshot();
+    L.relax.add('liq');
+    try {
+      await L.liquidate([step]);
+      return clone(L.segments[L.segments.length - 1].inputs) as any;
+    } finally {
+      L.relax.clear();
+      L.restore(snap);
+    }
+  };
+  const vOrder = [...L.orders[0].entries()].find(([, o]) => o.account === V)![0];
+  const pOrder = [...L.orders[0].entries()].find(([, o]) => o.account === P)![0];
+  await expectFail('liquidating a healthy account', 'seg_liquidate', await relaxed({ kind: 'cancel', account: P, market: 0, index: pOrder }), 'account is not liquidatable');
+  await expectFail('closing before the orders are cancelled', 'seg_liquidate', await relaxed({ kind: 'close', account: V, market: 0 }), 'orders must be cancelled first');
+  await L.liquidate([{ kind: 'cancel', account: V, market: 0, index: vOrder }]); // honest
+  const cancelStep = clone(L.segments[L.segments.length - 1].inputs) as any;
+  await execute('seg_liquidate', cancelStep);
+  await expectFail('close below the liquidation limit', 'seg_liquidate', await relaxed({ kind: 'close', account: V, market: 0 }), 'best bid below the limit');
+  await expectFail('takeover before the lowest-PnL position', 'seg_liquidate', await relaxed({ kind: 'takeover', account: V, market: 1 }), 'not the lowest unrealized PnL');
+  await expectFail('takeover beyond the insurance margin', 'seg_liquidate', await relaxed({ kind: 'takeover', account: V, market: 0 }), 'insurance below initial margin');
+  await expectFail('takeover of an account above close-out margin', 'seg_liquidate', await relaxed({ kind: 'takeover', account: P, market: 0 }), 'account is above close-out margin');
+  await expectFail('deficit with positions left', 'seg_liquidate', await relaxed({ kind: 'deficit', account: V }), 'positions remain');
+  await expectFail('ADL while the insurance can absorb', 'seg_liquidate', await relaxed({ kind: 'adl', account: W, market: 0, counterparty: P }), 'insurance can absorb');
+  await expectFail('ADL against a position on the same side', 'seg_liquidate', await relaxed({ kind: 'adl', account: V, market: 0, counterparty: W }), 'counterparty not opposite');
+  await expectFail('liquidating the insurance account', 'seg_liquidate', await relaxed({ kind: 'deficit', account: M.INSURANCE_INDEX }), 'only user accounts are liquidated');
+  t = clone(cancelStep);
+  t.params.max_age = '0';
+  t.start.time = (BigInt(t.start.time) + 10n).toString();
+  await expectFail('liquidation on a stale index', 'seg_liquidate', t, 'index too old for a liquidation');
+  // The honest ends of both waterfalls execute: V is deleveraged against P, W taken over.
+  await L.liquidate([{ kind: 'adl', account: V, market: 0, counterparty: P }, { kind: 'takeover', account: W, market: 0 }]);
+  await execute('seg_liquidate', L.segments[L.segments.length - 1].inputs);
+
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);
   await api.destroy();

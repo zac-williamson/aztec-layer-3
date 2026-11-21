@@ -48,6 +48,7 @@ const STEPS: Step[] = [
   { pkg: 'seg_priority', vk: ROLLUP },
   { pkg: 'seg_trade', vk: ROLLUP },
   { pkg: 'seg_refresh', vk: ROLLUP },
+  { pkg: 'seg_liquidate', vk: ROLLUP },
   { pkg: 'merge', vk: ROLLUP },
   { pkg: 'root', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'rogue_app', vk: { scheme: 'chonk', kind: 'app' } },
@@ -68,6 +69,7 @@ const PUBLISHES: Record<string, string> = {
   seg_priority: 'SEG_PRIORITY_VK_HASH',
   seg_trade: 'SEG_TRADE_VK_HASH',
   seg_refresh: 'SEG_REFRESH_VK_HASH',
+  seg_liquidate: 'SEG_LIQUIDATE_VK_HASH',
   merge: 'MERGE_VK_HASH',
   root: 'ROOT_VK_HASH',
   rogue_app: 'ROGUE_APP_VK_HASH',
@@ -90,6 +92,7 @@ const VK_SLOTS: Record<string, number> = {
   seg_priority: ROLE.SEGMENT * S + 2,
   seg_trade: ROLE.SEGMENT * S + 3,
   seg_refresh: ROLE.SEGMENT * S + 4,
+  seg_liquidate: ROLE.SEGMENT * S + 5,
   merge: ROLE.MERGE * S + 0,
 };
 

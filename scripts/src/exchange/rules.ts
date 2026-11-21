@@ -160,3 +160,51 @@ export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint) =
   lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots]);
 export const askLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.ASK ? o.lots : 0n);
 export const bidLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.BID ? o.lots : 0n);
+
+// ---- Liquidation (liq.nr) ----
+
+export const LIQ = { CANCEL: 1n, CLOSE: 2n, TAKEOVER: 3n, DEFICIT: 4n, ADL: 5n } as const;
+
+export const closeoutMargin = (acct: M.AccountPriv, markets: M.Market[], params: M.Params) =>
+  acct.positions.reduce((s, p, m) => s + abs(p.size) * markets[m].markPrice * params.markets[m].cmrPpm, 0n);
+export const below = (eq: bigint, requirement: bigint) => !covers(eq, requirement);
+
+export const upnl = (p: M.Position, m: M.Market) =>
+  p.size === 0n ? 0n : p.size * m.markPrice - p.entry + fundingCredit(p.size, p.funding, m.cumFunding)[0];
+
+/** The ratio-preserving limit for closing a position against the book (liq.nr `close_limit`). */
+export function closeLimit(size: bigint, mark: bigint, mmrPpm: bigint, eq: bigint, mmScaled: bigint): bigint {
+  if (mmScaled <= 0n) throw new Error('no maintenance requirement');
+  const e = eq > 0n ? eq : 0n;
+  const delta = (mark * mmrPpm * e) / mmScaled;
+  return size > 0n ? (delta < mark ? mark - delta : 1n) : mark + delta;
+}
+
+export const liqFee = (notional: bigint, ratePpm: bigint) => (notional * ratePpm + PPM - 1n) / PPM;
+
+/** The bankruptcy price of a position (liq.nr `bankruptcy_price`). */
+export function bankruptcyPrice(size: bigint, mark: bigint, eq: bigint): bigint {
+  if (eq >= 0n) return mark;
+  const s = abs(size);
+  const d = (abs(eq) + s - 1n) / s;
+  if (size > 0n) return mark + d < MAX_PRICE ? mark + d : MAX_PRICE - 1n;
+  return d < mark ? mark - d : 1n;
+}
+
+/** The insurance account takes over a position at the mark (liq.nr `takeover`). */
+export function takeover(a: M.AccountPriv, ins: M.AccountPriv, market: M.Market, m: number) {
+  const mark = market.markPrice;
+  const [ac, apos, d1] = settleFunding(a.collateral, a.positions[m], market.cumFunding);
+  const [ic, ipos, d2] = settleFunding(ins.collateral, ins.positions[m], market.cumFunding);
+  const s = apos.size;
+  const [as, ae, apnl] = fill(apos.size, apos.entry, -s, mark);
+  const [is, ie, ipnl] = fill(ipos.size, ipos.entry, s, mark);
+  const a2 = M.copyPriv(a);
+  a2.positions[m] = { size: as, entry: ae, funding: apos.funding };
+  a2.collateral = ac + apnl;
+  const i2 = M.copyPriv(ins);
+  i2.positions[m] = { size: is, entry: ie, funding: ipos.funding };
+  i2.collateral = ic + ipnl;
+  if (abs(a2.collateral) >= MAX_COLLATERAL || abs(i2.collateral) >= MAX_COLLATERAL) throw new Error('collateral out of range');
+  return { a: a2, ins: i2, sizes: { a: [apos.size, as] as const, ins: [ipos.size, is] as const }, dust: d1 + d2 };
+}

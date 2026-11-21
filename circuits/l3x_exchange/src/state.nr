@@ -122,8 +122,9 @@ pub fn market_data_hash(data: [Field; MARKET_DATA_LEN]) -> Field {
 }
 
 /// Opening of Running.state (SPEC.md §6.2). `fees_pending` is collected but not yet credited to the
-/// fee account; `insurance_micro` holds funding remainders, in micro-units, not yet credited to the
-/// insurance account. Both are swept into their accounts by the maintenance segment.
+/// fee account; `insurance_pending` (liquidation fees) and `insurance_micro` (funding remainders, in
+/// micro-units) are owed to the insurance account. The maintenance segment sweeps them into their
+/// accounts.
 pub struct State {
     pub accounts_root: Field,
     pub activity_root: Field,
@@ -131,6 +132,7 @@ pub struct State {
     pub refresh_cursor: u32,
     pub num_accounts: u32,
     pub fees_pending: u64,
+    pub insurance_pending: u64,
     pub insurance_micro: u64,
 }
 
@@ -139,7 +141,8 @@ impl State {
         hash(
             [
                 DS_OTHER, self.activity_root, markets_hash(self.markets), self.refresh_cursor as Field,
-                self.num_accounts as Field, self.fees_pending as Field, self.insurance_micro as Field,
+                self.num_accounts as Field, self.fees_pending as Field, self.insurance_pending as Field,
+                self.insurance_micro as Field,
             ],
         )
     }
@@ -193,6 +196,7 @@ pub fn genesis_state(protocol: [AccountPub; PROTOCOL_ACCOUNTS]) -> State {
         refresh_cursor: 0,
         num_accounts: PROTOCOL_ACCOUNTS,
         fees_pending: 0,
+        insurance_pending: 0,
         insurance_micro: 0,
     }
 }

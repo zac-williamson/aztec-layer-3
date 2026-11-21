@@ -1,6 +1,6 @@
 # L3X
 
-A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the design. This repository holds phases P0 and P1 and the first increment of P2 (SPEC.md §15):
+A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the design. This repository holds phases P0 and P1 and the first increments of P2 (SPEC.md §15):
 
 - **P0**: the `rollup-on-aztec` proof pipeline ported to Aztec v6, with a merge tree, a role-partitioned VK tree, and a Bridge that settles batches under a delayed configuration.
 - **P1**: a single-market perpetuals exchange.
@@ -14,6 +14,9 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - Hourly funding settled lazily per position, and maker and taker fees, with every rounding against the account.
   - Insurance and fee accounts from genesis.
   - FOK, post-only and reduce-only orders, and self-trade prevention.
+- **P2.2**: liquidation (SPEC.md §8.5) as operator steps checked in circuit.
+  - The waterfall: cancel the account's orders, close against the book within a ratio-preserving limit, insurance takeover lowest PnL first, deficit absorption.
+  - Auto-deleveraging at the bankruptcy price once the insurance account cannot absorb a position.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -22,11 +25,12 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | Path | Contents |
 | --- | --- |
 | `circuits/l3x_types` | Shared constants, Poseidon2 sponge, running values and node output, VK tree, DA sponge, `BatchHeader` |
-| `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, fills, funding, fees, margin, mark ticks |
+| `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick |
 | `circuits/seg_priority` | X-segment: Register and Deposit requests in queue order (refunds for missing accounts) |
 | `circuits/seg_trade` | X-segment: signed PlaceOrder (GTC, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, Withdraw |
-| `circuits/seg_refresh` | X-segment (maintenance): sweeps fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
+| `circuits/seg_refresh` | X-segment (maintenance): sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
+| `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/client_auth` | P-lane client circuit: knowledge of the secret behind an account's auth binding, authorizing `msg` |
 | `circuits/agg_app` | Chonk app: verifies 10 client proofs against the pinned client VK and folds the first `count` |
 | `circuits/{init,tail,hiding}_kernel` | IVC kernels: OINK, HN, HN_FINAL, each pinning its predecessor's VK hash |
@@ -83,12 +87,15 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs three batches natively across markets 0–2. They cover:
+This runs four batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
-- self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps.
+- self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
+- a 13% fall in market 0 followed by both liquidation waterfalls, one ending in an insurance takeover and deficit, the other in auto-deleveraging.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
+
+With `EXECUTE_ONLY=1`, the segments are executed and compared with the engine but not proved, which takes seconds instead of minutes.
 
 ```bash
 npm run adversarial
@@ -128,7 +135,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P1: not done | The exit criterion names a testnet; the run here is a local network. |
 | P2.1: markets, mark, funding, fees | Four market slots; k-of-n oracle updates as mark ticks with proved top of book; lazy funding and fees with every rounding against the account; insurance and fee accounts from genesis, credited by a sweep; FOK, post-only, reduce-only, self-trade prevention. |
 | P2.1: tests | Native run with exact conservation after every batch; 25 adversarial witnesses rejected; 47 Bridge TXE tests; the exit test on a local network with funding accrued to the freeze. |
-| P2: next | P2.2 liquidation and the insurance backstop; P2.3 session keys, forced requests, GTT; P2.4 refresh-rate enforcement, late desert claims, protocol-account seniority; P2.5 receipts, client-proof actions; C1 custody once the D7 token is specified. |
+| P2.2: liquidation | Cancel, close within the ratio-preserving limit, insurance takeover lowest PnL first, deficit absorption, auto-deleveraging at the bankruptcy price; preconditions checked in circuit at fresh marks. |
+| P2.2: tests | Both liquidation waterfalls proved in the native run; 11 more adversarial witnesses (36 in all). |
+| P2: next | P2.3 session keys, forced requests, GTT; P2.4 refresh-rate enforcement, late desert claims, protocol-account seniority; P2.5 receipts, client-proof actions; C1 custody once the D7 token is specified. |
 
 ## Caveats
 

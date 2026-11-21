@@ -40,6 +40,7 @@ pub global DS_BLOCK: Field = 44;
 pub global DS_DOMAIN: Field = 45;
 pub global DS_MKTS: Field = 46;
 pub global DS_MKT_PARAMS: Field = 47;
+pub global DS_LIQ: Field = 48;
 
 // Priority request kinds (SPEC.md §7.3).
 pub global KIND_REGISTER: Field = 1;
@@ -50,6 +51,7 @@ pub global LOG_PRIORITY: Field = 1;
 pub global LOG_BLOCK: Field = 2;
 pub global LOG_ORACLE: Field = 3;
 pub global LOG_SIGNED: Field = 4;
+pub global LOG_LIQUIDATE: Field = 5;
 
 // DA entries (SPEC.md §9.5). Every entry starts with its tag and has a fixed length.
 pub global TAG_SEG: Field = 1; // [tag, da_nonce]: opens a segment's encryption context

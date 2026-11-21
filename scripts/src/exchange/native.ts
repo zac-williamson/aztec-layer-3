@@ -4,15 +4,17 @@
 // opened from the DA payloads alone.
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
-import { Prover, assert, newApi, proveBatch } from '../pipeline.ts';
+import { type BatchWitness, Prover, assert, executeBatch, newApi, proveBatch } from '../pipeline.ts';
 import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
 import * as M from './model.ts';
-import { protocolAccounts, testParams } from './params.ts';
+import { genesisState, protocolAccounts, testParams } from './params.ts';
 import * as X from './rules.ts';
 
 const log = (m: string) => console.log(`[native] ${m}`);
+/** EXECUTE_ONLY=1 executes every segment and compares it with the engine, without proving. */
+const EXECUTE_ONLY = !!process.env.EXECUTE_ONLY;
 const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
 
 /**
@@ -38,15 +40,18 @@ async function main() {
   const h = M.hasher(api);
   const { params, oracleSks } = await testParams(h);
   const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
+  const settle = (w: BatchWitness) => (EXECUTE_ONLY ? executeBatch(prover, w, log) : proveBatch(prover, w, log));
   const protocol = await protocolAccounts(h);
   const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol);
-  assert((await engine.trees()) === BigInt(manifest.genesisTrees), 'engine genesis != manifest genesis');
+  // Execute-only runs may use circuits newer than the manifest, so they check genesis directly.
+  const genesis = EXECUTE_ONLY ? await genesisState(api, protocol) : { trees: BigInt(manifest.genesisTrees), stateRoot: BigInt(manifest.genesisStateRoot) };
+  assert((await engine.trees()) === genesis.trees, 'engine genesis != manifest genesis');
   const update = (market: bigint, price: bigint, external: bigint, time: bigint) => signUpdate(h, engine.domain, oracleSks, [0, 2], market, price, external, time);
 
   const now = BigInt(Math.floor(Date.now() / 1000)) - 10_000n;
-  const users = await Promise.all([101n, 202n, 303n].map(async (seed) => ({ seed, addr: randomField(), keys: await keysFromSeed(h, seed) })));
-  const [alice, bob, carol] = users.map((u) => u.keys);
-  const [A, B, C] = [2n, 3n, 4n]; // account indices after the two protocol accounts
+  const users = await Promise.all([101n, 202n, 303n, 404n, 505n, 606n].map(async (seed) => ({ seed, addr: randomField(), keys: await keysFromSeed(h, seed) })));
+  const [alice, bob, carol, dave, eve, frank] = users.map((u) => u.keys);
+  const [A, B, C, D, E, F] = [2n, 3n, 4n, 5n, 6n, 7n]; // account indices after the two protocol accounts
   const reqs: M.Request[] = [];
   for (const [i, u] of users.entries()) {
     const masterAuth = await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y);
@@ -57,9 +62,12 @@ async function main() {
   reqs.push({ kind: M.KIND.DEPOSIT, a: A, b: 1_000_000n, sender: users[0].addr, time: now - 90n });
   reqs.push({ kind: M.KIND.DEPOSIT, a: B, b: 2_000_000n, sender: users[1].addr, time: now - 85n });
   reqs.push({ kind: M.KIND.DEPOSIT, a: C, b: 3_000_000n, sender: users[2].addr, time: now - 84n });
+  reqs.push({ kind: M.KIND.DEPOSIT, a: D, b: 5_000_000n, sender: users[3].addr, time: now - 83n });
+  reqs.push({ kind: M.KIND.DEPOSIT, a: E, b: 30_000n, sender: users[4].addr, time: now - 82n });
+  reqs.push({ kind: M.KIND.DEPOSIT, a: F, b: 25_000n, sender: users[5].addr, time: now - 81n });
   reqs.push({ kind: M.KIND.DEPOSIT, a: 99n, b: 500n, sender: users[1].addr, time: now - 80n }); // no account 99: refund
-  reqs.push({ kind: M.KIND.DEPOSIT, a: M.INSURANCE_INDEX, b: 50_000n, sender: users[2].addr, time: now - 79n }); // seed the insurance fund
-  let netDeposits = 6_050_000n;
+  reqs.push({ kind: M.KIND.DEPOSIT, a: M.INSURANCE_INDEX, b: 20_000n, sender: users[2].addr, time: now - 79n }); // seed the insurance fund
+  let netDeposits = 11_075_000n;
   const report: Record<string, unknown> = {};
 
   // Batch 1: indices for three markets, registrations, deposits, a refund.
@@ -69,8 +77,8 @@ async function main() {
   checkConservation(engine, netDeposits, 'batch 1');
   const w1 = await engine.endBatch();
   log(`batch 1: ${w1.segments.map((s) => s.label).join(' | ')}; ${w1.daPayload.length} DA fields`);
-  const b1 = await proveBatch(prover, w1, log);
-  assert(b1.header[0] === BigInt(manifest.genesisStateRoot), 'batch 1 does not start from genesis');
+  const b1 = await settle(w1);
+  assert(b1.header[0] === genesis.stateRoot, 'batch 1 does not start from genesis');
 
   // Batch 2: trading in markets 0 and 1, with orders the rules must refuse mixed in.
   const act = (who: typeof alice, account: bigint, nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, who, kind, account, nonce, p);
@@ -118,7 +126,7 @@ async function main() {
   checkConservation(engine, netDeposits, 'batch 2');
   const w2 = await engine.endBatch();
   log(`batch 2: ${w2.segments.map((s) => s.label).join(' | ')}; ${w2.daPayload.length} DA fields`);
-  const b2 = await proveBatch(prover, w2, log);
+  const b2 = await settle(w2);
   assert(b2.header[0] === b1.header[1], 'batch 2 does not chain from batch 1');
 
   // Batch 3: an hour later funding is due in markets 0 and 1, and the next ticks apply it. Carol
@@ -138,15 +146,57 @@ async function main() {
   checkConservation(engine, netDeposits, 'batch 3');
   const w3 = await engine.endBatch();
   log(`batch 3: ${w3.segments.map((s) => s.label).join(' | ')}; ${w3.daPayload.length} DA fields`);
-  const b3 = await proveBatch(prover, w3, log);
+  const b3 = await settle(w3);
   assert(b3.header[0] === b2.header[1], 'batch 3 does not chain from batch 2');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the three
+  // Batch 4: liquidation (SPEC.md §8.5). Eve and Frank buy in market 0 from Dave; Eve also rests
+  // an ask. The index then falls 13% in two updates within one block, which leaves both underwater.
+  // Eve: her ask is cancelled, part of her position closes against Dave's new bid, the insurance
+  // account takes over the rest and absorbs her deficit. Frank: the insurance account, seeded small,
+  // cannot also absorb his position, so it is auto-deleveraged against Dave's short at Frank's
+  // bankruptcy price.
+  await engine.beginBatch(4n, b3.end.priorityHead, b3.end.priorityCursor, b3.end.time);
+  const t4 = now + 3800n;
+  await engine.block(t4, [await update(0n, 2000n, 2000n, t4 - 1n)]);
+  await engine.trade([
+    await act(dave, D, 1n, PLACE, [0n, ASK, 2000n, 400n, GTC, 0n]),
+    await act(eve, E, 1n, PLACE, [0n, BID, 2000n, 120n, IOC, 0n]),
+    await act(frank, F, 1n, PLACE, [0n, BID, 2000n, 100n, IOC, 0n]),
+    await act(eve, E, 2n, PLACE, [0n, ASK, 2050n, 1n, GTC, 0n]),
+  ]);
+  assert(engine.rejected.length === 5, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  await engine.block(t4 + 1n, [await update(0n, 1840n, 1840n, t4), await update(0n, 1740n, 1740n, t4 + 1n)]);
+  assert(engine.markets[0].markPrice === 1740n, `market 0 mark after the fall: ${engine.markets[0].markPrice}`);
+  await engine.trade([await act(dave, D, 2n, PLACE, [0n, BID, 1745n, 30n, GTC, 0n])]);
+  assert(engine.rejected.length === 5, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  const before4 = { eve: engine.health(E), frank: engine.health(F) };
+  log(`after the fall: eve equity ${before4.eve.equity} (MM ${before4.eve.mm / X.PPM}), frank equity ${before4.frank.equity} (MM ${before4.frank.mm / X.PPM})`);
+  assert(before4.eve.liquidatable && before4.frank.closeout, 'both accounts liquidatable');
+  const eveSteps = await engine.liquidateAccount(E);
+  const frankSteps = await engine.liquidateAccount(F, () => D);
+  const kinds = [...eveSteps, ...frankSteps].map((x) => x.kind).join(', ');
+  log(`liquidation steps: ${kinds}`);
+  assert(kinds === 'cancel, close, takeover, deficit, adl', `unexpected waterfall: ${kinds}`);
+  const ins = engine.accts.get(M.INSURANCE_INDEX)!.priv;
+  for (const [name, i] of [['eve', E], ['frank', F]] as const) {
+    const p = engine.accts.get(i)!.priv;
+    assert(p.collateral === 0n && p.positions.every((x) => x.size === 0n), `${name} not fully liquidated: ${show(p)}`);
+  }
+  assert(ins.positions[0].size === 90n && engine.accts.get(D)!.priv.positions[0].size === -90n, 'positions after liquidation');
+  log(`insurance: long ${ins.positions[0].size} in market 0, collateral ${ins.collateral} (+${engine.insurancePending} liquidation fees pending); dave short ${-engine.accts.get(D)!.priv.positions[0].size}`);
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 4');
+  const w4 = await engine.endBatch();
+  log(`batch 4: ${w4.segments.map((s) => s.label).join(' | ')}; ${w4.daPayload.length} DA fields`);
+  const b4 = await settle(w4);
+  assert(b4.header[0] === b3.header[1], 'batch 4 does not chain from batch 3');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the four
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b3.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b4.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
@@ -158,11 +208,12 @@ async function main() {
   assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -60n && pos(C).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
-  log(`header of batch 3 ${hex(b3.headerHash)}`);
+  log(`header of batch 4 ${hex(b4.headerHash)}`);
   await api.destroy();
 }
 

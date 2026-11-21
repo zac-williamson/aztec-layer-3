@@ -34,6 +34,7 @@ export const DS = {
   DOMAIN: 45n,
   MKTS: 46n,
   MKT_PARAMS: 47n,
+  LIQ: 48n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -43,7 +44,7 @@ export const MAX_WD_BATCH = 16;
 export const MARKETS = 4;
 export const N_ORACLES = 3;
 export const KIND = { REGISTER: 1n, DEPOSIT: 2n } as const;
-export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n } as const;
+export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
 export const CHANGE_ENTRY_LEN = 3 + PLAINTEXT_LEN;
@@ -95,11 +96,13 @@ export type State = {
   refreshCursor: bigint;
   numAccounts: bigint;
   feesPending: bigint;
+  insurancePending: bigint;
   insuranceMicro: bigint;
 };
 export type MarketParams = {
   imrPpm: bigint;
   mmrPpm: bigint;
+  cmrPpm: bigint;
   priceBandPpm: bigint;
   maxJumpPpm: bigint;
   markBandPpm: bigint;
@@ -196,11 +199,11 @@ export function decodeMarketData(data: bigint[]) {
 }
 export const marketsHash = async (h: H, ms: Market[]) => h([DS.MKTS, ...(await Promise.all(ms.map((m) => marketHash(h, m))))]);
 export const otherRoot = async (h: H, s: State) =>
-  h([DS.OTHER, s.activityRoot, await marketsHash(h, s.markets), s.refreshCursor, s.numAccounts, s.feesPending, s.insuranceMicro]);
+  h([DS.OTHER, s.activityRoot, await marketsHash(h, s.markets), s.refreshCursor, s.numAccounts, s.feesPending, s.insurancePending, s.insuranceMicro]);
 export const treesOf = async (h: H, s: State) => h([DS.TREES, s.accountsRoot, await otherRoot(h, s)]);
 
 export const marketParamsHash = (h: H, p: MarketParams) =>
-  h([DS.MKT_PARAMS, p.imrPpm, p.mmrPpm, p.priceBandPpm, p.maxJumpPpm, p.markBandPpm, p.makerFeePpm, p.takerFeePpm, p.liqFeePpm]);
+  h([DS.MKT_PARAMS, p.imrPpm, p.mmrPpm, p.cmrPpm, p.priceBandPpm, p.maxJumpPpm, p.markBandPpm, p.makerFeePpm, p.takerFeePpm, p.liqFeePpm]);
 export async function paramsHash(h: H, p: Params) {
   const oracles = p.oraclePkX.flatMap((x, i) => [x, p.oraclePkY[i]]);
   const markets = await Promise.all(p.markets.map((m) => marketParamsHash(h, m)));
@@ -269,11 +272,13 @@ export const stateToNoir = (s: State) => ({
   refresh_cursor: s.refreshCursor.toString(),
   num_accounts: s.numAccounts.toString(),
   fees_pending: s.feesPending.toString(),
+  insurance_pending: s.insurancePending.toString(),
   insurance_micro: s.insuranceMicro.toString(),
 });
 export const marketParamsToNoir = (p: MarketParams) => ({
   imr_ppm: p.imrPpm.toString(),
   mmr_ppm: p.mmrPpm.toString(),
+  cmr_ppm: p.cmrPpm.toString(),
   price_band_ppm: p.priceBandPpm.toString(),
   max_jump_ppm: p.maxJumpPpm.toString(),
   mark_band_ppm: p.markBandPpm.toString(),

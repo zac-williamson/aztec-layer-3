@@ -2,15 +2,17 @@ use crate::consts::{DS_DOMAIN, DS_MKT_PARAMS, DS_PARAMS, MARKETS, N_ORACLES};
 use l3x_types::{config_hash, hash::hash};
 
 /// One market's parameters (SPEC.md §6.6, §8), in ppm. A market is listed when `imr_ppm > 0`.
-///   imr, mmr: initial and maintenance margin fractions;
+///   imr, mmr, cmr: initial, maintenance and close-out margin fractions (SPEC.md §8.3);
 ///   price_band: maximum distance of a limit price from the mark;
 ///   max_jump: maximum index change per oracle update;
 ///   mark_band: maximum distance of the mark from the index;
 ///   maker_fee, taker_fee: fee rates (hundredths of a basis point are ppm);
-///   liq_fee: liquidation fee charged to a liquidated account (P2.2).
+///   liq_fee: fee on the notional a liquidation closes against the book, paid to the insurance
+///   fund (at most 1%, SPEC.md §8.5).
 pub struct MarketParams {
     pub imr_ppm: u64,
     pub mmr_ppm: u64,
+    pub cmr_ppm: u64,
     pub price_band_ppm: u64,
     pub max_jump_ppm: u64,
     pub mark_band_ppm: u64,
@@ -23,7 +25,8 @@ impl MarketParams {
     pub fn hash(self) -> Field {
         hash(
             [
-                DS_MKT_PARAMS, self.imr_ppm as Field, self.mmr_ppm as Field, self.price_band_ppm as Field,
+                DS_MKT_PARAMS, self.imr_ppm as Field, self.mmr_ppm as Field, self.cmr_ppm as Field,
+                self.price_band_ppm as Field,
                 self.max_jump_ppm as Field, self.mark_band_ppm as Field, self.maker_fee_ppm as Field,
                 self.taker_fee_ppm as Field, self.liq_fee_ppm as Field,
             ],

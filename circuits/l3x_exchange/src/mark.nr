@@ -140,6 +140,7 @@ fn ticks() {
     let mp = MarketParams {
         imr_ppm: 100_000,
         mmr_ppm: 60_000,
+        cmr_ppm: 40_000,
         price_band_ppm: 50_000,
         max_jump_ppm: 100_000,
         mark_band_ppm: 20_000,
