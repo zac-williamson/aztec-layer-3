@@ -1,0 +1,6 @@
+[package]
+name = "l3x_types"
+type = "lib"
+authors = [""]
+
+[dependencies]

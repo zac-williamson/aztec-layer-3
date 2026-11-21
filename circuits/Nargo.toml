@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "l3x_types",
+    "client_auth",
+    "agg_app",
+    "init_kernel",
+    "tail_kernel",
+    "hiding_kernel",
+    "tube",
+    "padding",
+    "root",
+    "rogue_app",
+]

@@ -1,0 +1,7 @@
+[package]
+name = "init_kernel"
+type = "bin"
+authors = [""]
+
+[dependencies]
+l3x_types = { path = "../l3x_types" }

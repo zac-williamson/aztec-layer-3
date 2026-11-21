@@ -1,0 +1,9 @@
+[package]
+name = "l3x_bridge"
+type = "contract"
+authors = [""]
+
+[dependencies]
+aztec = { git = "https://github.com/aztec-labs-eng/aztec-nr", tag = "v6.0.0", directory = "aztec" }
+bb_proof_verification = { path = "../../circuits/vendor/bb_proof_verification" }
+l3x_types = { path = "../../circuits/l3x_types" }
