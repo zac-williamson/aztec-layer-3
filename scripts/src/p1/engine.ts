@@ -43,6 +43,11 @@ export class Engine {
   keyring = new Map<bigint, bigint>();
   /** Actions the engine refused, with the reason (they were never sequenced). */
   rejected: Rejection[] = [];
+  /**
+   * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
+   * (a malicious operator's engine). Empty in any real use.
+   */
+  relax = new Set<'fills'>();
 
   // The batch being built.
   running!: Running;
@@ -171,6 +176,9 @@ export class Engine {
     if (update) {
       const msg = await M.oracleMessage(this.h, this.domain, update.price, update.time);
       assert(update.time > this.market.indexTime && update.time <= time, 'oracle update time');
+      assert(update.price > 0n && update.price < X.MAX_PRICE, 'oracle price out of range');
+      const old = this.market.indexPrice;
+      assert(old === 0n || X.abs(update.price - old) * X.PPM <= old * this.params.maxJumpPpm, 'oracle jump too large');
       this.market.indexPrice = update.price;
       this.market.indexTime = update.time;
       r.actionLog = await M.logAppend(this.h, r.actionLog, msg, M.LOG.ORACLE);
@@ -534,7 +542,9 @@ export class Engine {
     let restPath = emptyBookPath();
     if (remaining > 0n) {
       const best = this.bestOpposite(side);
-      if (best && (side === M.SIDE.BID ? best.price <= price : best.price >= price)) throw new Error(`order needs more than ${FILLS} fills`);
+      if (!this.relax.has('fills') && best && (side === M.SIDE.BID ? best.price <= price : best.price >= price)) {
+        throw new Error(`order needs more than ${FILLS} fills`);
+      }
       const seq = this.market.nextSeq;
       const slot = X.orderIndex(side, price, seq);
       restPath = siblingsToNoir(this.book.path(slot));

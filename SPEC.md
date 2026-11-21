@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.4, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1 is under way. Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.4, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -673,6 +673,7 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 | M3 | Tube: 1,473,521 gates, 4.5 s, 480-field RollupHonk proof. |
 | M4 | Root, with two RollupHonk verifications and full IPA verification: 8,388,352 gates (≈ 2^23), 42–46 s, 458-field ZK proof. This is a fixed cost per batch. |
 | M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity. |
+| M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. Liquidation and risk-sweep costs await P2. |
 | M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
@@ -713,7 +714,103 @@ P0 status (2026-11-21): complete on Aztec 6.0.0 rather than 6.1, which had not y
 - The Bridge's checks are covered by TXE tests: replay, priority-queue forgeries, `T_force`, time bounds, halt and resume, and delayed configuration and operator changes.
 - M1, M4, M5 and M7 are measured (§14); M2 and M3 are the IVC and tube figures from the same runs.
 
-Left for later phases: a client subtree with more than one circuit, and desert-mode, custody and withdrawal paths (P1, P2).
+Left for later phases: a client subtree with more than one circuit, and the custody paths of C1 (P2).
+
+### P1 profile (as built, 2026-11-21)
+
+P1 runs one market end to end. Where it narrows the design, the full design remains normative for later phases; everything not listed here is deferred to P2.
+
+**State** (§6, reduced):
+
+- Accounts and activity trees of height 32 with nodes `H(DS, left, right)`.
+- `AccountLeaf = H(DS_ACCT, pub_hash, priv_hash)` with `pub = (owner, master_auth, enc_key_commitment, class)` and `priv = (collateral, size, entry_notional, blind)`: one position slot (`P_MAX = 1`), signed values in 64-bit two's complement. `master_auth = H(DS_MAUTH, pk)` for a Grumpkin master key. There are no session keys: the master key signs every action.
+- `ActivityLeaf = H(DS_ACTV, nonce, open_bid_lots, open_ask_lots, open_order_count)`.
+- `MarketLeaf = H(DS_MKT, book_root, index_price, index_time, next_seq, oi_long, oi_short)`; the mark is the index.
+- The book is the tree of §6.5. A node is one Poseidon2 permutation of `(left, right, ask_lots + bid_lots·2^64, DS_BOOK)`; an order leaf is `H(DS_ORDER, side, account_index, lots)`. Sequence numbers stay below 2^47, so a resting bid has no ask at or below its price exactly when no ask lies to its left.
+- Bounds that keep position arithmetic in 64 bits: price and lots below 2^24, |size| below 2^32, |collateral| and deposits below 2^62.
+
+**Segments.** All are X-segments in the segment subtree of the VK tree:
+
+| Segment | Per proof | Gates | Does |
+| --- | --- | --- | --- |
+| `seg_block` | one L3 block | 6,996 | Sets L3 time; it is the only segment that advances it. Applies at most one oracle update signed by the configured key, newer than the last and not after the block, moving at most `max_jump`. |
+| `seg_priority` | ≤ 4 requests | 94,286 | `Register` (an account at the next index, zero balances) and `Deposit` (a credit, or a refund record if the account does not exist), in queue order. |
+| `seg_trade` | ≤ 2 signed actions | 276,126 | `PlaceOrder` (GTC, IOC; ≤ 2 fills), `CancelOrder`, `Withdraw`. |
+| `seg_refresh` | ≤ 4 accounts | 26,917 | Republishes the next accounts after `refresh_cursor`. |
+
+Each segment proves in under 2 s on the reference laptop; a merge (1.48M gates) takes about 6 s and the root 35–50 s. At these sizes merges dominate, so P2 SHOULD raise actions per segment [M6, M7].
+
+**Trading rules.**
+
+- An action is signed by the account's master key over `H(DS_ACTION, domain, kind, account, nonce, payload)`, with `nonce` = stored + 1 and `domain = H(DS_DOMAIN, chain_id, instance)` from the configuration. The account's leaf is always proven against the accounts root, which authenticates the key.
+- A limit price must lie within `price_band` of the index.
+- An order fills against the best opposite order at the maker's price; the tree aggregates prove it is the best. Self-trade is rejected.
+- The remainder rests (GTC) or cancels (IOC), either way only after proving that no crossing liquidity is left. An order that would need more than two fills is not sequenced.
+- Reductions realize PnL against the average entry; a flip closes the position and opens the rest. Rounding moves value only between realized and unrealized PnL, so equity is exact.
+- An action that increases worst-case size needs an index no older than `max_age` and equity ≥ worst·index·imr afterwards.
+- `Withdraw` needs collateral ≥ amount and equity − amount ≥ IM. It appends a record `H(DS_WD, recipient, amount, salt, batch, index)` with `salt = H(DS_WDSALT, k_enc, batch, index)`.
+- Only accounts whose `AccountLeaf` changes get DA entries, so placing and cancelling orders publishes nothing (§4).
+
+**DA** (§9.5):
+
+- Each segment opens with `[TAG_SEG, da_nonce]`, where `da_nonce = H(DS_DANONCE, batch, action log after the segment's actions, the segment's DA offset)`. It is published so owners can decrypt. It replaces §9.4's batch-level nonce, which segments cannot compute because they do not know the batch's final action log.
+- Account entries, for changes and refreshes, are 11 fields: tag, index, leaf, the public part in clear, and ciphertexts of collateral, size, entry notional and blind.
+- Blind and keystream are bound to `(k_enc, account, da_nonce, position)`, so no keystream is ever reused, even for two entries of one account in one segment.
+- Withdrawal and refund records are 2 fields.
+- The refresh rate is not yet enforced.
+
+**Bridge**, C0 profile (§10.3):
+
+- `register` is private. It checks `k_enc` against the commitment, delivers `k_enc` to the operator by constrained on-chain delivery, and queues the request with `owner = msg_sender`. A user therefore cannot register a key the operator does not hold, which would otherwise block the queue into desert mode.
+- `deposit` pulls tokens into the vault and queues the request.
+- `settle` and `_apply` work as in P0, plus market data and per-batch withdrawal trees.
+- `claim_withdrawal` pays a record in a settled batch's tree from the vault, once, to its recipient.
+- `activate_desert`, `desert_refund`, `exit_register` and `exit_withdraw` follow §12. The pro-rata ratio is fixed at the first payout after the claim window closes, and senior obligations (unpaid withdrawals and unprocessed deposits) are reserved first.
+- Collateral is a minimal public token for C0, not the D7 token.
+- Storage is grouped into packed structs, because aztec-nr's type-complexity limit rejects a contract with about 40 separate state variables.
+
+**Exit test** (P1 exit criterion), on the 6.0.0 local network with real client proofs, not yet on a testnet:
+
+1. Alice and Bob register (7–9 s each, including constrained key delivery) and deposit.
+2. Three batches settle, each 7–8 s from send to checkpoint:
+   - batch 1: priority requests and a refund;
+   - batch 2: Alice rests a bid at 2100 and Bob sells 60 lots into it, then Alice cancels and Bob withdraws;
+   - batch 3: the index moves to 2200 and both accounts are refreshed.
+3. Bob claims his refund and his withdrawal from the vault using only the published DA and his key.
+4. The operator stops. Alice queues one more deposit; after `T_force` anyone activates desert mode.
+5. For each user, a fresh client holding only the node, the Bridge address and the user's seed rebuilds the frozen accounts tree from the DA logs (under 50 ms for 3 batches). It opens the user's leaf and registers a claim valued at the frozen index.
+6. Alice is refunded her deposit and receives 1,006,000 (long 60 from 2100 to 2200); Bob receives 1,993,000. The vault ends empty.
+
+**Tests:**
+
+- Every segment's circuit output is compared field by field with the engine (differential check).
+- 16 adversarial witnesses are rejected for the intended reason, several built by an engine that deliberately skips one rule:
+  - forged signature;
+  - another account's key;
+  - an operator-substituted signing key;
+  - replayed nonce;
+  - a fill that skips the best order;
+  - self-trade;
+  - an IOC that stops with crossing liquidity left;
+  - a limit outside the band;
+  - margin bypasses on orders and withdrawals;
+  - oracle forgery, jump and time regression;
+  - a wrong encryption key;
+  - a deposit credited to another account;
+  - an inflated refresh opening.
+- 45 Bridge TXE tests.
+
+**Deferred to P2:**
+
+- C1 custody and the D7 token;
+- fees, funding and mark ticks;
+- liquidation and the insurance account;
+- multiple markets and `P_MAX > 1`;
+- session keys, and client-proof actions (the tube changes no state in P1);
+- receipts;
+- refresh-rate enforcement;
+- late desert claims and protocol-account seniority;
+- triggers, post-only, FOK, GTT and reduce-only.
 
 See `README.md`.
 

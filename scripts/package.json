@@ -11,7 +11,8 @@
     "vk-substitution": "node src/vk_substitution.ts",
     "m1": "node src/m1.ts",
     "p1:native": "node src/p1/native.ts",
-    "p1:e2e": "node src/p1/e2e.ts"
+    "p1:e2e": "node src/p1/e2e.ts",
+    "p1:adversarial": "node src/p1/adversarial.ts"
   },
   "dependencies": {
     "@aztec-foundation/bb.js": "6.0.0",
