@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.3, 2026-11-20. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is under way in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) exists (§3); everything else here is design. Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.4, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1 is under way. Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -68,9 +68,9 @@ Gaps that MUST be closed before the pipeline secures value:
 | # | Gap | Change |
 | --- | --- | --- |
 | G1 | The tube is proved with `noir-rollup` (RollupHonk: carries an IPA claim and proof), but `verify_batch` calls `verify_honk_proof`, which accepts only UltraHonk ZK proofs. `prove_e2e.ts` never deploys or calls the contract. | Add a root circuit that verifies the tube with `verify_root_rolluphonk_proof` (new in v6 `bb_proof_verification`; closes the IPA accumulator), proved as UltraHonk ZK for `verify_honk_proof`. bb requires the root to accumulate exactly two IPA claims ("Root rollup must accumulate two IPA proofs"), so the root verifies two RollupHonk proofs. A single-segment batch pairs its tube with a padding segment (§9.2). Implemented in P0. |
-| G2 | Verification keys are free witnesses at every inner layer: the client VK in `batch_app`, `app_vk` in `init_kernel`, `kernel_vk` in `tail_kernel` and `hiding_kernel`, and the Chonk VK in `tube`. Only the tube's VK hash is fixed (in the contract). A prover can substitute any inner circuit and emit any `batch_hash`. | Every recursive verification MUST pin the child VK hash, by a circuit constant or by membership in a role-specific VK subtree whose root the Bridge checks (§9.3). |
+| G2 | Verification keys are free witnesses at every inner layer: the client VK in `batch_app`, `app_vk` in `init_kernel`, `kernel_vk` in `tail_kernel` and `hiding_kernel`, and the Chonk VK in `tube`. Only the tube's VK hash is fixed (in the contract). A prover can substitute any inner circuit and emit any `batch_hash`. | Every recursive verification MUST pin the child VK hash, by a circuit constant or by membership in a role-specific VK subtree whose root the Bridge checks (§9.3). Implemented in P0: the Chonk chain and the tube pin constants; merges and the root check membership in the VK tree. |
 | G3 | The contract keeps no state: no state root, no replay protection, public inputs bound to nothing on-chain. | Bridge contract (§10). |
-| G4 | Fixed shape: exactly 10 proofs of one circuit, no padding, one sequential IVC. | Variable occupancy with VK membership and dummy padding; segment and merge tree (§9.2). |
+| G4 | Fixed shape: exactly 10 proofs of one circuit, no padding, one sequential IVC. | Variable occupancy with VK membership and dummy padding; segment and merge tree (§9.2). Implemented in P0: any number of segments, merged pairwise, with padding for a single segment. The client subtree still has one member, pinned as a constant in `agg_app`. |
 | G5 | Version drift. v6.1 renumbered proof types (`HN = 2`, `HN_FINAL = 7`, `CHONK = 8`; `HN_TAIL` no longer exists), so the PoC's `HN_TAIL = 8` would now select Chonk and its `CHONK = 9` is undefined. Sizes changed: Mega app and kernel VKs are 151 fields, the Chonk VK is 119 (PoC: 127), a Chonk proof is 1,193 fields plus the hiding kernel's public IO (PoC: 1935; README: 1632), and an UltraHonk ZK recursive proof is 458. The contract comment also says Poseidon2 where the circuits use Pedersen. | Regenerate every constant from v6.1 `constants.nr`; use Poseidon2 throughout (§6.1). |
 
 ## 4. Privacy boundary
@@ -153,9 +153,12 @@ Hashes are Poseidon2 over the BN254 scalar field with distinct domain separators
 ### 6.2 State root
 
 ```
-StateRoot = H(DS_STATE, accounts_root, activity_root, markets_root,
-              priority_cursor, refresh_cursor, batch_number, last_time)
+StateRoot  = H(DS_STATE, trees, priority_cursor, batch_number, last_time)
+trees      = H(DS_TREES, accounts_root, other_root)
+other_root = H(DS_OTHER, activity_root, markets_root, refresh_cursor)
 ```
+
+Segments carry `trees` as one field of their running values (§9.1). The root circuit opens it to expose `accounts_root` (§9.4). P0 has no activity or markets tree and uses `other_root = 0`.
 
 Configuration is not part of the state. Each batch proves against the `config_hash` that the Bridge holds when it settles (§9.4, §10.2). That hash commits to `chain_id`, the Bridge address, the role-partitioned VK tree root, market parameters, fees, oracle publishers, the operator encryption key and the protocol deadlines. Its preimage is published on-chain whenever a change is scheduled.
 
@@ -367,28 +370,45 @@ Unrealized PnL and funding sum to zero across accounts, so `Σ equity` equals ne
 ### 9.1 Units
 
 - **L3 block**: an ordering interval with a header (time, oracle updates, action-log root). Receipts reference it.
-- **Segment**: a contiguous run of actions proved as one unit. It exposes running hashes in and out for `(state, action_log, priority, da, market_data, withdrawals)`. `priority` is the hash-chain fold of the queue entries the segment consumed.
+- **Segment**: a contiguous run of actions proved as one unit. It proves a transition of running values, `Running`:
+  - `trees` (§6.2);
+  - the action-log hash chain;
+  - the priority-queue head and cursor, which advance by folding each consumed entry;
+  - the DA sponge state and length (§9.5);
+  - the withdrawal-record hash chain and count;
+  - L3 time.
+
+  The action log, DA and withdrawals start empty in every batch. Market data is read from the markets tree at the end of the batch.
 - **Batch**: consecutive L3 blocks settled by one Aztec transaction.
 
 ### 9.2 Circuits
 
 ```
-X-segment  UltraHonk                 signed actions, matching, oracle, funding, liquidation
+X-segment  UltraHonk, rollup target  signed actions, matching, oracle, funding, liquidation
 P-segment  Chonk IVC → tube          agg_app (≤10 client proofs) → kernel → exec_app → kernel … → hiding kernel
                 └───────────── RollupHonk proofs ─────────────┘
-merge      UltraHonk, rollup target  verify_rolluphonk_proof ×2; left.out == right.in; IPA claims accumulated
+merge      UltraHonk, rollup target  verify_rolluphonk_proof ×2; child VKs in allowed roles; left.end == right.start; IPA claims accumulated
 root       UltraHonk ZK              verify_root_rolluphonk_proof ×2 (closes IPA); batch rules; output H(BatchHeader)
 Bridge     Aztec private function    verify_honk_proof against root_vk_hash
 ```
 
-- The root is the top merge. bb requires it to accumulate exactly two IPA claims, so it always verifies two RollupHonk proofs. A batch with a single segment pairs it with a padding segment: a trivial circuit whose output is the empty aggregation, proved with the rollup target, which carries bb's default IPA claim.
-- Segments without client proofs SHOULD be X-segments, which avoid Chonk and the tube. How X-segments enter the merge tree (RollupHonk target with a trivial IPA claim, or a wrapper) is fixed in phase 0 [M7].
+- Every merge-tree node, segment or merge, has the same public output, `NodeOutput = (config_hash, start: Running, end: Running)`. A merge can therefore verify any child; the child's VK-tree role decides what is allowed (§9.3).
+- The root is the top merge. bb requires it to accumulate exactly two IPA claims, so it always verifies two RollupHonk proofs. A batch with a single segment pairs it with a padding segment: a trivial circuit whose transition is the identity, proved with the rollup target, which carries bb's default IPA claim.
+- Segments without client proofs SHOULD be X-segments, which avoid Chonk and the tube. X-segments enter the merge tree directly: a circuit proved with the rollup target that verifies no proof carries bb's default IPA claim, as padding does [M7, measured in P0].
 - Within a segment, touched leaves and tree nodes are read once into in-circuit RAM, mutated there, and written back once at the end. A market maker's repeated actions on its own account cost RAM operations, not Merkle paths. Order-book paths still cost one 80-level path per matching step.
 - Segments are proved in parallel: the engine has already computed every intermediate root.
 
 ### 9.3 Verification-key discipline
 
 The VK tree, whose root is committed in `config_hash`, is partitioned by role: segments, merges, Chonk apps and kernels, tubes, and client circuits. Every circuit that verifies a proof MUST pin the child VK hash, by constant or by membership in the subtree for the role it expects, so a merge cannot accept a client proof as a child. The root circuit takes the VK tree root from the configuration it commits to in the header. The Bridge checks that configuration against its own `config_hash` and stores only the root VK hash. This closes G2.
+
+As built in P0:
+
+- The tree has height 6: eight roles (client, Chonk, tube, segment, merge, and three reserved) of eight slots each, at leaf index `role·8 + slot`. Leaves are VK hashes; empty slots are zero.
+- `config_hash = H(DS_CONFIG, vk_tree_root, params_hash)`.
+- Merges and the root accept children in the tube, segment and merge subtrees only. A merge verifies merges, so it cannot contain its own VK hash as a constant; it takes the VK tree root as a witness bound by `config_hash`.
+- Circuits with a single possible child, the Chonk chain and the tube, pin that child's VK hash as a constant.
+- bb constrains `hash(vk) == vk_hash` inside every recursive verification, so a child cannot present one VK and claim another's tree slot.
 
 ### 9.4 Batch header
 
@@ -403,11 +423,14 @@ BatchHeader {
 da_nonce = H(DS_DANONCE, prev_state_root, action_log_root)
 ```
 
+`min_time` is the L3 time at the start of the batch, which is the previous batch's `max_time`; `max_time` is the time of its last block.
+
 The root proof has one public input: `H(DS_HEADER, BatchHeader)`. The root circuit proves that:
 
 - `new_state_root` opens to `new_accounts_root`, so exits can use published data alone;
 - folding exactly `priority_end − priority_start` consumed entries from `priority_head_start` yields `priority_head_end`;
-- every segment used the configuration in `config_hash`.
+- every segment used the configuration in `config_hash`;
+- the action log, DA and withdrawals started empty, and the DA sponge finalizes to `da_hash`.
 
 `da_nonce` makes every encryption specific to one attempt. If a batch is re-proved with different contents after an Aztec prune, the two payloads use different keystreams.
 
@@ -423,21 +446,28 @@ The DA payload of a batch has three parts.
 2. **Refresh entries.** `refresh_cursor` advances so that every account, active or not, receives a fixed-size refresh entry at least once per `W` (default 14 days, inside Ethereum's ~18-day blob retention). A refresh entry is the leaf commitment and the full encrypted opening, padded to `P_MAX` positions.
 3. **Withdrawal hashes**: one blinded record hash per withdrawal or refund (§10.4).
 
+`da_hash` is a Poseidon2 sponge of rate 3 over the payload in order, finalized with the payload length. Segments carry the sponge state in `Running`, so the payload may split anywhere between segments; the Bridge recomputes the hash over the flat payload.
+
 `KS` is a Poseidon2 keystream. Plaintext values are packed into as few fields as possible. The circuit proves that every ciphertext encrypts the true values under the key committed in `enc_key_commitment`, so the operator cannot publish garbage. A typical change entry (collateral plus one position) is 4–6 fields; a refresh entry is about 2 + 2·`P_MAX` fields [M8].
 
 DA published within any window of length `W` therefore suffices to rebuild the whole accounts tree and every owner's opening. A user who has lost all local state can still exit (§12). Activity and order trees are not published. The operator MAY also publish snapshots for faster sync; nothing depends on them.
 
 | Mode [D3] | Where | Capacity | Exit relies on |
 | --- | --- | --- | --- |
-| R (default) | public logs of the settlement transaction | ≤ 4,096 fields per transaction (`FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH`), shared with `market_data` | Aztec, hence Ethereum, DA |
+| R (default) | public logs of the settlement transaction | bounded by the per-transaction DA gas admission limit, below the 4,096-field public-log cap (see below); shared with `market_data` | Aztec, hence Ethereum, DA |
 | E | Ethereum blobs posted through an L1 inbox; bound to `da_hash` by a KZG point evaluation (checked on L1 by the precompile and in the root circuit by barycentric evaluation) and relayed to the Bridge by L1→L2 message | blob market | Ethereum DA; adds L1→L2 latency |
 | V | committee; k-of-n signatures on `da_hash` verified in the root circuit | unbounded | committee honesty |
 
-DA scales with distinct accounts whose balances change in a batch, not with trades. One full Mode R settlement per 72-second slot carries roughly 700–1,000 change entries (≈ 1.8 KB/s).
+Mode R capacity [M5]. Public logs are capped at `FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH` = 4,096 fields per transaction, including two header fields per log. The binding limit is lower: a node admits a transaction only if its DA gas fits `ceil(1.5 · B / blocks_per_checkpoint)`, where `B` is the checkpoint's blob space net of encoding overhead (`stdlib` `computeNetworkTxGasLimits` in v6.0.0). A settlement spends 30 fields of DA on its own effects. That leaves:
+
+- about 3,640 payload fields at 10 blocks per checkpoint (72 s slots, 6 s blocks);
+- 1,714 payload fields on the 6.0.0 local network (21 blocks per checkpoint), measured.
+
+DA scales with distinct accounts whose balances change in a batch, not with trades. One full Mode R settlement per 72-second slot carries roughly 600–900 change entries (≈ 1.6 KB/s) at 10 blocks per checkpoint.
 
 For calibration, Lighter publishes unencrypted diffs and was measured at about one 128 KB blob per batch commit, with commits every ~3.5 min (≈ 0.6 KB/s). L3X entries are larger, so Mode R supports an account-change rate of the same order as Lighter's today.
 
-Refresh costs `N_accounts · (2 + 2·P_MAX) / (W / slot)` fields per batch: about 200 at 100,000 accounts and about 2,000 at one million (`P_MAX = 16`, `W` = 14 days). A full payload also occupies about one sixth of Aztec's network-wide budget of `BLOBS_PER_CHECKPOINT × FIELDS_PER_BLOB` = 24,576 fields per slot, so its price depends on Aztec's fee market [M5]. Mode E is the path beyond either limit.
+Refresh costs `N_accounts · (2 + 2·P_MAX) / (W / slot)` fields per batch: about 200 at 100,000 accounts and about 2,000 at one million (`P_MAX = 16`, `W` = 14 days). A full payload also occupies about 15% of Aztec's network-wide budget of `BLOBS_PER_CHECKPOINT × FIELDS_PER_BLOB` = 24,576 fields per slot, so its price depends on Aztec's fee market [M5]. Mode E is the path beyond either limit.
 
 ## 10. Aztec contracts
 
@@ -446,7 +476,7 @@ Refresh costs `N_accounts · (2 + 2·P_MAX) / (W / slot)` fields per batch: abou
 | Storage | Type | Use |
 | --- | --- | --- |
 | `state_root`, `accounts_root`, `batch_number`, `last_time`, `priority_cursor` | `PublicMutable` | exchange tip |
-| `root_vk_hash`, `config_hash`, `operators` | `DelayedPublicMutable` | readable in private; changes take effect after `upgrade_delay` |
+| `root_vk_hash`, `config_hash`, `operators` | `DelayedPublicMutable` | readable in private; changes take effect after `upgrade_delay`. A `DelayedPublicMutable` cannot be set without its delay, so the genesis values live in `PublicImmutable` and apply until a scheduled change takes effect. |
 | `priority_count`, `priority_head[n]`, `priority_time[n]` | `PublicMutable`, `Map` | priority queue as hash-chain prefixes, `priority_head[0] = 0` |
 | `pending_deposit[h]` | `Map` | deposits awaiting sweep: submission time and status |
 | `withdrawals_root[batch]`, `settled_time[batch]`, `market_data_hash` | `Map`, `PublicMutable` | settled withdrawal lists, settlement times, latest market data |
@@ -457,7 +487,9 @@ Refresh costs `N_accounts · (2 + 2·P_MAX) / (W / slot)` fields per batch: abou
 | `register(master_auth, enc_key_commitment, k_enc)` | private | asserts `H(DS_ENC, k_enc) == enc_key_commitment`; charges `request_fee`; queues `Register` with `owner = msg_sender`; delivers `k_enc` to the operator by constrained on-chain delivery |
 | `deposit(account_index, amount, refund_to, sk_d)` | private | §10.3 |
 | `submit_forced(request)` | private | charges `request_fee`; queues the request with `msg_sender`, optionally encrypted |
-| `settle(header, proof, vk, da_payload)` | private | asserts `msg_sender ∈ operators` and `header.config_hash == config_hash`; `verify_honk_proof(vk, proof, [H(header)], root_vk_hash)`; `enqueue_self._apply(header, da_payload)` |
+| `settle(header, proof, vk, da_payload, da_len)` | private | asserts `msg_sender ∈ operators` and `header.config_hash == config_hash`; checks `da_hash` over the first `da_len` fields; `verify_honk_proof(vk, proof, [H(header)], root_vk_hash)`; `enqueue_self._apply(header, da_payload, da_len)` |
+| `schedule_upgrade(vk_tree_leaves, params_hash, root_vk_hash)` | public, operator | recomputes `config_hash` from the preimage, schedules it and `root_vk_hash` together, and publishes the preimage |
+| `schedule_operator(operator)` | public, operator | schedules a new operator |
 | `_apply(header, da_payload)` | public, only-self | §10.2 |
 | `custody(…)` | private, operator | §10.3, §10.4 |
 | `reclaim_deposit(record)` | private | §10.3 |
@@ -474,11 +506,11 @@ No Bridge function may change the Bridge's own contract class (§12). Configurat
 2. `header.priority_start == priority_cursor`, `header.priority_end ≤ priority_count`, `priority_head[priority_start] == header.priority_head_start` and `priority_head[priority_end] == header.priority_head_end`;
 3. if `priority_end < priority_count`, then `priority_time[priority_end] ≥ now − T_force`, so no request older than `T_force` is left behind;
 4. `last_time ≤ header.min_time ≤ header.max_time ≤ now` and `header.max_time ≥ now − T_lag`;
-5. `Poseidon2(da_payload) == header.da_hash`.
+5. the payload's `da_hash`, checked in `settle` rather than here: the enqueued call's calldata is bound to `settle`'s arguments, so `_apply` receives exactly the payload that was checked, and hashing it costs client-proving gates instead of public gas.
 
 It then:
 
-- emits `da_payload` as public logs;
+- emits `[DA_LOG_TAG, batch_number, payload…]` as one public log;
 - updates `state_root`, `accounts_root`, `batch_number`, `last_time` and `priority_cursor`;
 - stores `withdrawals_root[batch_number]`, `settled_time[batch_number]` and `market_data_hash`;
 - emits `market_data` as a public event, roughly 8 fields per market from the same 4,096-field log budget.
@@ -636,13 +668,14 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 
 | # | Result |
 | --- | --- |
-| M1 | Verifying one UltraHonk ZK client proof inside a Chonk (Mega) app costs about 11.0k gates: `agg_app` with 10 proofs is 109,564 gates. A client proof of the P0 auth circuit takes 27 ms. The UltraHonk-in-UltraHonk comparison is not yet measured. |
+| M1 | Verifying one UltraHonk ZK client proof inside a Chonk (Mega) app costs about 11.0k gates: `agg_app` with 10 proofs is 109,564 gates. A client proof of the P0 auth circuit takes 27 ms. In plain UltraHonk (`agg_ultra`, rollup target, so it could enter the merge tree directly) the same 10 verifications cost 7,592,247 gates (≈ 759k per proof) and 36.7 s to prove, against 6.9 s for the Chonk IVC plus tube: Chonk is 5.3× faster. |
 | M2 | Chonk IVC over `agg_app` plus three kernels (11,445, 15,339 and 36,862 gates): 1.6 s. The proof is 1,221 fields plus the user public inputs, which come first. |
 | M3 | Tube: 1,473,521 gates, 4.5 s, 480-field RollupHonk proof. |
 | M4 | Root, with two RollupHonk verifications and full IPA verification: 8,388,352 gates (≈ 2^23), 42–46 s, 458-field ZK proof. This is a fixed cost per batch. |
-| M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on. The private `settle` circuit, which includes in-circuit verification of the root proof and H(header), is 28,766 gates. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. From send to checkpointed: 5.6 s. The fee at local-network prices was 1.19 × 10^18 fee-juice base units. The cost of a full 4,096-field DA payload is not yet measured (P0 publishes 64 fields). |
+| M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity. |
+| M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
-On this hardware the root alone takes about 60% of a 72-second slot. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s).
+On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
 
 Measure before fixing circuit shapes (M1–M4 above are first P0 results):
 
@@ -667,17 +700,20 @@ Measure before fixing circuit shapes (M1–M4 above are first P0 results):
 | P3 Scale | Parallel segments and merge tree in production, Mode E, risk sweep, ADL ranking, spot, public liquidity pool | Sustained targets within the proof-lag bound |
 | P4 Operator trust | Hot-standby operators with encrypted state replication; research into threshold-encrypted order flow, batch auctions, MPC or TEE matching | — |
 
-P0 status (2026-11-20): the exit criterion is met on Aztec 6.0.0 rather than 6.1, which had not yet been published.
+P0 status (2026-11-21): complete on Aztec 6.0.0 rather than 6.1, which had not yet been published.
 
-- A batch settles through a fully proved settlement transaction on a local network that verifies transaction proofs.
-- Substituted VKs are rejected in the IVC app slot and in the root's tube slot.
+- Batches settle through fully proved settlement transactions on a local network that verifies transaction proofs. The test batches are `root(merge(tube, x-segment), x-segment)` and `root(x-segment, padding)`.
+- Substituted or role-crossing VKs are rejected:
+  - in the IVC app slot;
+  - as a root or merge child outside the VK tree;
+  - in a borrowed tree slot with a forged VK hash;
+  - in the client subtree.
+- Segments that do not chain, or that used another configuration, are rejected.
 - A forged header that passes every public check is rejected by the proof binding.
+- The Bridge's checks are covered by TXE tests: replay, priority-queue forgeries, `T_force`, time bounds, halt and resume, and delayed configuration and operator changes.
+- M1, M4, M5 and M7 are measured (§14); M2 and M3 are the IVC and tube figures from the same runs.
 
-Still open from P0's scope:
-- the merge tree (G4);
-- the UltraHonk comparison for M1;
-- the full-size DA cost for M5;
-- `DelayedPublicMutable` configuration and a role-partitioned VK tree, where P0 uses `PublicImmutable` and pinned constants.
+Left for later phases: a client subtree with more than one circuit, and desert-mode, custody and withdrawal paths (P1, P2).
 
 See `README.md`.
 

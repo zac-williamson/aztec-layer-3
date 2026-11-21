@@ -1,6 +1,10 @@
-// Builds the P0 circuit pipeline in dependency order. Before compiling each parent it writes the
-// VK hashes of the circuits it verifies into `<parent>/src/pinned.nr`, so every recursive
-// verification is pinned to one circuit (SPEC.md §3 G2, §9.3). Writes scripts/out/manifest.json.
+// Builds the circuits in dependency order and the role-partitioned VK tree (SPEC.md §9.3).
+//
+// Circuits with a fixed child (the Chonk chain and the tube) pin the child's VK hash as a constant:
+// before compiling each, this writes the hashes it verifies into `<pkg>/src/pinned.nr` (G2).
+// Merges and the root verify children of several kinds, including merges, so they cannot pin
+// constants; they check membership in the VK tree, whose root the configuration commits to.
+// Writes scripts/out/manifest.json.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Barretenberg } from '@aztec-foundation/bb.js';
@@ -8,22 +12,28 @@ import {
   AZTEC_VERSION,
   BB,
   CIRCUITS,
-  DS,
   NARGO,
   OUT,
+  ROLE,
+  SHAPE,
   TARGET,
   VK_DIR,
+  configHashOf,
   fromBytes32,
   hex,
-  l3xHash,
   readVkJson,
   run,
+  stateRoot,
   toBytes32,
+  trees,
+  vkTree,
   writeJson,
 } from './lib.ts';
 
 type VkSpec = { scheme: 'ultra_honk'; target: string } | { scheme: 'chonk'; kind: 'app' | 'kernel' | 'hiding' };
 type Step = { pkg: string; vk: VkSpec; pinned?: string[] };
+
+const ROLLUP = { scheme: 'ultra_honk', target: 'noir-rollup-no-zk' } as const;
 
 // `pinned` lists the hash names (from earlier steps) written into this package before it compiles.
 const STEPS: Step[] = [
@@ -32,22 +42,14 @@ const STEPS: Step[] = [
   { pkg: 'init_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['AGG_APP_VK_HASH'] },
   { pkg: 'tail_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['INIT_KERNEL_VK_HASH'] },
   { pkg: 'hiding_kernel', vk: { scheme: 'chonk', kind: 'hiding' }, pinned: ['TAIL_KERNEL_VK_HASH'] },
-  { pkg: 'tube', vk: { scheme: 'ultra_honk', target: 'noir-rollup-no-zk' }, pinned: ['CHONK_VK_HASH'] },
-  { pkg: 'padding', vk: { scheme: 'ultra_honk', target: 'noir-rollup-no-zk' } },
-  {
-    pkg: 'root',
-    vk: { scheme: 'ultra_honk', target: 'noir-recursive' },
-    pinned: [
-      'CLIENT_VK_HASH',
-      'AGG_APP_VK_HASH',
-      'INIT_KERNEL_VK_HASH',
-      'TAIL_KERNEL_VK_HASH',
-      'CHONK_VK_HASH',
-      'TUBE_VK_HASH',
-      'PADDING_VK_HASH',
-    ],
-  },
+  { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH'] },
+  { pkg: 'x_segment', vk: ROLLUP },
+  { pkg: 'padding', vk: ROLLUP },
+  { pkg: 'merge', vk: ROLLUP },
+  { pkg: 'root', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'rogue_app', vk: { scheme: 'chonk', kind: 'app' } },
+  { pkg: 'rogue_segment', vk: ROLLUP },
+  { pkg: 'agg_ultra', vk: ROLLUP, pinned: ['CLIENT_VK_HASH'] },
 ];
 
 // The hash name each package's VK is published under.
@@ -58,10 +60,32 @@ const PUBLISHES: Record<string, string> = {
   tail_kernel: 'TAIL_KERNEL_VK_HASH',
   hiding_kernel: 'CHONK_VK_HASH',
   tube: 'TUBE_VK_HASH',
+  x_segment: 'X_SEGMENT_VK_HASH',
   padding: 'PADDING_VK_HASH',
+  merge: 'MERGE_VK_HASH',
   root: 'ROOT_VK_HASH',
   rogue_app: 'ROGUE_APP_VK_HASH',
+  rogue_segment: 'ROGUE_SEGMENT_VK_HASH',
+  agg_ultra: 'AGG_ULTRA_VK_HASH',
 };
+
+// VK tree leaf index per package: role subtree, then slot. The root's VK is stored on the Bridge
+// instead; the rogue fixtures are deliberately absent, and agg_ultra is a measurement circuit (M1).
+const S = SHAPE.VK_ROLE_SLOTS;
+const VK_SLOTS: Record<string, number> = {
+  client_auth: ROLE.CLIENT * S + 0,
+  agg_app: ROLE.CHONK * S + 0,
+  init_kernel: ROLE.CHONK * S + 1,
+  tail_kernel: ROLE.CHONK * S + 2,
+  hiding_kernel: ROLE.CHONK * S + 3,
+  tube: ROLE.TUBE * S + 0,
+  padding: ROLE.SEGMENT * S + 0,
+  x_segment: ROLE.SEGMENT * S + 1,
+  merge: ROLE.MERGE * S + 0,
+};
+
+// P0 has no exchange parameters; P1 commits market parameters, fees and deadlines here.
+const PARAMS_HASH = 0n;
 
 function writePinned(pkg: string, names: string[], hashes: Record<string, string>) {
   const lines = names.map((n) => {
@@ -104,25 +128,31 @@ async function main() {
     console.log(`${step.pkg.padEnd(14)} vk ${String(vk.vk.length).padStart(3)} fields  hash ${hash}  (${Math.round(vkMs)} ms)`);
   }
 
-  const h = (name: string) => BigInt(hashes[name]);
-  const configHash = await l3xHash(api, [
-    DS.CONFIG,
-    h('CLIENT_VK_HASH'),
-    h('AGG_APP_VK_HASH'),
-    h('INIT_KERNEL_VK_HASH'),
-    h('TAIL_KERNEL_VK_HASH'),
-    h('CHONK_VK_HASH'),
-    h('TUBE_VK_HASH'),
-    h('PADDING_VK_HASH'),
-  ]);
-  const genesisStateRoot = await l3xHash(api, [DS.STATE, 0n, 0n, 0n, 0n]);
+  const leaves = Array<bigint>(1 << SHAPE.VK_TREE_HEIGHT).fill(0n);
+  for (const [pkg, slot] of Object.entries(VK_SLOTS)) leaves[slot] = BigInt(hashes[PUBLISHES[pkg]]);
+  const layers = await vkTree(api, leaves);
+  const vkTreeRoot = layers[layers.length - 1][0];
+  const configHash = await configHashOf(api, vkTreeRoot, PARAMS_HASH);
+  const genesisTrees = await trees(api, 0n, 0n);
+  const genesisStateRoot = await stateRoot(api, genesisTrees, 0n, 0n, 0n);
   await api.destroy();
 
-  writeJson(join(OUT, 'manifest.json'), { aztecVersion: AZTEC_VERSION, hashes, configHash, genesisStateRoot, timings });
-  console.log(`config hash        ${'0x' + configHash.toString(16).padStart(64, '0')}`);
+  const vkHashByPkg = Object.fromEntries(Object.entries(PUBLISHES).map(([pkg, name]) => [pkg, hashes[name]]));
+  writeJson(join(OUT, 'manifest.json'), {
+    aztecVersion: AZTEC_VERSION,
+    hashes,
+    vkHashByPkg,
+    vkTree: { root: vkTreeRoot, slots: VK_SLOTS, leaves },
+    paramsHash: PARAMS_HASH,
+    configHash,
+    genesisTrees,
+    genesisStateRoot,
+    timings,
+  });
+  console.log(`vk tree root       ${hex(vkTreeRoot)}`);
+  console.log(`config hash        ${hex(configHash)}`);
   console.log(`wrote ${join(OUT, 'manifest.json')}`);
 }
-
 main().catch((err) => {
   console.error(err?.stderr?.toString?.() ?? err);
   process.exit(1);

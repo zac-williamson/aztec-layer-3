@@ -1,4 +1,5 @@
 pub mod hash;
+pub mod merge;
 
 use hash::hash;
 
@@ -15,12 +16,17 @@ pub global CHONK_VK_LENGTH: u32 = 119;
 // 48 hiding oink + 28 hiding-kernel IO + 41 merge + 556 ECCVM + 70 triple IPA + 478 joint.
 pub global CHONK_PROOF_LENGTH: u32 = 1221;
 
-// P0 shape parameters.
+// Shape parameters.
 pub global MAX_CLIENT_PROOFS: u32 = 10;
 pub global CLIENT_PUBLIC_INPUTS: u32 = 3;
 pub global MAX_PRIORITY: u32 = 8;
-pub global DA_LEN: u32 = 64;
 pub global HEADER_LEN: u32 = 16;
+/// DA fields one settlement carries. Aztec allows FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH = 4096 fields of
+/// public logs per transaction, each log costing 2 header fields. The Bridge emits the DA log
+/// (2 + tag + payload) and the BatchSettled event (2 + tag + 5), leaving 4085; 4080 keeps slack.
+pub global DA_MAX: u32 = 4080;
+/// DA fields one P0 X-segment can absorb (enough for a full payload, so M5 needs one segment).
+pub global X_DA_MAX: u32 = 4080;
 
 // Domain separators.
 pub global DS_AUTH: Field = 1;
@@ -32,9 +38,13 @@ pub global DS_STATE: Field = 6;
 pub global DS_HEADER: Field = 7;
 pub global DS_DA: Field = 8;
 pub global DS_CONFIG: Field = 9;
+pub global DS_TREES: Field = 10;
+pub global DS_ACTION_LOG: Field = 11;
+pub global DS_VK_NODE: Field = 12;
+pub global DS_DA_SPONGE: Field = 13;
 
 /// Carried through the Chonk IVC on the databus: app return_data -> kernel call_data -> ...
-/// The hiding kernel exposes it as its public output, and the tube re-exposes it.
+/// The hiding kernel exposes it as its public output; the tube consumes it.
 pub struct AggOutput {
     pub actions_hash: Field,
     pub count: u32,
@@ -44,6 +54,90 @@ impl AggOutput {
     pub fn to_fields(self) -> [Field; 2] {
         [self.actions_hash, self.count as Field]
     }
+}
+
+/// Running values a segment carries from its first action to its last (SPEC.md §9.1). Merges
+/// require `left.end == right.start`, so a batch is one unbroken chain of segments.
+pub struct Running {
+    /// Commitment to the exchange trees: trees(accounts_root, other_root).
+    pub state: Field,
+    /// Hash chain over executed actions; zero at the start of every batch.
+    pub action_log: Field,
+    /// Priority-queue hash-chain head, and the absolute index of the next unconsumed entry.
+    pub priority_head: Field,
+    pub priority_cursor: u64,
+    /// DA sponge state and number of DA fields absorbed (da_iv() and 0 at the start of a batch).
+    pub da: [Field; 4],
+    pub da_len: u32,
+    /// Hash chain over withdrawal records and their count; zero at the start of every batch.
+    pub withdrawals: Field,
+    pub withdrawals_count: u32,
+    /// L3 time of the latest block.
+    pub time: u64,
+}
+
+pub global RUNNING_LEN: u32 = 12;
+
+impl Running {
+    pub fn to_fields(self) -> [Field; RUNNING_LEN] {
+        [
+            self.state,
+            self.action_log,
+            self.priority_head,
+            self.priority_cursor as Field,
+            self.da[0],
+            self.da[1],
+            self.da[2],
+            self.da[3],
+            self.da_len as Field,
+            self.withdrawals,
+            self.withdrawals_count as Field,
+            self.time as Field,
+        ]
+    }
+}
+
+impl Eq for Running {
+    fn eq(self, other: Self) -> bool {
+        self.to_fields() == other.to_fields()
+    }
+}
+
+/// The public output of every merge-tree node: segments (tube, X-segment, padding) and merges.
+/// A uniform layout lets a merge verify any child without knowing its kind; the VK tree role
+/// decides which kinds are allowed (SPEC.md §9.3).
+pub struct NodeOutput {
+    pub config_hash: Field,
+    pub start: Running,
+    pub end: Running,
+}
+
+pub global NODE_OUTPUT_LEN: u32 = 1 + 2 * RUNNING_LEN;
+
+impl NodeOutput {
+    pub fn to_fields(self) -> [Field; NODE_OUTPUT_LEN] {
+        let s = self.start.to_fields();
+        let e = self.end.to_fields();
+        let mut out: [Field; NODE_OUTPUT_LEN] = [0; NODE_OUTPUT_LEN];
+        out[0] = self.config_hash;
+        for i in 0..RUNNING_LEN {
+            out[1 + i] = s[i];
+            out[1 + RUNNING_LEN + i] = e[i];
+        }
+        out
+    }
+}
+
+/// The exchange trees, as one commitment carried in Running.state. P0 has only an accounts root;
+/// `other_root` stands for the activity tree, markets tree and refresh cursor (SPEC.md §6.2).
+pub fn trees(accounts_root: Field, other_root: Field) -> Field {
+    hash([DS_TREES, accounts_root, other_root])
+}
+
+/// The configuration a batch proves against (SPEC.md §6.2): the role-partitioned VK tree root and
+/// a hash of every other parameter.
+pub fn config_hash(vk_tree_root: Field, params_hash: Field) -> Field {
+    hash([DS_CONFIG, vk_tree_root, params_hash])
 }
 
 /// SPEC.md §9.4. The root proof's single public input is `hash()` of this header; the Bridge
@@ -127,13 +221,13 @@ impl BatchHeader {
     }
 }
 
-/// P0 state root (SPEC.md §6.2, reduced): accounts root, priority cursor, batch number, last time.
-pub fn state_root(accounts_root: Field, priority_cursor: u64, batch_number: u64, last_time: u64) -> Field {
-    hash([DS_STATE, accounts_root, priority_cursor as Field, batch_number as Field, last_time as Field])
+/// State root (SPEC.md §6.2, reduced): exchange trees, priority cursor, batch number, last time.
+pub fn state_root(trees: Field, priority_cursor: u64, batch_number: u64, last_time: u64) -> Field {
+    hash([DS_STATE, trees, priority_cursor as Field, batch_number as Field, last_time as Field])
 }
 
 pub fn genesis_state_root() -> Field {
-    state_root(0, 0, 0, 0)
+    state_root(trees(0, 0), 0, 0, 0)
 }
 
 /// Priority queue (SPEC.md §10.1): entry binds payload, submitter and time; heads chain entries.
@@ -145,13 +239,49 @@ pub fn priority_next_head(head: Field, entry: Field) -> Field {
     hash([DS_PRIORITY, head, entry])
 }
 
-pub fn da_hash(payload: [Field; DA_LEN]) -> Field {
-    let mut buf: [Field; DA_LEN + 1] = [0; DA_LEN + 1];
-    buf[0] = DS_DA;
-    for i in 0..DA_LEN {
-        buf[i + 1] = payload[i];
+/// DA hash (SPEC.md §9.5). A Poseidon2 sponge of rate 3 runs over the batch's DA fields in order;
+/// segments carry its state in Running.da so the payload can be split anywhere between segments.
+/// The Bridge recomputes the same value from the flat payload.
+pub fn da_iv() -> [Field; 4] {
+    [0, 0, 0, DS_DA_SPONGE]
+}
+
+pub fn da_absorb(da: [Field; 4], len: u32, x: Field) -> ([Field; 4], u32) {
+    let pos = len % 3;
+    let mut s = da;
+    s[pos] += x;
+    if pos == 2 {
+        s = std::hash::poseidon2_permutation(s);
     }
-    hash(buf)
+    (s, len + 1)
+}
+
+/// Binds the length, so payloads that differ only by trailing zeros hash differently.
+pub fn da_finalize(da: [Field; 4], len: u32) -> Field {
+    let mut s = da;
+    if len % 3 != 0 {
+        s = std::hash::poseidon2_permutation(s);
+    }
+    hash([DS_DA, s[0], len as Field])
+}
+
+/// The same hash over a flat payload of `len <= N` fields, absorbing three fields per
+/// permutation. Fields at index >= len are ignored. Used by the Bridge.
+pub fn da_hash_flat<let N: u32>(payload: [Field; N], len: u32) -> Field {
+    assert(len <= N, "DA payload too long");
+    let mut s = da_iv();
+    for g in 0..(N + 2) / 3 {
+        if g * 3 < len {
+            for j in 0..3 {
+                let i = g * 3 + j;
+                if (i < N) & (i < len) {
+                    s[j] += payload[i];
+                }
+            }
+            s = std::hash::poseidon2_permutation(s);
+        }
+    }
+    hash([DS_DA, s[0], len as Field])
 }
 
 #[test]
@@ -183,4 +313,28 @@ fn test_header_rejects_wide_integers() {
     let mut f: [Field; HEADER_LEN] = [0; HEADER_LEN];
     f[3] = 18446744073709551616; // 2^64
     let _ = BatchHeader::from_fields(f);
+}
+
+#[test]
+fn test_da_incremental_matches_flat() {
+    let payload: [Field; 10] = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3];
+    for len in 0..11 {
+        let mut s = da_iv();
+        let mut n: u32 = 0;
+        // Split the absorption across two "segments" at an arbitrary point.
+        for i in 0..10 {
+            if i < len {
+                let (s2, n2) = da_absorb(s, n, payload[i]);
+                s = s2;
+                n = n2;
+            }
+        }
+        assert(da_finalize(s, n) == da_hash_flat(payload, len));
+    }
+}
+
+#[test]
+fn test_da_length_bound() {
+    let a: [Field; 2] = [7, 0];
+    assert(da_hash_flat(a, 1) != da_hash_flat(a, 2));
 }

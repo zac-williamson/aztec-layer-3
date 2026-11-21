@@ -1,0 +1,8 @@
+[package]
+name = "merge"
+type = "bin"
+authors = [""]
+
+[dependencies]
+bb_proof_verification = { path = "../vendor/bb_proof_verification" }
+l3x_types = { path = "../l3x_types" }

@@ -9,7 +9,8 @@
     "build:circuits": "node src/build.ts",
     "prove": "node src/prove.ts",
     "vk-substitution": "node src/vk_substitution.ts",
-    "settle": "node src/settle.ts"
+    "settle": "node src/settle.ts",
+    "m1": "node src/m1.ts"
   },
   "dependencies": {
     "@aztec-foundation/bb.js": "6.0.0",

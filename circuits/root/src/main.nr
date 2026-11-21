@@ -1,85 +1,59 @@
-mod pinned;
-
-use bb_proof_verification::{RollupHonkProof, RollupHonkVerificationKey, verify_root_rolluphonk_proof};
+use bb_proof_verification::verify_root_rolluphonk_proof;
 use l3x_types::{
-    AggOutput, BatchHeader, DS_ACCOUNTS, DS_CONFIG, MAX_PRIORITY, DA_LEN, da_hash, hash::hash,
-    priority_next_head, state_root,
+    BatchHeader, config_hash, da_finalize, da_iv, merge::{Child, combine}, state_root, trees,
 };
 
-/// Root circuit (SPEC.md §9.2–9.4), reduced for P0. It verifies two RollupHonk proofs with
-/// verify_root_rolluphonk_proof, which accumulates their IPA claims and closes the accumulator
-/// (G1); bb requires exactly two. P0 has one real segment (the tube) and one padding segment.
-/// The result is a plain UltraHonk proof the Bridge checks with verify_honk_proof. The root then
-/// binds everything the Bridge checks into the batch header and returns H(header) as its only
-/// public input.
+/// Root circuit (SPEC.md §9.2–9.4). The top merge: it checks its two children as a merge does,
+/// verifies them with verify_root_rolluphonk_proof, which accumulates their IPA claims and closes
+/// the accumulator (G1), and binds the batch's whole transition into the header. The result is a
+/// plain UltraHonk ZK proof whose only public input is H(header), checked by the Bridge with
+/// verify_honk_proof against root_vk_hash.
 ///
-/// P0 stubs: the "accounts root" absorbs the actions hash; withdrawals and market data are empty.
+/// The root pins no constants. The VK tree root and parameters come from the configuration it
+/// commits to in the header, and the Bridge checks that against its own config_hash (§9.3).
 fn main(
-    tube_vk: RollupHonkVerificationKey,
-    tube_proof: RollupHonkProof,
-    agg: AggOutput,
-    padding_vk: RollupHonkVerificationKey,
-    padding_proof: RollupHonkProof,
-    prev_accounts_root: Field,
-    prev_last_time: u64,
+    vk_tree_root: Field,
+    params_hash: Field,
+    left: Child,
+    right: Child,
+    end_accounts_root: Field,
+    end_other_root: Field,
     batch_number: u64,
-    min_time: u64,
-    max_time: u64,
-    priority_start: u64,
-    priority_n: u32,
-    priority_head_start: Field,
-    priority_entries: [Field; MAX_PRIORITY],
-    da_payload: [Field; DA_LEN],
-    config_hash: Field,
 ) -> pub Field {
-    verify_root_rolluphonk_proof(tube_vk, tube_proof, agg.to_fields(), pinned::TUBE_VK_HASH);
-    verify_root_rolluphonk_proof(padding_vk, padding_proof, [0, 0], pinned::PADDING_VK_HASH);
-
-    // The configuration commits to the pinned circuit set (stand-in for the VK tree root, §9.3).
-    let expected_config = hash(
-        [
-            DS_CONFIG, pinned::CLIENT_VK_HASH, pinned::AGG_APP_VK_HASH, pinned::INIT_KERNEL_VK_HASH,
-            pinned::TAIL_KERNEL_VK_HASH, pinned::CHONK_VK_HASH, pinned::TUBE_VK_HASH,
-            pinned::PADDING_VK_HASH,
-        ],
-    );
-    assert(config_hash == expected_config, "config mismatch");
+    let config = config_hash(vk_tree_root, params_hash);
+    let out = combine(config, vk_tree_root, left, right);
+    verify_root_rolluphonk_proof(left.vk, left.proof, left.out.to_fields(), left.vk_hash);
+    verify_root_rolluphonk_proof(right.vk, right.proof, right.out.to_fields(), right.vk_hash);
+    let s = out.start;
+    let e = out.end;
 
     assert(batch_number > 0, "batch numbers start at 1");
-    assert(min_time <= max_time, "time order");
-    assert(prev_last_time <= min_time, "time regressed");
-    assert(priority_n <= MAX_PRIORITY, "too many priority entries");
-
-    // Fold exactly priority_n consumed entries from the head the Bridge holds for priority_start.
-    let mut head = priority_head_start;
-    for i in 0..MAX_PRIORITY {
-        if i < priority_n {
-            head = priority_next_head(head, priority_entries[i]);
-        }
-    }
-    let priority_end = priority_start + priority_n as u64;
-
-    let prev_state_root = state_root(prev_accounts_root, priority_start, batch_number - 1, prev_last_time);
-    let new_accounts_root = hash([DS_ACCOUNTS, prev_accounts_root, agg.actions_hash]);
-    let new_state_root = state_root(new_accounts_root, priority_end, batch_number, max_time);
+    // Per-batch accumulators start empty.
+    assert(s.action_log == 0, "action log must start empty");
+    assert(s.da == da_iv(), "DA must start empty");
+    assert(s.da_len == 0, "DA must start empty");
+    assert(s.withdrawals == 0, "withdrawals must start empty");
+    assert(s.withdrawals_count == 0, "withdrawals must start empty");
+    // The new state root opens to the accounts root, so exits can rely on published data alone.
+    assert(e.state == trees(end_accounts_root, end_other_root), "end state opening");
 
     let header = BatchHeader {
-        prev_state_root,
-        new_state_root,
-        new_accounts_root,
+        prev_state_root: state_root(s.state, s.priority_cursor, batch_number - 1, s.time),
+        new_state_root: state_root(e.state, e.priority_cursor, batch_number, e.time),
+        new_accounts_root: end_accounts_root,
         batch_number,
-        min_time,
-        max_time,
-        priority_start,
-        priority_end,
-        priority_head_start,
-        priority_head_end: head,
-        withdrawals_root: 0,
-        withdrawals_count: 0,
-        action_log_root: agg.actions_hash,
-        da_hash: da_hash(da_payload),
+        min_time: s.time,
+        max_time: e.time,
+        priority_start: s.priority_cursor,
+        priority_end: e.priority_cursor,
+        priority_head_start: s.priority_head,
+        priority_head_end: e.priority_head,
+        withdrawals_root: e.withdrawals,
+        withdrawals_count: e.withdrawals_count as u64,
+        action_log_root: e.action_log,
+        da_hash: da_finalize(e.da, e.da_len),
         market_data_hash: 0,
-        config_hash,
+        config_hash: config,
     };
     header.hash()
 }

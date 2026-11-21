@@ -30,15 +30,25 @@ export const DS = {
   HEADER: 7n,
   DA: 8n,
   CONFIG: 9n,
+  TREES: 10n,
+  ACTION_LOG: 11n,
+  VK_NODE: 12n,
+  DA_SPONGE: 13n,
 } as const;
 
-/** P0 shape parameters; must match circuits/l3x_types/src/lib.nr. */
+/** Shape parameters; must match circuits/l3x_types/src/{lib,merge}.nr. */
 export const SHAPE = {
   MAX_CLIENT_PROOFS: 10,
   MAX_PRIORITY: 8,
-  DA_LEN: 64,
+  DA_MAX: 4080,
+  X_DA_MAX: 4080,
   CHONK_PROOF_LENGTH: 1221,
+  VK_TREE_HEIGHT: 6,
+  VK_ROLE_SLOTS: 8,
 } as const;
+
+/** VK tree roles (SPEC.md §9.3); leaf index = role * VK_ROLE_SLOTS + slot. */
+export const ROLE = { CLIENT: 0, CHONK: 1, TUBE: 2, SEGMENT: 3, MERGE: 4 } as const;
 
 export function run(cmd: string, args: string[], cwd = CIRCUITS): string {
   return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 });
@@ -78,7 +88,7 @@ export function randomField(): bigint {
   return fromBytes32(b) % R;
 }
 
-async function permute(api: Barretenberg, state: bigint[]): Promise<bigint[]> {
+export async function permute(api: Barretenberg, state: bigint[]): Promise<bigint[]> {
   const { outputs } = await api.poseidon2Permutation({ inputs: state.map(toBytes32) });
   return outputs.map(fromBytes32);
 }
@@ -97,6 +107,62 @@ export async function l3xHash(api: Barretenberg, inputs: bigint[]): Promise<bigi
   }
   if (pos !== 0) state = await permute(api, state);
   return state[0];
+}
+
+// Mirrors of the l3x_types helpers.
+
+export const trees = (api: Barretenberg, accountsRoot: bigint, otherRoot: bigint) =>
+  l3xHash(api, [DS.TREES, accountsRoot, otherRoot]);
+
+export const stateRoot = (api: Barretenberg, treesRoot: bigint, cursor: bigint, batch: bigint, time: bigint) =>
+  l3xHash(api, [DS.STATE, treesRoot, cursor, batch, time]);
+
+export const configHashOf = (api: Barretenberg, vkTreeRoot: bigint, paramsHash: bigint) =>
+  l3xHash(api, [DS.CONFIG, vkTreeRoot, paramsHash]);
+
+export const daIv = (): bigint[] => [0n, 0n, 0n, DS.DA_SPONGE];
+
+export async function daAbsorb(api: Barretenberg, da: bigint[], len: number, x: bigint): Promise<[bigint[], number]> {
+  const pos = len % 3;
+  const s = [...da];
+  s[pos] = (s[pos] + x) % R;
+  return [pos === 2 ? await permute(api, s) : s, len + 1];
+}
+
+export async function daFinalize(api: Barretenberg, da: bigint[], len: number): Promise<bigint> {
+  const s = len % 3 !== 0 ? await permute(api, da) : da;
+  return l3xHash(api, [DS.DA, s[0], BigInt(len)]);
+}
+
+/** DA hash of a whole payload, as the Bridge computes it. */
+export async function daHash(api: Barretenberg, payload: bigint[]): Promise<bigint> {
+  let s = daIv();
+  let n = 0;
+  for (const x of payload) [s, n] = await daAbsorb(api, s, n, x);
+  return daFinalize(api, s, n);
+}
+
+/** Layers of the VK tree: layers[0] are the leaves, the last layer is [root]. */
+export async function vkTree(api: Barretenberg, leaves: bigint[]): Promise<bigint[][]> {
+  if (leaves.length !== 1 << SHAPE.VK_TREE_HEIGHT) throw new Error(`VK tree needs ${1 << SHAPE.VK_TREE_HEIGHT} leaves`);
+  const layers = [leaves];
+  while (layers[layers.length - 1].length > 1) {
+    const prev = layers[layers.length - 1];
+    const next: bigint[] = [];
+    for (let i = 0; i < prev.length; i += 2) next.push(await l3xHash(api, [DS.VK_NODE, prev[i], prev[i + 1]]));
+    layers.push(next);
+  }
+  return layers;
+}
+
+export function vkPath(layers: bigint[][], index: number): bigint[] {
+  const path: bigint[] = [];
+  let idx = index;
+  for (let level = 0; level < SHAPE.VK_TREE_HEIGHT; level++) {
+    path.push(layers[level][idx ^ 1]);
+    idx >>= 1;
+  }
+  return path;
 }
 
 export type VkJson = { vk: string[]; hash: string; bb_version: string; scheme: string };

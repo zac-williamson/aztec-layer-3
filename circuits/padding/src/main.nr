@@ -1,10 +1,9 @@
-use l3x_types::AggOutput;
+use l3x_types::NodeOutput;
 
-/// Empty segment. bb's root-rollup verifier requires exactly two nested IPA claims, so the root
-/// always verifies two RollupHonk proofs (SPEC.md §9.2). A batch with one real segment pairs it
-/// with this circuit's proof, proved with the noir-rollup-no-zk target, which carries bb's
-/// default IPA claim. Its output must be the empty aggregation.
-fn main(output: pub AggOutput) {
-    assert(output.actions_hash == 0, "padding segment must be empty");
-    assert(output.count == 0, "padding segment must be empty");
+/// Empty segment (SPEC.md §9.2). bb's root-rollup verifier needs exactly two nested IPA claims,
+/// so the root always verifies two RollupHonk proofs; a batch with one real child pairs it with
+/// this circuit's proof, which carries bb's default IPA claim. Its transition is the identity,
+/// so it chains after any node.
+fn main(out: pub NodeOutput) {
+    assert(out.start == out.end, "padding segment must be empty");
 }
