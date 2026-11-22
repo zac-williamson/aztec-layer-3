@@ -30,6 +30,7 @@ import {
   vkTree,
 } from './lib.ts';
 import { type P256Key, bytes32, halves, p256Sign } from './exchange/p256.ts';
+import { CLIENT_DATA_MAX, makeAssertion, rpHalves } from './exchange/webauthn.ts';
 
 const CircuitKind = { App: 0, Kernel: 1, HidingKernel: 2 } as const;
 const IVC = ['agg_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'] as const;
@@ -162,7 +163,7 @@ export async function newApi(): Promise<Barretenberg> {
 export type ClientProof = { pkg: string; proof: string[]; publicInputs: string[] };
 const CLIENT_PROOF_FIELDS = 458;
 /** The client circuits of the VK tree's client subtree. */
-export const CLIENT_CIRCUITS = ['client_auth', 'client_p256'] as const;
+export const CLIENT_CIRCUITS = ['client_auth', 'client_p256', 'client_webauthn'] as const;
 /** Fields of AggOutput, the Chonk proof's public inputs: actions_hash, count, vk_tree_root. */
 const AGG_OUTPUT_LEN = 3;
 
@@ -302,6 +303,34 @@ export class Prover {
       account_index: hex(account),
       auth_binding: hex(await l3xHash(this.api, [DS.P256, xh, xl, yh, yl, salt])),
     });
+  }
+
+  /**
+   * The client_webauthn witness for an assertion of `msg` by passkey `key` registered with relying
+   * party `rpId`: the auth binding commits to the key, the relying party and `salt`.
+   */
+  async webauthnWitness(key: P256Key, salt: bigint, rpId: string, origin: string, msg: bigint, account: bigint) {
+    const a = makeAssertion(key, rpId, origin, msg);
+    const [xh, xl] = halves(key.pk.x);
+    const [yh, yl] = halves(key.pk.y);
+    const [rh, rl] = rpHalves(rpId);
+    return {
+      pk_x: bytes32(key.pk.x),
+      pk_y: bytes32(key.pk.y),
+      salt: hex(salt),
+      signature: [...a.signature],
+      authenticator_data: [...a.authenticatorData],
+      client_data: [...a.clientDataJSON, ...Array<number>(CLIENT_DATA_MAX - a.clientDataJSON.length).fill(0)],
+      client_data_len: a.clientDataJSON.length,
+      msg: hex(msg),
+      account_index: hex(account),
+      auth_binding: hex(await l3xHash(this.api, [DS.WEBAUTHN, xh, xl, yh, yl, rh, rl, salt])),
+    };
+  }
+
+  /** A client_webauthn proof: a WebAuthn assertion of `msg`, as a browser's passkey makes it. */
+  async clientProofWebAuthn(key: P256Key, salt: bigint, rpId: string, origin: string, msg: bigint, account: bigint) {
+    return this.proveClient('client_webauthn', await this.webauthnWitness(key, salt, rpId, origin, msg, account));
   }
 
   /** A valid proof of a random message, for the slots of a P-segment beyond its actions (agg_app verifies every slot). */

@@ -194,6 +194,11 @@ export const p256Binding = (h: H, pk: { x: bigint; y: bigint }, salt: bigint) =>
   const lo = (1n << 128n) - 1n;
   return h([DS.P256, pk.x >> 128n, pk.x & lo, pk.y >> 128n, pk.y & lo, salt]);
 };
+/** A passkey's auth binding (client_webauthn): the key, the relying party ID hash, and the client's salt. */
+export const webauthnBinding = (h: H, pk: { x: bigint; y: bigint }, rpIdHash: bigint, salt: bigint) => {
+  const lo = (1n << 128n) - 1n;
+  return h([DS.WEBAUTHN, pk.x >> 128n, pk.x & lo, pk.y >> 128n, pk.y & lo, rpIdHash >> 128n, rpIdHash & lo, salt]);
+};
 /** Lane-P master authorization (SPEC.md §7.1): the client circuit, with the account's auth binding. */
 export const masterAuthP = (h: H, clientVkHash: bigint, binding: bigint) => h([DS.MAUTH_P, clientVkHash, binding]);
 export const encCommitment = (h: H, k: bigint) => h([DS.ENC, k]);

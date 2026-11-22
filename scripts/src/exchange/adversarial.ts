@@ -8,6 +8,7 @@ import { OUT, hex, randomField, readCircuit, readJson } from '../lib.ts';
 import { Prover, assert, batchStart, chonkPlaceholder, newApi, nodeToNoir } from '../pipeline.ts';
 import { Engine, type SignedAction, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed, scalarToNoir, sign, sigToNoir } from './grumpkin.ts';
+import { p256Key } from './p256.ts';
 import * as M from './model.ts';
 import { protocolAccounts, testParams } from './params.ts';
 import * as X from './rules.ts';
@@ -546,6 +547,28 @@ async function main() {
   await PE.proven([await byClient(U, 1n, ADD_KEY, [0n, pSess.pk.x, pSess.pk.y, 0b01n, 100_000n, now + 1000n])]);
   PE.relax.delete('client-auth');
   await expectFail('client proof for a lane-S account', 'tube', runTube(PE.segments[pt].inputs), 'client proof does not control the account');
+
+  // Passkey assertions (client_webauthn, SPEC.md §7.4). The client circuit itself refuses an
+  // assertion of another challenge, one without user presence, one from another relying party, and
+  // a registration in place of an assertion.
+  const passkey = p256Key();
+  const wsalt = randomField();
+  const wmsg = randomField();
+  const wit = await prover.webauthnWitness(passkey, wsalt, 'l3x.example', 'https://l3x.example', wmsg, 2n);
+  await execute('client_webauthn', wit);
+  let wt = clone(wit) as any;
+  wt.msg = hex(wmsg ^ 1n);
+  await expectFail('passkey assertion of another challenge', 'client_webauthn', wt, 'assertion for another challenge');
+  wt = clone(wit) as any;
+  wt.authenticator_data[32] = 0x04;
+  await expectFail('passkey assertion without user presence', 'client_webauthn', wt, 'user not present');
+  wt = clone(await prover.webauthnWitness(passkey, wsalt, 'evil.example', 'https://evil.example', wmsg, 2n)) as any;
+  wt.auth_binding = wit.auth_binding;
+  await expectFail('passkey assertion from another site', 'client_webauthn', wt, 'key does not match the auth binding');
+  wt = clone(wit) as any;
+  const create = [...new TextEncoder().encode('{"type":"webauthn.create"')];
+  create.forEach((b, i) => (wt.client_data[i] = b));
+  await expectFail('passkey registration in place of an assertion', 'client_webauthn', wt, 'not a WebAuthn assertion');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

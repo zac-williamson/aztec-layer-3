@@ -9,6 +9,9 @@ import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
 import { p256Key } from './p256.ts';
+import { sha256 } from './webauthn.ts';
+
+const rpIdHashOf = (rpId: string) => BigInt(`0x${Buffer.from(sha256(new TextEncoder().encode(rpId))).toString('hex')}`);
 import * as M from './model.ts';
 import { genesisState, protocolAccounts, testParams } from './params.ts';
 import * as X from './rules.ts';
@@ -385,13 +388,29 @@ async function main() {
   // Batch 8: CancelAll in constant time (SPEC.md §6.5). Heidi's session key cancels all her orders
   // and Alice does the same with her master key; Carol's ForcedCancelAll through the queue voids
   // hers. Void orders stay in the books until matching meets them: Bob's sell removes Heidi's
-  // market-0 bid instead of filling it, and Dave's sell removes Carol's.
+  // market-0 bid instead of filling it, and Dave's sell removes Carol's. Ivan registers with a
+  // passkey (client_webauthn) and grants a session key with a WebAuthn assertion.
   await engine.beginBatch(8n, b7.end.priorityHead, b7.end.priorityCursor, b7.end.time);
   const t8 = now + 4200n;
   await engine.block(t8, [await update(0n, 1750n, 1750n, t8 - 1n), await update(1n, 30_010n, 30_010n, t8 - 1n)]);
   const { CANCEL_ALL } = X.KIND_ACT;
   await engine.trade([await byHeidiKey(4n, CANCEL_ALL, []), await act(alice, A, 8n, CANCEL_ALL, [])]);
-  await engine.priority([{ kind: M.KIND.FORCED_CANCEL_ALL, a: C, b: 0n, sender: users[2].addr, time: t8 }]);
+  const ivan = { passkey: p256Key(), salt: randomField(), rpId: 'l3x.example', origin: 'https://l3x.example', addr: randomField(), keys: await keysFromSeed(h, 909n) };
+  const Iv = 10n;
+  const ivanAuth = await M.masterAuthP(h, prover.clientVks.client_webauthn, await M.webauthnBinding(h, ivan.passkey.pk, rpIdHashOf(ivan.rpId), ivan.salt));
+  const ivanEnc = await M.encCommitment(h, ivan.keys.kEnc);
+  engine.keyring.set(ivanEnc, ivan.keys.kEnc);
+  await engine.priority([
+    { kind: M.KIND.FORCED_CANCEL_ALL, a: C, b: 0n, sender: users[2].addr, time: t8 },
+    { kind: M.KIND.REGISTER, a: ivanAuth, b: ivanEnc, sender: ivan.addr, time: t8 },
+    { kind: M.KIND.DEPOSIT, a: Iv, b: 100_000n, sender: ivan.addr, time: t8 },
+  ]);
+  netDeposits += 100_000n;
+  const iSess = await keysFromSeed(h, 9009n);
+  await engine.proven([
+    await proveAction(h, engine.domain, ivan, ADD_KEY, Iv, 1n, [0n, iSess.pk.x, iSess.pk.y, 0b0001n, 50_000n, t8 + 1000n], EXECUTE_ONLY ? undefined : prover),
+  ]);
+  assert(engine.keyOf(Iv, 0).pkX === iSess.pk.x && engine.actv.get(Iv)!.nonce === 1n, 'passkey key grant');
   const voided = (i: bigint) => {
     const x = engine.actv.get(i)!;
     return x.epoch > 0n && x.openOrders === 0n && x.openBid.every((b) => b === 0n) && x.openAsk.every((b) => b === 0n);
@@ -427,6 +446,8 @@ async function main() {
   }
   const graceOpened = await openAccount(h, rebuilt, grace.keys.kEnc, graceAuth);
   assert(graceOpened.index === G && show(graceOpened.priv) === show(engine.accts.get(G)!.priv), 'lane-P account opened from DA differs from the engine');
+  const ivanOpened = await openAccount(h, rebuilt, ivan.keys.kEnc, ivanAuth);
+  assert(ivanOpened.index === Iv && show(ivanOpened.priv) === show(engine.accts.get(Iv)!.priv), 'passkey account opened from DA differs from the engine');
   const heidiOpened = await openAccount(h, rebuilt, heidi.keys.kEnc, heidiAuth);
   assert(heidiOpened.index === Hd && show(heidiOpened.priv) === show(engine.accts.get(Hd)!.priv), 'P-256 account opened from DA differs from the engine');
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;

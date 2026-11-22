@@ -39,6 +39,7 @@ const ROLLUP = { scheme: 'ultra_honk', target: 'noir-rollup-no-zk' } as const;
 const STEPS: Step[] = [
   { pkg: 'client_auth', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'client_p256', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
+  { pkg: 'client_webauthn', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'agg_app', vk: { scheme: 'chonk', kind: 'app' } },
   { pkg: 'init_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['AGG_APP_VK_HASH'] },
   { pkg: 'tail_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['INIT_KERNEL_VK_HASH'] },
@@ -63,6 +64,7 @@ const STEPS: Step[] = [
 const PUBLISHES: Record<string, string> = {
   client_auth: 'CLIENT_VK_HASH',
   client_p256: 'CLIENT_P256_VK_HASH',
+  client_webauthn: 'CLIENT_WEBAUTHN_VK_HASH',
   agg_app: 'AGG_APP_VK_HASH',
   init_kernel: 'INIT_KERNEL_VK_HASH',
   tail_kernel: 'TAIL_KERNEL_VK_HASH',
@@ -89,6 +91,7 @@ const S = SHAPE.VK_ROLE_SLOTS;
 const VK_SLOTS: Record<string, number> = {
   client_auth: ROLE.CLIENT * S + 0,
   client_p256: ROLE.CLIENT * S + 1,
+  client_webauthn: ROLE.CLIENT * S + 2,
   agg_app: ROLE.CHONK * S + 0,
   init_kernel: ROLE.CHONK * S + 1,
   tail_kernel: ROLE.CHONK * S + 2,

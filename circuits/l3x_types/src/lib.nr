@@ -45,6 +45,7 @@ pub global DS_DA_SPONGE: Field = 13;
 pub global DS_RECEIPT: Field = 14;
 pub global DS_RECEIPT_NODE: Field = 15;
 pub global DS_P256: Field = 16;
+pub global DS_WEBAUTHN: Field = 17;
 
 /// Carried through the Chonk IVC on the databus: app return_data -> kernel call_data -> ...
 /// The hiding kernel exposes it as its public output; the tube consumes it. `vk_tree_root` is the

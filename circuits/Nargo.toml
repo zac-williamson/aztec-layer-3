@@ -4,6 +4,7 @@ members = [
     "l3x_exchange",
     "client_auth",
     "client_p256",
+    "client_webauthn",
     "agg_app",
     "init_kernel",
     "tail_kernel",

@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), and the risk sweep at refresh (P2.11), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), and a WebAuthn passkey client circuit (P2.12), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -831,6 +831,7 @@ P2 is built in increments, each leaving every test green.
 - P2.9: `CancelAll` in constant time, through order epochs.
 - P2.10: dead-order removal, and ticks that read only live orders.
 - P2.11: the risk sweep (§8.7), checked at refresh.
+- P2.12: a WebAuthn passkey client circuit.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1142,9 +1143,10 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   | --- | --- | --- | --- |
   | 0 | `client_auth` | knowledge of a secret | `H(DS_AUTH, secret)` |
   | 1 | `client_p256` | an ECDSA P-256 signature on the message's 32 bytes | `H(DS_P256, x_hi, x_lo, y_hi, y_lo, salt)`: the key's coordinates in 16-byte halves, and a salt the client keeps so the key is not a public identifier |
+  | 2 | `client_webauthn` (P2.12) | a WebAuthn assertion whose challenge is the message | `H(DS_WEBAUTHN, x_hi, x_lo, y_hi, y_lo, rp_hi, rp_lo, salt)`, which also binds the relying party ID hash |
 
 - **P-256 keys.** `client_p256` suits hardware keys that sign a digest, such as a Secure Enclave or a TPM. The message is already a domain-separated hash, so it is the digest. Signers use RFC 6979 nonces and low `s`.
-  - WebAuthn passkeys sign `authenticatorData ‖ SHA-256(clientDataJSON)` instead. Supporting them means rebuilding that preimage in the circuit, with the message as the challenge. That is deferred.
+  - WebAuthn passkeys sign `authenticatorData ‖ SHA-256(clientDataJSON)` instead. P2.12 adds a circuit that rebuilds that preimage (see Passkeys).
 - **Narrowing.** Every circuit in the subtree may authorize every lane-P kind. §7.1's per-kind permission is not built.
 - **Cost.** `client_p256` is 46,551 gates and proves in about 250 ms on the reference laptop, against 29 ms for `client_auth`. A VK hash and a 6-level membership path per slot take `agg_app` from 109,564 to 113,267 Mega gates (+3.4%). The tube is unchanged in size.
 
@@ -1202,6 +1204,30 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Scope.** Protocol accounts are never liquidated, and are not checked.
 - **Cost.** `seg_refresh`: 160,565 gates, up 19,000 for four checks.
 
+**Passkeys** (P2.12, §7.4):
+
+- **Circuit.** `client_webauthn` (client slot 2) verifies a WebAuthn assertion as a browser's passkey makes it, so a user can authorize lane-P actions with Face ID or a security key.
+- **Challenge.** The challenge is the action message.
+  - clientDataJSON must begin with `{"type":"webauthn.get","challenge":"`, then the message's 32 bytes in unpadded base64url, then a closing quote. Browsers serialize these two members first.
+  - The rest of clientDataJSON is hashed as signed but not parsed: the origin, `crossOrigin`, and fields browsers sometimes append.
+- **Relying party.** authenticatorData is 37 bytes, and its user-present flag must be set.
+  - Its first 32 bytes, the SHA-256 of the relying party ID, are bound into `auth_binding` along with the key and a salt.
+  - A passkey registered with another site therefore cannot authorize, and the circuit need not check the origin.
+- **Signature.** The signature is ECDSA P-256 over `SHA-256(authenticatorData ‖ SHA-256(clientDataJSON))`.
+  - clientDataJSON may be up to 311 bytes. The circuit hashes it with the SHA-256 compression function over five blocks and keeps the state after the message's last block. The Noir standard library of this toolchain has the compression function but no `sha256`.
+  - Clients convert the DER signature a browser returns to `r ‖ s`, with `s` normalized to the lower half. Both forms are valid ECDSA.
+- **Narrowing.**
+  - authenticatorData carries no extensions.
+  - User verification is not required.
+  - Signature counters are not checked; the operator can watch them for cloned authenticators.
+- **Cost.** `client_webauthn` is 87,206 gates and proves in 0.7–1 s on the reference laptop, with the build running alongside. The P-256 verification is about half of it (46,551 gates alone in `client_p256`); the seven SHA-256 compressions are a cheap black box.
+
+**Tests** (P2.12):
+
+- **Native**, batch 8: Ivan registers with a passkey and grants a session key with a WebAuthn assertion, proved through the IVC and the tube. The DA reopens his account.
+- **Adversarial:** 4 more witnesses, 78 in all: an assertion of another challenge, one without user presence, one from another site, and a registration (`webauthn.create`) in place of an assertion.
+- **Simulator.** The simulated authenticator's assertions verify under Node's own ECDSA verifier on the WebAuthn construction. The circuit accepts clientDataJSON of three, four and five blocks.
+
 **Tests** (P2.11):
 
 - **Native:** every refresh across the eight batches passes the check. The engine refuses to refresh an account that is due for liquidation.
@@ -1252,8 +1278,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. WebAuthn passkeys as a client circuit.
-3. From P3: the ranking of ADL counterparties (§8.5).
+2. From P3: the ranking of ADL counterparties (§8.5).
 
 ## 16. Decisions
 

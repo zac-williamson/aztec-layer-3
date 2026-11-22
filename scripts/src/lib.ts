@@ -37,6 +37,7 @@ export const DS = {
   RECEIPT: 14n,
   RECEIPT_NODE: 15n,
   P256: 16n,
+  WEBAUTHN: 17n,
 } as const;
 
 /** Shape parameters; must match circuits/l3x_types/src/{lib,merge}.nr. */

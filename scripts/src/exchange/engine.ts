@@ -7,6 +7,10 @@ import { DS as DS0, R, SHAPE, daAbsorb, hex } from '../lib.ts';
 import { type BatchWitness, type ClientProof, type Prover, type Running, type SegmentWitness, assert, batchStart, copyRunning, runningToNoir } from '../pipeline.ts';
 import { type Point, type Sig, sigToNoir, verify, zeroSig } from './grumpkin.ts';
 import type { P256Key } from './p256.ts';
+import { sha256 } from './webauthn.ts';
+
+/** SHA-256 of a relying party ID, as a passkey's authenticator data carries it. */
+const rpIdHash = (rpId: string) => BigInt(`0x${Buffer.from(sha256(new TextEncoder().encode(rpId))).toString('hex')}`);
 import * as M from './model.ts';
 import type { ProtocolAccount } from './params.ts';
 import * as X from './rules.ts';
@@ -1775,8 +1779,11 @@ export async function signAction(h: M.H, domain: bigint, keys: { sk: bigint; pk:
   return { kind, account, keyId, nonce, p: payload, sig: await sign(h, keys.sk, msg), pk: { x: keys.pk!.x, y: keys.pk!.y } };
 }
 
-/** How a lane-P client authorizes: the secret behind its auth binding (client_auth), or a P-256 key and salt (client_p256). */
-export type ClientAuth = bigint | { key: P256Key; salt: bigint };
+/**
+ * How a lane-P client authorizes: the secret behind its auth binding (client_auth), a P-256 key
+ * and salt (client_p256), or a passkey registered with a relying party (client_webauthn).
+ */
+export type ClientAuth = bigint | { key: P256Key; salt: bigint } | { passkey: P256Key; salt: bigint; rpId: string; origin: string };
 
 /**
  * A client's proof of a master action (SPEC.md §7.4): the client circuit authorizes the action's
@@ -1786,14 +1793,23 @@ export type ClientAuth = bigint | { key: P256Key; salt: bigint };
 export async function proveAction(h: M.H, domain: bigint, auth: ClientAuth, kind: bigint, account: bigint, nonce: bigint, p: bigint[], prover?: Prover): Promise<ProvenAction> {
   const payload = [...p, ...Array<bigint>(X.ACTION_PAYLOAD - p.length).fill(0n)];
   const msg = await X.actionMsg(h, domain, kind, account, M.MASTER_KEY, nonce, payload);
-  const pkg = typeof auth === 'bigint' ? 'client_auth' : 'client_p256';
   let proof: ClientProof;
   if (prover) {
-    const made = typeof auth === 'bigint' ? await prover.clientProof(auth, msg, account) : await prover.clientProofP256(auth.key, auth.salt, msg, account);
+    const made =
+      typeof auth === 'bigint'
+        ? await prover.clientProof(auth, msg, account)
+        : 'passkey' in auth
+          ? await prover.clientProofWebAuthn(auth.passkey, auth.salt, auth.rpId, auth.origin, msg, account)
+          : await prover.clientProofP256(auth.key, auth.salt, msg, account);
     proof = { pkg: made.pkg, proof: made.proof, publicInputs: made.publicInputs };
   } else {
-    const binding = typeof auth === 'bigint' ? await M.authBinding(h, auth) : await M.p256Binding(h, auth.key.pk, auth.salt);
-    proof = { pkg, proof: [], publicInputs: [msg, account, binding].map(hex) };
+    const [pkg, binding] =
+      typeof auth === 'bigint'
+        ? ['client_auth', await M.authBinding(h, auth)]
+        : 'passkey' in auth
+          ? ['client_webauthn', await M.webauthnBinding(h, auth.passkey.pk, rpIdHash(auth.rpId), auth.salt)]
+          : ['client_p256', await M.p256Binding(h, auth.key.pk, auth.salt)];
+    proof = { pkg: pkg as string, proof: [], publicInputs: [msg, account, binding as bigint].map(hex) };
   }
   return { kind, account, nonce, p: payload, proof };
 }

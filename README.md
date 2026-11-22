@@ -28,6 +28,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.9**: `CancelAll` in constant time. Orders record their owner's order epoch; cancelling all advances the epoch, and matching removes void orders when it meets them. Forced cancel-all and liquidation use the same step.
 - **P2.10**: dead orders. Maintenance removes void and expired orders, and a tick proves its top-of-book orders live, so an order that cannot fill never moves the mark.
 - **P2.11**: the risk sweep. A refreshed account must not be due for liquidation at fresh marks, so with the refresh deadline every due liquidation happens within about two refresh windows.
+- **P2.12**: passkeys. A WebAuthn client circuit lets a browser passkey authorize lane-P actions: the assertion's challenge is the action message, and the relying party is bound into the account's authorization.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -45,6 +46,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
 | `circuits/client_auth` | P-lane client circuit (client slot 0): knowledge of the secret behind an account's auth binding, authorizing `msg` |
 | `circuits/client_p256` | P-lane client circuit (client slot 1): an ECDSA P-256 signature on `msg` by the key the auth binding commits to |
+| `circuits/client_webauthn` | P-lane client circuit (client slot 2): a WebAuthn passkey assertion whose challenge is `msg`, bound to the relying party |
 | `circuits/agg_app` | Chonk app: verifies 10 client proofs, each against a VK in the VK tree's client subtree, and folds the first `count` with their VK hashes |
 | `circuits/{init,tail,hiding}_kernel` | IVC kernels: OINK, HN, HN_FINAL, each pinning its predecessor's VK hash |
 | `circuits/tube` | P-segment leaf: verifies the Chonk proof against the pinned Chonk VK, checks the segment's actions against the proofs' aggregation, and applies them (AddKey, RevokeKey, Withdraw) |
@@ -174,7 +176,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.10: tests | Native batch 6 clears two void asks before ticking; 3 more adversarial witnesses (73 in all). |
 | P2.11: risk sweep | The refresh checks each user account at fresh marks (equity ≥ MM, or liquidate first); stale indices exempt an account so an oracle outage cannot stall refresh. |
 | P2.11: tests | Every native refresh passes the check; 1 more adversarial witness (74 in all). |
-| P2: next | C1 custody once the D7 token is specified; WebAuthn passkeys; from P3, ADL ranking. |
+| P2.12: passkeys | client_webauthn checks the challenge, user presence and relying party, hashes clientDataJSON (up to 311 bytes) with SHA-256, and verifies the P-256 assertion signature. |
+| P2.12: tests | Native batch 8 grants a session key by passkey; 4 more adversarial witnesses (78 in all); the simulated authenticator agrees with Node's ECDSA verifier. |
+| P2: next | C1 custody once the D7 token is specified; from P3, ADL ranking. |
 
 ## Caveats
 
