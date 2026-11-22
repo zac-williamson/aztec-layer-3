@@ -132,6 +132,8 @@ pub struct State {
     pub refresh_cursor: u32,
     /// L3 time at which the refresh cursor last wrapped past the last account (SPEC.md §9.5).
     pub cycle_start: u64,
+    /// The sequencer's number of the last signed action executed (SPEC.md §11).
+    pub last_seq: u64,
     pub num_accounts: u32,
     pub fees_pending: u64,
     pub insurance_pending: u64,
@@ -143,7 +145,7 @@ impl State {
         hash(
             [
                 DS_OTHER, self.activity_root, markets_hash(self.markets), self.refresh_cursor as Field,
-                self.cycle_start as Field, self.num_accounts as Field, self.fees_pending as Field, self.insurance_pending as Field,
+                self.cycle_start as Field, self.last_seq as Field, self.num_accounts as Field, self.fees_pending as Field, self.insurance_pending as Field,
                 self.insurance_micro as Field,
             ],
         )
@@ -197,6 +199,7 @@ pub fn genesis_state(protocol: [AccountPub; PROTOCOL_ACCOUNTS]) -> State {
         markets: [Market::genesis(book); MARKETS],
         refresh_cursor: 0,
         cycle_start: 0,
+        last_seq: 0,
         num_accounts: PROTOCOL_ACCOUNTS,
         fees_pending: 0,
         insurance_pending: 0,

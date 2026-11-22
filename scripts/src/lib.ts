@@ -34,6 +34,8 @@ export const DS = {
   ACTION_LOG: 11n,
   VK_NODE: 12n,
   DA_SPONGE: 13n,
+  RECEIPT: 14n,
+  RECEIPT_NODE: 15n,
 } as const;
 
 /** Shape parameters; must match circuits/l3x_types/src/{lib,merge}.nr. */

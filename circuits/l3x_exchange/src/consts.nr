@@ -48,6 +48,10 @@ pub global DS_MKT_PARAMS: Field = 47;
 pub global DS_LIQ: Field = 48;
 pub global DS_KEY: Field = 49;
 pub global DS_KEY_NODE: Field = 50;
+pub global DS_RECEIPT_SIG: Field = 51;
+/// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
+/// tree's depth (SPEC.md §11).
+pub global RECEIPT_DEPTH: u32 = 24;
 
 // Priority request kinds (SPEC.md §7.3). Forced requests carry the account index in `a`.
 pub global KIND_REGISTER: Field = 1;

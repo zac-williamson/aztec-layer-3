@@ -76,6 +76,7 @@ fn main(
         market_data_hash: market_data_hash(market_data(end_state.markets)),
         config_hash: config,
         cycle_start: end_state.cycle_start,
+        receipts_root: out.receipts_root,
     };
     header.hash()
 }

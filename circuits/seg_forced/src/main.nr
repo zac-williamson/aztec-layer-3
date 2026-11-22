@@ -162,5 +162,5 @@ fn main(
         assert((n_fills == 0) & (n_cancels == 0), "no such account");
     }
     end.state = st.trees();
-    NodeOutput { config_hash: params.config(vk_tree_root), start, end }
+    NodeOutput { config_hash: params.config(vk_tree_root), start, end, receipts_root: 0 }
 }

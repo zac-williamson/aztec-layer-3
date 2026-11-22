@@ -2,6 +2,8 @@
 //! proving, so the root proof here is a dummy and headers are built by hand; the proof binding is
 //! tested end to end against real proofs in scripts/src.
 use crate::L3XBridge;
+use crate::L3XBridge::ReceiptConfig;
+use std::embedded_curve_ops::EmbeddedCurveScalar;
 use aztec::{protocol::{address::AztecAddress, traits::ToField}, test::helpers::test_environment::TestEnvironment};
 use bb_proof_verification::{UltraHonkVerificationKey, UltraHonkZKProof};
 use l3x_exchange::{
@@ -15,7 +17,10 @@ use l3x_exchange::{
     withdrawal_record, withdrawals_root,
 };
 use l3x_token::L3XToken;
-use l3x_types::{BatchHeader, config_hash, DA_MAX, da_hash_flat, hash::hash, merge::{VK_TREE_LEAVES, vk_tree_root_of}};
+use l3x_types::{
+    BatchHeader, config_hash, DA_MAX, da_hash_flat, hash::hash, merge::{VK_TREE_LEAVES, vk_tree_root_of}, receipt_leaf,
+    receipt_node,
+};
 
 global ROOT_VK: Field = 0x1234;
 global CONFIG: Field = 0x5678;
@@ -24,6 +29,22 @@ global T_CLAIM: u64 = 500;
 global REQUEST_FEE: u128 = 25;
 global T_REFRESH: u64 = 100_000;
 global T_LATE: u64 = 300;
+// Receipt key and two receipts signed with it (scripts/src/receipt_vectors.ts).
+global RECEIPT_DOMAIN: Field = 0x1234abcd;
+global RECEIPT_PK_X: Field = 0x227b763466c29a7bd8281d9357510eb4a09f28f77212e701a8022761cfff6a60;
+global RECEIPT_PK_Y: Field = 0x0ac3c64095fd102f2c25c8033ed095ad808a8a2c5071635a5a93c10f6bfcdf5a;
+global T_SETTLE: u64 = 100;
+global T_RESP: u64 = 200;
+global SLASH: u128 = 400;
+global R1_MSG: Field = 0x5151;
+global R1_SEQ: u64 = 7;
+global R1_S: EmbeddedCurveScalar = EmbeddedCurveScalar { lo: 0xe95511a7b4b2ea512cbd5ac0fd5dca25, hi: 0x06c8a305607119b4f87613861f61650c };
+global R1_E: EmbeddedCurveScalar = EmbeddedCurveScalar { lo: 0x83d843e1075da2becba8b31cdeae0839, hi: 0x01a4b9281a65ef34420cf9e016072a17 };
+global R2_MSG: Field = 0x6262;
+global R2_SEQ: u64 = 8;
+global R2_S: EmbeddedCurveScalar = EmbeddedCurveScalar { lo: 0x56e91bdad1a1a1752f44a6ca2ecf81ff, hi: 0x102b2cd7fc8650ef72705699899909dc };
+global R2_E: EmbeddedCurveScalar = EmbeddedCurveScalar { lo: 0xa2a5809e3c98a5cca1375a0f562bf4ce, hi: 0x2a1d389ec3cbe0b8085e17515f3dbbc3 };
+global ISSUED: u64 = 1;
 global T_LAG: u64 = 15 * 60;
 global UPGRADE_DELAY: u64 = 21 * 24 * 60 * 60;
 global TEST_DA_LEN: u32 = 8;
@@ -70,6 +91,14 @@ unconstrained fn setup() -> Env {
             T_REFRESH,
             T_LATE,
             REQUEST_FEE,
+            ReceiptConfig {
+                domain: RECEIPT_DOMAIN,
+                pk_x: RECEIPT_PK_X,
+                pk_y: RECEIPT_PK_Y,
+                t_settle: T_SETTLE,
+                t_resp: T_RESP,
+                slash: SLASH,
+            },
             [operator, operator],
             PROTOCOL_MAUTH,
             PROTOCOL_ENC,
@@ -137,6 +166,7 @@ unconstrained fn next_header(e: Env, now: u64, consume: u64) -> BatchHeader {
         market_data_hash: market_data_hash(md(PRICE, now, 0)),
         config_hash: CONFIG,
         cycle_start,
+        receipts_root: 0,
     }
 }
 
@@ -500,6 +530,102 @@ unconstrained fn unprocessed_forced_request_blocks_settlement() {
     settle(e, e.operator, next_header(e, now, 0), now);
 }
 
+// ---- Receipts and accountability (SPEC.md §11) ----
+
+/// Settles a batch whose receipts root holds receipt 1's leaf at depth 1 (its sibling is empty),
+/// then challenges receipt 1 as Bob, past t_settle.
+unconstrained fn receipt_world() -> Env {
+    let e = setup();
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).mint(e.bob, 1000));
+    let _ = e.env.call_public(e.bob, L3XToken::at(e.token).approve(e.bridge, 1000));
+    let now = now_plus(e, T_SETTLE + 10);
+    let mut h = next_header(e, now, 0);
+    h.receipts_root = receipt_node(receipt_leaf(R1_SEQ, R1_MSG), 0);
+    settle(e, e.operator, h, now);
+    e
+}
+
+unconstrained fn challenge(e: Env, msg: Field, seq: u64, s: EmbeddedCurveScalar, ee: EmbeddedCurveScalar) {
+    e.env.call_private(e.bob, L3XBridge::at(e.bridge).challenge(msg, seq, ISSUED, s, ee));
+}
+
+#[test]
+unconstrained fn answered_challenge_pays_the_fee_to_the_operator() {
+    let e = receipt_world();
+    challenge(e, R1_MSG, R1_SEQ, R1_S, R1_E);
+    assert(balance(e, e.bob) == 1000 - REQUEST_FEE);
+    let id = receipt_leaf(R1_SEQ, R1_MSG);
+    let mut path: [Field; 24] = [0; 24];
+    path[0] = 0;
+    let before = balance(e, e.operator);
+    e.env.call_private(e.operator, L3XBridge::at(e.bridge).answer(R1_MSG, R1_SEQ, 1, 1, 0, path));
+    let (open, done, _, _) = e.env.view_public(L3XBridge::at(e.bridge).get_challenge(id));
+    assert(!open & done);
+    assert(balance(e, e.operator) == before + REQUEST_FEE);
+}
+
+#[test(should_fail_with = "receipt not in the batch")]
+unconstrained fn wrong_receipt_path_rejected() {
+    let e = receipt_world();
+    challenge(e, R1_MSG, R1_SEQ, R1_S, R1_E);
+    let mut path: [Field; 24] = [0; 24];
+    path[0] = 5;
+    e.env.call_private(e.operator, L3XBridge::at(e.bridge).answer(R1_MSG, R1_SEQ, 1, 1, 0, path));
+}
+
+#[test]
+unconstrained fn unanswered_challenge_slashes_the_bond() {
+    let e = receipt_world();
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).mint(e.operator, 1000));
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).approve(e.bridge, 1000));
+    let _ = e.env.call_public(e.operator, L3XBridge::at(e.bridge).post_bond(1000));
+    // Receipt 2 was signed but its action never settled.
+    challenge(e, R2_MSG, R2_SEQ, R2_S, R2_E);
+    e.env.advance_next_block_timestamp_by(T_RESP + 10);
+    let _ = e.env.call_public(e.alice, L3XBridge::at(e.bridge).slash(receipt_leaf(R2_SEQ, R2_MSG)));
+    assert(balance(e, e.bob) == 1000 + SLASH);
+    let (_, done, _, bond) = e.env.view_public(L3XBridge::at(e.bridge).get_challenge(receipt_leaf(R2_SEQ, R2_MSG)));
+    assert(done & (bond == 1000 - SLASH));
+}
+
+#[test(should_fail_with = "challenge still open")]
+unconstrained fn slash_waits_for_the_deadline() {
+    let e = receipt_world();
+    challenge(e, R2_MSG, R2_SEQ, R2_S, R2_E);
+    let _ = e.env.call_public(e.alice, L3XBridge::at(e.bridge).slash(receipt_leaf(R2_SEQ, R2_MSG)));
+}
+
+#[test(should_fail)]
+unconstrained fn forged_receipt_rejected() {
+    let e = receipt_world();
+    // Receipt 1's signature over receipt 2's message.
+    challenge(e, R2_MSG, R2_SEQ, R1_S, R1_E);
+}
+
+#[test(should_fail_with = "receipt too recent to challenge")]
+unconstrained fn recent_receipt_cannot_be_challenged() {
+    let e = setup();
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).mint(e.bob, 1000));
+    let _ = e.env.call_public(e.bob, L3XToken::at(e.token).approve(e.bridge, 1000));
+    let (_, deployed) = e.env.view_public(L3XBridge::at(e.bridge).get_refresh());
+    // The vectors are issued at time 1; a deployment within t_settle of it is too early.
+    if deployed + 5 < ISSUED + T_SETTLE {
+        challenge(e, R1_MSG, R1_SEQ, R1_S, R1_E);
+    } else {
+        assert(false, "receipt too recent to challenge");
+    }
+}
+
+#[test(should_fail_with = "receipt already challenged")]
+unconstrained fn receipt_challenged_once() {
+    let e = receipt_world();
+    challenge(e, R1_MSG, R1_SEQ, R1_S, R1_E);
+    let mut path: [Field; 24] = [0; 24];
+    path[0] = 0;
+    e.env.call_private(e.operator, L3XBridge::at(e.bridge).answer(R1_MSG, R1_SEQ, 1, 1, 0, path));
+    challenge(e, R1_MSG, R1_SEQ, R1_S, R1_E);
+}
+
 // ---- Desert mode (SPEC.md §12) ----
 
 /// Alice holds an account at index 0 with `collateral` and a position in market 0 of `size` lots
@@ -539,7 +665,7 @@ unconstrained fn exit_register(e: Env, pubv: AccountPub, privv: AccountPriv, pat
 }
 
 unconstrained fn exit_register_with(e: Env, pubv: AccountPub, privv: AccountPriv, path: [Field; ACCOUNTS_HEIGHT], data: [Field; MARKET_DATA_LEN]) {
-    let _ = e.env.call_public(
+    e.env.call_private(
         e.bob,
         L3XBridge::at(e.bridge).exit_register(
             0,
@@ -568,6 +694,23 @@ unconstrained fn desert_exit_from_the_frozen_root() {
     let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
     assert(balance(e, e.alice) == 10_000);
     assert(balance(e, e.bridge) == 0);
+}
+
+#[test]
+unconstrained fn desert_payouts_exclude_the_bond() {
+    let (e, pubv, privv, path) = desert_world(1000, 0, 0);
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).mint(e.operator, 700));
+    let _ = e.env.call_public(e.operator, L3XToken::at(e.token).approve(e.bridge, 700));
+    let _ = e.env.call_public(e.operator, L3XBridge::at(e.bridge).post_bond(700));
+    let (_, _, _, settled_time, _, _) = tip(e);
+    activate(e);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).desert_refund(1, 0, 50, e.alice));
+    exit_register(e, pubv, privv, path, PRICE, settled_time);
+    e.env.advance_next_block_timestamp_by(T_CLAIM + 10);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
+    // Alice gets her 1000, not a share of the bond; the bond stays in escrow.
+    assert(balance(e, e.alice) == 10_000);
+    assert(balance(e, e.bridge) == 700);
 }
 
 #[test]
@@ -675,12 +818,12 @@ unconstrained fn desert_late_claim_waits_for_window_claims() {
     deposit(e, e.alice, 0, 50);
     activate(e);
     let data = md(PRICE, now, 0);
-    let _ = e.env.call_public(
+    e.env.call_private(
         e.bob,
         L3XBridge::at(e.bridge).exit_register(0, e.alice, alice_pub.master_auth, alice_pub.enc_commitment, CLASS_USER, alice_priv.plaintext(), path0, data),
     );
     e.env.advance_next_block_timestamp_by(T_CLAIM + 10);
-    let _ = e.env.call_public(
+    e.env.call_private(
         e.bob,
         L3XBridge::at(e.bridge).exit_register(1, e.bob, bob_pub.master_auth, bob_pub.enc_commitment, CLASS_USER, bob_priv.plaintext(), path1, data),
     );

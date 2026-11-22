@@ -19,7 +19,7 @@ use l3x_exchange::{
     tree::{merkle_root, update},
     withdrawal_record,
 };
-use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
+use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, receipt_leaf, receipt_node, Running};
 
 /// Signed actions per segment, and matching steps per order.
 global TA: u32 = 2;
@@ -31,6 +31,8 @@ struct Action {
     account_index: u32,
     /// The signing key: MASTER_KEY, or a session-key slot of the account (SPEC.md §7.2).
     key_id: u32,
+    /// The sequencer's number for the action, as on its receipt (SPEC.md §11).
+    seq: u64,
     nonce: u64,
     p: [Field; ACTION_PAYLOAD],
     pk_x: Field,
@@ -86,15 +88,23 @@ fn main(
     let da_nonce = segment_nonce(start, end.action_log);
     end = open_segment(end, da_nonce);
     let mut st = state;
+    // Receipts (SPEC.md §11): actions execute in the order of their sequence numbers, and each
+    // gets a leaf in the segment's receipts root, so a receipted action that was dropped or
+    // reordered has no leaf the operator can show.
+    let mut leaves: [Field; TA] = [0; TA];
     for i in 0..TA {
         if i < n {
-            let (st2, end2) = apply(st, end, actions[i], da_nonce, params, domain);
+            let a = actions[i];
+            assert(a.seq > st.last_seq, "sequence numbers must increase");
+            st.last_seq = a.seq;
+            leaves[i] = receipt_leaf(a.seq, action_msg(domain, a.kind, a.account_index, a.key_id, a.nonce, a.p));
+            let (st2, end2) = apply(st, end, a, da_nonce, params, domain);
             st = st2;
             end = end2;
         }
     }
     end.state = st.trees();
-    NodeOutput { config_hash: params.config(vk_tree_root), start, end }
+    NodeOutput { config_hash: params.config(vk_tree_root), start, end, receipts_root: receipt_node(leaves[0], leaves[1]) }
 }
 
 fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Params, domain: Field) -> (State, Running) {

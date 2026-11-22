@@ -1,4 +1,4 @@
-use crate::{DS_VK_NODE, hash::hash, NodeOutput};
+use crate::{DS_VK_NODE, hash::hash, NodeOutput, receipt_node};
 use bb_proof_verification::{RollupHonkProof, RollupHonkVerificationKey};
 
 /// Role-partitioned VK tree (SPEC.md §9.3). Leaf index = role * VK_ROLE_SLOTS + slot, so each
@@ -66,7 +66,12 @@ pub fn combine(config_hash: Field, vk_tree_root: Field, left: Child, right: Chil
     assert_merge_child_vk(left.vk_hash, left.membership, vk_tree_root);
     assert_merge_child_vk(right.vk_hash, right.membership, vk_tree_root);
     assert(left.out.end == right.out.start, "children do not chain");
-    NodeOutput { config_hash, start: left.out.start, end: right.out.end }
+    NodeOutput {
+        config_hash,
+        start: left.out.start,
+        end: right.out.end,
+        receipts_root: receipt_node(left.out.receipts_root, right.out.receipts_root),
+    }
 }
 
 /// Root of the VK tree over all its leaves. Used by the Bridge when a new configuration is

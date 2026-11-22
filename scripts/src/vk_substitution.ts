@@ -95,7 +95,7 @@ async function main() {
   const forgedState: M.State = { ...g.state, accountsRoot: randomField() };
   const forgedEnd: Running = { ...genesis, state: await M.treesOf(h, forgedState), time: now };
   const forgedOpening = M.stateToNoir(forgedState);
-  const rogueOut = (configHash: bigint): NodeOutput => ({ configHash, start: genesis, end: forgedEnd });
+  const rogueOut = (configHash: bigint): NodeOutput => ({ configHash, start: genesis, end: forgedEnd, receiptsRoot: 0n });
   const rogue = await prover.proveNode('rogue_segment', { out: nodeToNoir(rogueOut(config)) });
   const pad = await prover.padding(forgedEnd);
   const borrowed = prover.membership('seg_block');

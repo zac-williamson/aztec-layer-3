@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.8, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), and refresh enforcement with the desert seniority rules (P2.4), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.9, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), and receipts with accountability (P2.5), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -822,8 +822,9 @@ P2 is built in increments, each leaving every test green.
 - P2.2: liquidation and the insurance backstop.
 - P2.3: session keys, GTT orders and forced priority requests.
 - P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
+- P2.5 (first part): receipts and accountability.
 
-All four are built. Where they narrow the design, the full design remains normative.
+These are built. Where they narrow the design, the full design remains normative.
 
 **State** (§6):
 
@@ -1009,6 +1010,35 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - A first version counted completed cycles and restarted the clock at the start of a completing batch. It was replaced, because a batch's start says nothing about when within it the cursor wrapped: for a first batch it is L3 time 0, and after a halt it is the pre-halt time.
 - `t_refresh` is set at deployment and must leave a margin below the DA's retention (§9.5).
 
+**Receipts and accountability** (P2.5, §11):
+
+- **Sequence numbers.** Every signed action carries the sequencer's sequence number. The state keeps the last one, `last_seq`, across batches, and actions must execute in strictly increasing order.
+- **Receipts tree.** An action's receipt leaf is `H(DS_RECEIPT, seq, msg)`.
+  - Every node output carries a `receipts_root`. A trade segment's covers its two leaves. Every other segment, and padding (which asserts it), has 0. A merge hashes its children's roots.
+  - So the batch's receipts tree has the shape of its merge tree. The header's 19th field is its root, and a receipt's path runs from its segment up through the merges.
+- **Receipt.** The operator signs `H(DS_RECEIPT_SIG, domain, msg, seq, issued_at)` with a receipt key named in the Bridge's configuration.
+  - Simplification: §11's receipt also commits to the L3 block and an encrypted result. Here it commits only to the action, its number and when it was issued.
+- **Bridge.**
+  - `post_bond(amount)`: adds to the operator's bond.
+  - `challenge(msg, seq, issued_at, sig)`: takes a valid receipt at least `t_settle` old, and the challenger pays `request_fee`. The signature is checked in the private phase.
+  - `answer(msg, seq, batch, depth, bits, path)`: the operator shows the leaf in a settled batch's receipts root, and the fee goes to the operator. The path is folded in the private phase, and the public phase compares the result with the stored root.
+  - `slash(id)`: once `t_resp` passes unanswered, the challenger gets the fee back plus `slash` from the bond, as far as the bond goes.
+  - The bond and open challenges' fees are held apart from the vault, and desert payouts exclude them.
+- **Deployment size.** Publishing a contract class puts its public bytecode in the deployment transaction's DA. So the Bridge's public bytecode must fit one transaction's DA budget: 55,836 DA gas, about 1,745 fields, on the 6.0.0 local network.
+  - With receipts it first came to 1,734 fields, which the deployment exceeded together with its other effects.
+  - Moving the receipt signature check, the receipt path fold and `exit_register`'s leaf and valuation arithmetic into private functions, each finished by an only-self public call, brought it to 1,537 fields.
+  - Further Bridge features need the same discipline, or a split into more than one contract.
+- **What it proves.** Leaves bind sequence numbers, and the numbers rise with execution. So a receipted action that was dropped, or executed out of order, has no leaf the operator can show, and the operator loses `slash`. Front-running before a receipt is issued is not prevented.
+
+**Tests** (P2.5):
+
+- **TXE**, 65 tests. They cover an answered challenge and a wrong path, a slash and its deadline, a forged receipt, a receipt too recent to challenge, a receipt challenged twice, and desert payouts that leave out the bond.
+- **Native:** every one of the 21 receipts across five batches has a path to its batch's receipts root. The batch prover checks its own receipts tree against the root circuit's.
+- **Adversarial:** an action out of sequence order, and padding that claims a receipts root.
+- **Exit test**, on the local network, after the operator posts a bond:
+  - Bob challenges the receipt of his withdrawal, and the operator answers with the action's path in batch 2.
+  - The operator signed a receipt for an action it then dropped. Bob challenges it, nobody can answer, and anyone can then slash the bond to pay him.
+
 **Desert claims** (P2.4, §12):
 
 - An account may register its claim after the window closes (a late claim). The protocol accounts may register too.
@@ -1045,7 +1075,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments:**
 
-1. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
+1. P2.5 (second part): client-proof actions (§7.4).
 2. C1 custody (§10.3), once the D7 token is specified.
 
 ## 16. Decisions

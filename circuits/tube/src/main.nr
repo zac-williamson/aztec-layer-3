@@ -27,5 +27,5 @@ fn main(
     );
     let mut end = start;
     end.action_log = hash([DS_ACTION_LOG, start.action_log, agg.actions_hash, agg.count as Field]);
-    NodeOutput { config_hash, start, end }
+    NodeOutput { config_hash, start, end, receipts_root: 0 }
 }

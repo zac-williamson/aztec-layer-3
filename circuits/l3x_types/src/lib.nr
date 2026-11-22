@@ -20,7 +20,7 @@ pub global CHONK_PROOF_LENGTH: u32 = 1221;
 pub global MAX_CLIENT_PROOFS: u32 = 10;
 pub global CLIENT_PUBLIC_INPUTS: u32 = 3;
 pub global MAX_PRIORITY: u32 = 8;
-pub global HEADER_LEN: u32 = 18;
+pub global HEADER_LEN: u32 = 19;
 /// DA fields one settlement carries. Aztec allows FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH = 4096 fields of
 /// public logs per transaction, each log costing 2 header fields. The Bridge emits the DA log
 /// (2 + tag + payload) and the BatchSettled event (2 + tag + 5), leaving 4085; 4080 keeps slack.
@@ -42,6 +42,8 @@ pub global DS_TREES: Field = 10;
 pub global DS_ACTION_LOG: Field = 11;
 pub global DS_VK_NODE: Field = 12;
 pub global DS_DA_SPONGE: Field = 13;
+pub global DS_RECEIPT: Field = 14;
+pub global DS_RECEIPT_NODE: Field = 15;
 
 /// Carried through the Chonk IVC on the databus: app return_data -> kernel call_data -> ...
 /// The hiding kernel exposes it as its public output; the tube consumes it.
@@ -112,14 +114,27 @@ impl Eq for Running {
 
 /// The public output of every merge-tree node: segments (tube, X-segment, padding) and merges.
 /// A uniform layout lets a merge verify any child without knowing its kind; the VK tree role
-/// decides which kinds are allowed (SPEC.md §9.3).
+/// decides which kinds are allowed (SPEC.md §9.3). `receipts_root` commits to the receipted
+/// actions beneath the node (SPEC.md §11): a trade segment's root over its actions' receipt leaves,
+/// zero for other segments, and for a merge the receipt node of its children's roots, so the
+/// batch's receipts tree has the merge tree's shape.
 pub struct NodeOutput {
     pub config_hash: Field,
     pub start: Running,
     pub end: Running,
+    pub receipts_root: Field,
 }
 
-pub global NODE_OUTPUT_LEN: u32 = 1 + 2 * RUNNING_LEN;
+pub global NODE_OUTPUT_LEN: u32 = 2 + 2 * RUNNING_LEN;
+
+/// A receipted action's leaf: the sequencer's number for it and its signed message (SPEC.md §11).
+pub fn receipt_leaf(seq: u64, msg: Field) -> Field {
+    hash([DS_RECEIPT, seq as Field, msg])
+}
+
+pub fn receipt_node(left: Field, right: Field) -> Field {
+    hash([DS_RECEIPT_NODE, left, right])
+}
 
 impl NodeOutput {
     pub fn to_fields(self) -> [Field; NODE_OUTPUT_LEN] {
@@ -131,6 +146,7 @@ impl NodeOutput {
             out[1 + i] = s[i];
             out[1 + RUNNING_LEN + i] = e[i];
         }
+        out[1 + 2 * RUNNING_LEN] = self.receipts_root;
         out
     }
 }
@@ -170,6 +186,9 @@ pub struct BatchHeader {
     /// L3 time at which the current refresh cycle began, the last time the refresh cursor wrapped
     /// (SPEC.md §9.5). The Bridge requires every batch to end within the refresh window of it.
     pub cycle_start: u64,
+    /// Root of the batch's receipts tree (SPEC.md §11): the operator answers a receipt challenge
+    /// with a path to the action's leaf.
+    pub receipts_root: Field,
 }
 
 fn to_u64_checked(x: Field) -> u64 {
@@ -199,6 +218,7 @@ impl BatchHeader {
             self.market_data_hash,
             self.config_hash,
             self.cycle_start as Field,
+            self.receipts_root,
         ]
     }
 
@@ -222,6 +242,7 @@ impl BatchHeader {
             market_data_hash: f[15],
             config_hash: f[16],
             cycle_start: to_u64_checked(f[17]),
+            receipts_root: f[18],
         }
     }
 
@@ -230,7 +251,7 @@ impl BatchHeader {
         hash(
             [
                 DS_HEADER, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
-                f[12], f[13], f[14], f[15], f[16], f[17],
+                f[12], f[13], f[14], f[15], f[16], f[17], f[18],
             ],
         )
     }
@@ -316,6 +337,7 @@ fn test_header_roundtrip() {
         market_data_hash: 15,
         config_hash: 16,
         cycle_start: 18,
+        receipts_root: 19,
     };
     let g = BatchHeader::from_fields(h.to_fields());
     assert(g.hash() == h.hash());

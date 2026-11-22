@@ -3,7 +3,7 @@
 // inputs (witness) and the transition the circuit must prove. Divergence between engine and
 // circuit makes a batch unprovable, so proveBatch compares them segment by segment.
 import type { Barretenberg } from '@aztec-foundation/bb.js';
-import { R, daAbsorb, hex } from '../lib.ts';
+import { DS as DS0, R, daAbsorb, hex } from '../lib.ts';
 import { type BatchWitness, type Running, type SegmentWitness, assert, batchStart, copyRunning, runningToNoir } from '../pipeline.ts';
 import { type Point, type Sig, sigToNoir, verify, zeroSig } from './grumpkin.ts';
 import * as M from './model.ts';
@@ -14,8 +14,13 @@ import { type BookSibling, BookTree, MerkleTree } from './tree.ts';
 export type AccountRecord = { index: bigint; pub: M.AccountPub; priv: M.AccountPriv; kEnc: bigint };
 /** An index update for one market, with the signatures of the publishers that signed it. */
 export type OracleUpdate = { market: bigint; price: bigint; external: bigint; time: bigint; sigs: (Sig | undefined)[] };
-/** An action as one of its account's keys signed it (SPEC.md §7.1): the master key (MASTER_KEY) or a session-key slot. */
-export type SignedAction = { kind: bigint; account: bigint; keyId: bigint; nonce: bigint; p: bigint[]; sig: Sig; pk: { x: bigint; y: bigint } };
+/**
+ * An action as one of its account's keys signed it (SPEC.md §7.1): the master key (MASTER_KEY) or
+ * a session-key slot. `seq` is the sequencer's number for it, assigned when it is sequenced.
+ */
+export type SignedAction = { kind: bigint; account: bigint; keyId: bigint; nonce: bigint; p: bigint[]; sig: Sig; pk: { x: bigint; y: bigint }; seq?: bigint };
+/** A receipt (SPEC.md §11): an action's message and sequence number, where its leaf sits in the batch. */
+export type Receipt = { msg: bigint; seq: bigint; segment: number; slot: number };
 export type Rejection = { action: SignedAction; reason: string };
 /** A liquidation step (SPEC.md §8.5), as the operator chooses it. A close's size defaults to what
  * the book can absorb within the limit in one step budget. */
@@ -62,6 +67,10 @@ export class Engine {
   refreshCursor = 0n;
   /** L3 time at which the refresh cursor last wrapped (SPEC.md §9.5). */
   cycleStart = 0n;
+  /** The sequencer's number of the last signed action executed (SPEC.md §11). */
+  lastSeq = 0n;
+  /** Receipts of the batch being built. */
+  receipts: Receipt[] = [];
   numAccounts = 0n;
   feesPending = 0n;
   insurancePending = 0n;
@@ -128,6 +137,7 @@ export class Engine {
       markets: this.markets.map((m, i) => ({ ...m, bookRoot: this.books[i].root })),
       refreshCursor: this.refreshCursor,
       cycleStart: this.cycleStart,
+      lastSeq: this.lastSeq,
       numAccounts: this.numAccounts,
       feesPending: this.feesPending,
       insurancePending: this.insurancePending,
@@ -146,6 +156,7 @@ export class Engine {
     this.daPayload = [];
     this.wdRecords = [];
     this.segments = [];
+    this.receipts = [];
   }
 
   async endBatch(): Promise<BatchWitness> {
@@ -224,9 +235,10 @@ export class Engine {
     return record;
   }
 
-  private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>) {
+  private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>, receiptLeaves?: bigint[]) {
     this.running.state = await this.trees();
-    this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running) });
+    const receiptsRoot = receiptLeaves ? await this.h([DS0.RECEIPT_NODE, receiptLeaves[0], receiptLeaves[1]]) : 0n;
+    this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running), receiptsRoot, receiptLeaves });
   }
 
   private base(start: Running, state: M.State) {
@@ -633,6 +645,8 @@ export class Engine {
       feesPending: this.feesPending,
       insurancePending: this.insurancePending,
       insuranceMicro: this.insuranceMicro,
+      lastSeq: this.lastSeq,
+      receipts: [...this.receipts],
       running: copyRunning(this.running),
       daPayload: [...this.daPayload],
       wdRecords: [...this.wdRecords],
@@ -656,6 +670,8 @@ export class Engine {
     this.feesPending = s.feesPending;
     this.insurancePending = s.insurancePending;
     this.insuranceMicro = s.insuranceMicro;
+    this.lastSeq = s.lastSeq;
+    this.receipts = s.receipts;
     this.running = s.running;
     this.daPayload = s.daPayload;
     this.wdRecords = s.wdRecords;
@@ -699,9 +715,15 @@ export class Engine {
     await this.absorb(M.TAG.SEG);
     await this.absorb(daNonce);
     const items: unknown[] = [];
+    // Each action gets the next sequence number and a receipt leaf (SPEC.md §11).
+    const leaves = [0n, 0n];
     for (const [i, a] of actions.entries()) {
+      a.seq = ++this.lastSeq;
+      const msg = await X.actionMsg(this.h, this.domain, a.kind, a.account, a.keyId, a.nonce, a.p);
+      leaves[i] = await this.h([DS0.RECEIPT, a.seq, msg]);
+      this.receipts.push({ msg, seq: a.seq, segment: this.segments.length, slot: i });
       try {
-        items.push(await this.execAction(a, daNonce));
+        items.push({ ...(await this.execAction(a, daNonce)), seq: a.seq.toString() });
       } catch (e: any) {
         e.actionIndex = i;
         throw e;
@@ -712,11 +734,12 @@ export class Engine {
       const by = a.keyId === M.MASTER_KEY ? '' : ` by key ${a.keyId}`;
       return (a.kind === X.KIND_ACT.PLACE ? `place m${a.p[0]}` : a.kind === X.KIND_ACT.CANCEL ? `cancel m${a.p[0]}` : names[a.kind.toString()]) + by;
     });
-    await this.finishSegment('seg_trade', `trade [${labels.join(', ')}]`, {
-      ...this.base(start, before),
-      n: actions.length,
-      actions: pad(items, TRADE_PER_SEGMENT, () => this.emptyAction()),
-    });
+    await this.finishSegment(
+      'seg_trade',
+      `trade [${labels.join(', ')}]`,
+      { ...this.base(start, before), n: actions.length, actions: pad(items, TRADE_PER_SEGMENT, () => this.emptyAction()) },
+      leaves,
+    );
   }
 
   private emptyFill() {
@@ -740,6 +763,7 @@ export class Engine {
       kind: hex(0n),
       account_index: '0',
       key_id: '0',
+      seq: '0',
       nonce: '0',
       p: zeros(X.ACTION_PAYLOAD),
       pk_x: hex(0n),

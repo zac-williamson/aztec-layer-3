@@ -5,7 +5,7 @@
 import { join } from 'node:path';
 import { Noir } from '@aztec-foundation/noir-noir_js';
 import { OUT, hex, randomField, readCircuit, readJson } from '../lib.ts';
-import { Prover, assert, newApi } from '../pipeline.ts';
+import { Prover, assert, batchStart, newApi, nodeToNoir } from '../pipeline.ts';
 import { Engine, type SignedAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed, scalarToNoir, sign, sigToNoir } from './grumpkin.ts';
 import * as M from './model.ts';
@@ -125,6 +125,12 @@ async function main() {
   t = clone(buy);
   await resign(t, 0, 1, 0n, PLACE, [0n, BID, 2002n, 5n, IOC, 0n]);
   await expectFail('replayed nonce', 'seg_trade', t, 'nonce');
+  // Receipts (SPEC.md §11): sequence numbers follow execution order, and padding claims none.
+  t = clone(buy);
+  t.actions[0].seq = '1';
+  await expectFail('action out of sequence order', 'seg_trade', t, 'sequence numbers must increase');
+  const at = batchStart(0n, 0n, 0n, 0n, 1n);
+  await expectFail('padding with a receipts root', 'padding', { out: nodeToNoir({ configHash: prover.configHash, start: at, end: at, receiptsRoot: 5n }) }, 'padding segment must be empty');
 
   // Matching.
   t = clone(buy);

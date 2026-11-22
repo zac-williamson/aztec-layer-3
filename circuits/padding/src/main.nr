@@ -6,4 +6,5 @@ use l3x_types::NodeOutput;
 /// so it chains after any node.
 fn main(out: pub NodeOutput) {
     assert(out.start == out.end, "padding segment must be empty");
+    assert(out.receipts_root == 0, "padding segment must be empty");
 }

@@ -55,7 +55,7 @@ export type Running = {
 };
 
 /** Mirror of l3x_types::NodeOutput, the public output of every merge-tree node. */
-export type NodeOutput = { configHash: bigint; start: Running; end: Running };
+export type NodeOutput = { configHash: bigint; start: Running; end: Running; receiptsRoot: bigint };
 
 export type ProvedNode = { pkg: string; proof: bigint[]; out: NodeOutput; ms: number };
 
@@ -76,7 +76,7 @@ export function runningFields(r: Running): bigint[] {
 }
 
 export function nodeFields(n: NodeOutput): bigint[] {
-  return [n.configHash, ...runningFields(n.start), ...runningFields(n.end)];
+  return [n.configHash, ...runningFields(n.start), ...runningFields(n.end), n.receiptsRoot];
 }
 
 export const runningToNoir = (r: Running) => ({
@@ -97,6 +97,7 @@ export const nodeToNoir = (n: NodeOutput) => ({
   config_hash: hex(n.configHash),
   start: runningToNoir(n.start),
   end: runningToNoir(n.end),
+  receipts_root: hex(n.receiptsRoot),
 });
 
 const runningFromNoir = (o: any): Running => ({
@@ -117,6 +118,7 @@ const nodeFromNoir = (o: any): NodeOutput => ({
   configHash: BigInt(o.config_hash),
   start: runningFromNoir(o.start),
   end: runningFromNoir(o.end),
+  receiptsRoot: BigInt(o.receipts_root),
 });
 
 /** Running values at the start of a batch: the chain tip, with per-batch accumulators empty. */
@@ -321,7 +323,7 @@ export class Prover {
   }
 
   padding(at: Running, configHash = this.configHash): Promise<ProvedNode> {
-    return this.proveNode('padding', { out: nodeToNoir({ configHash, start: at, end: at }) });
+    return this.proveNode('padding', { out: nodeToNoir({ configHash, start: at, end: at, receiptsRoot: 0n }) });
   }
 
   mergeInputs(left: ProvedNode, right: ProvedNode, lo: ChildOverrides = {}, ro: ChildOverrides = {}) {
@@ -365,8 +367,11 @@ export class Prover {
   }
 }
 
-/** A segment as the engine built it: the circuit, its inputs, and the transition it must prove. */
-export type SegmentWitness = { pkg: string; label: string; inputs: Record<string, unknown>; expectedEnd: Running };
+/**
+ * A segment as the engine built it: the circuit, its inputs, the transition it must prove, and
+ * for a trade segment its receipt leaves and receipts root (SPEC.md §11).
+ */
+export type SegmentWitness = { pkg: string; label: string; inputs: Record<string, unknown>; expectedEnd: Running; receiptsRoot?: bigint; receiptLeaves?: bigint[] };
 
 export type BatchWitness = {
   batchNumber: bigint;
@@ -392,6 +397,10 @@ export type ProvedBatch = {
   rootVk: bigint[];
   daPayload: bigint[];
   marketData: bigint[];
+  /** The batch's receipts tree: the header's root and, per segment, its root and leaves. */
+  receiptsRoot: bigint;
+  segmentRoots: bigint[];
+  segmentLeaves: bigint[][];
   end: Running;
   shape: string;
   ms: Record<string, number>;
@@ -408,7 +417,7 @@ export async function executeBatch(prover: Prover, w: BatchWitness, log = consol
     const t0 = performance.now();
     const { returnValue } = await new Noir(readCircuit(seg.pkg) as any).execute(seg.inputs as any);
     const got = nodeFields(nodeFromNoir(returnValue));
-    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd });
+    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd, receiptsRoot: seg.receiptsRoot ?? 0n });
     const bad = got.findIndex((x, j) => x !== want[j]);
     assert(bad < 0, `${seg.label}: circuit output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
     log(`  ${seg.label}: executed in ${(performance.now() - t0).toFixed(0)} ms`);
@@ -424,11 +433,61 @@ export async function executeBatch(prover: Prover, w: BatchWitness, log = consol
     rootVk: [],
     daPayload: w.daPayload,
     marketData: w.marketData,
+    ...(await receiptsOf(api, w)),
     end: e,
     shape: `executed ${w.segments.length} segments`,
     ms: {},
   };
 }
+
+/** The receipts tree of a batch, built as proveBatch builds the merge tree (SPEC.md §11). */
+async function receiptsOf(api: Barretenberg, w: BatchWitness) {
+  const segmentRoots = w.segments.map((s) => s.receiptsRoot ?? 0n);
+  const segmentLeaves = w.segments.map((s) => s.receiptLeaves ?? [0n, 0n]);
+  const node = (l: bigint, r: bigint) => l3xHash(api, [DS.RECEIPT_NODE, l, r]);
+  let level = segmentRoots.length === 1 ? [segmentRoots[0], 0n] : [...segmentRoots];
+  while (level.length > 2) {
+    const next: bigint[] = [];
+    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? await node(level[k], level[k + 1]) : level[k]);
+    level = next;
+  }
+  return { receiptsRoot: await node(level[0], level[1]), segmentRoots, segmentLeaves };
+}
+
+/**
+ * The path of a receipted action's leaf (slot `slot` of segment `segment`) in a batch's receipts
+ * tree, as Bridge.answer takes it: siblings from the leaf up, and for each level whether the node
+ * is the right child. A node carried up unpaired adds no level.
+ */
+export async function receiptPath(api: Barretenberg, b: Pick<ProvedBatch, 'segmentRoots' | 'segmentLeaves'>, segment: number, slot: number) {
+  const node = (l: bigint, r: bigint) => l3xHash(api, [DS.RECEIPT_NODE, l, r]);
+  const path: bigint[] = [b.segmentLeaves[segment][slot ^ 1]];
+  let bits = slot;
+  let level = b.segmentRoots.length === 1 ? [b.segmentRoots[0], 0n] : [...b.segmentRoots];
+  let i = segment;
+  while (level.length > 2) {
+    const next: bigint[] = [];
+    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? await node(level[k], level[k + 1]) : level[k]);
+    if (!(i === level.length - 1 && level.length % 2 === 1)) {
+      if (i & 1) bits |= 1 << path.length;
+      path.push(level[i ^ 1]);
+    }
+    i >>= 1;
+    level = next;
+  }
+  if (i & 1) bits |= 1 << path.length;
+  path.push(level[i ^ 1]);
+  return { depth: path.length, bits, path };
+}
+
+/** Folds a receipt path from its leaf, as Bridge.answer does. */
+export async function foldReceipt(api: Barretenberg, leaf: bigint, p: { depth: number; bits: number; path: bigint[] }) {
+  let n = leaf;
+  for (let i = 0; i < p.depth; i++) n = await l3xHash(api, [DS.RECEIPT_NODE, ...(((p.bits >> i) & 1) === 1 ? [p.path[i], n] : [n, p.path[i]])]);
+  return n;
+}
+
+export const receiptLeaf = (api: Barretenberg, seq: bigint, msg: bigint) => l3xHash(api, [DS.RECEIPT, seq, msg]);
 
 /**
  * Proves a batch: every segment (checking the circuit's output against the engine's expected
@@ -444,7 +503,7 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
   for (const [i, seg] of w.segments.entries()) {
     const node = await prover.proveNode(seg.pkg, seg.inputs);
     const got = nodeFields(node.out);
-    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd });
+    const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd, receiptsRoot: seg.receiptsRoot ?? 0n });
     const bad = got.findIndex((x, j) => x !== want[j]);
     assert(bad < 0, `${seg.label}: circuit output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
     ms[`${seg.pkg}_${i}`] = node.ms;
@@ -510,11 +569,14 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
     w.marketDataHash,
     prover.configHash,
     w.cycleStart,
+    await l3xHash(api, [DS.RECEIPT_NODE, level[0].out.receiptsRoot, level[1].out.receiptsRoot]),
   ];
   const headerHash = await l3xHash(api, [DS.HEADER, ...header]);
   assert(headerHash === root.headerHash, 'TS header hash != root circuit output');
   assert(headerHash === root.publicInputs[0], 'TS header hash != root proof public input');
   assert((await daHash(api, w.daPayload)) === header[14], 'flat DA hash != segment sponge');
+  const receipts = await receiptsOf(api, w);
+  assert(receipts.receiptsRoot === header[18], 'TS receipts tree != the root circuit\'s');
 
   return {
     header,
@@ -523,6 +585,7 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
     rootVk: readVkJson('root').vk.map((x) => BigInt(x)),
     daPayload: w.daPayload,
     marketData: w.marketData,
+    ...receipts,
     end: e,
     shape: `root(${shape[0]}, ${shape[1]})`,
     ms,

@@ -4,7 +4,7 @@
 // opened from the DA payloads alone.
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
-import { type BatchWitness, Prover, assert, executeBatch, newApi, proveBatch } from '../pipeline.ts';
+import { type BatchWitness, type ProvedBatch, Prover, assert, executeBatch, foldReceipt, newApi, proveBatch, receiptLeaf, receiptPath } from '../pipeline.ts';
 import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
@@ -40,7 +40,20 @@ async function main() {
   const h = M.hasher(api);
   const { params, oracleSks } = await testParams(h);
   const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
-  const settle = (w: BatchWitness) => (EXECUTE_ONLY ? executeBatch(prover, w, log) : proveBatch(prover, w, log));
+  const settled: ProvedBatch[] = [];
+  let receiptCount = 0;
+  /** Proves (or executes) a batch, then checks every receipt's path to its receipts root (SPEC.md §11). */
+  const settle = async (w: BatchWitness) => {
+    const b = await (EXECUTE_ONLY ? executeBatch(prover, w, log) : proveBatch(prover, w, log));
+    for (const r of engine.receipts) {
+      const p = await receiptPath(api, b, r.segment, r.slot);
+      assert(p.depth <= 24, 'receipt path too deep');
+      assert((await foldReceipt(api, await receiptLeaf(api, r.seq, r.msg), p)) === b.receiptsRoot, `receipt ${r.seq} has no path to the receipts root`);
+      receiptCount++;
+    }
+    settled.push(b);
+    return b;
+  };
   const protocol = await protocolAccounts(h);
   const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol);
   // Execute-only runs may use circuits newer than the manifest, so they check genesis directly.
@@ -270,6 +283,7 @@ async function main() {
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
+  log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
   log(`header of batch 5 ${hex(b5.headerHash)}`);
   await api.destroy();
 }

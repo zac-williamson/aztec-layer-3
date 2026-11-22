@@ -103,6 +103,7 @@ export type State = {
   markets: Market[];
   refreshCursor: bigint;
   cycleStart: bigint;
+  lastSeq: bigint;
   numAccounts: bigint;
   feesPending: bigint;
   insurancePending: bigint;
@@ -221,7 +222,7 @@ export function decodeMarketData(data: bigint[]) {
 }
 export const marketsHash = async (h: H, ms: Market[]) => h([DS.MKTS, ...(await Promise.all(ms.map((m) => marketHash(h, m))))]);
 export const otherRoot = async (h: H, s: State) =>
-  h([DS.OTHER, s.activityRoot, await marketsHash(h, s.markets), s.refreshCursor, s.cycleStart, s.numAccounts, s.feesPending, s.insurancePending, s.insuranceMicro]);
+  h([DS.OTHER, s.activityRoot, await marketsHash(h, s.markets), s.refreshCursor, s.cycleStart, s.lastSeq, s.numAccounts, s.feesPending, s.insurancePending, s.insuranceMicro]);
 export const treesOf = async (h: H, s: State) => h([DS.TREES, s.accountsRoot, await otherRoot(h, s)]);
 
 export const marketParamsHash = (h: H, p: MarketParams) =>
@@ -294,6 +295,7 @@ export const stateToNoir = (s: State) => ({
   markets: s.markets.map(marketToNoir),
   refresh_cursor: s.refreshCursor.toString(),
   cycle_start: s.cycleStart.toString(),
+  last_seq: s.lastSeq.toString(),
   num_accounts: s.numAccounts.toString(),
   fees_pending: s.feesPending.toString(),
   insurance_pending: s.insurancePending.toString(),

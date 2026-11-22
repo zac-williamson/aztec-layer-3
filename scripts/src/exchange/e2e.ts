@@ -9,6 +9,9 @@
 //     segments, merged, root) and settles it. Bob claims his refund using only the published DA.
 //  3. Batch 2: Alice rests a bid in market 0 and Bob sells into it; Alice offers in market 1 and
 //     Bob buys; Alice cancels her rest and Bob withdraws. Bob claims the withdrawal from the DA.
+//     The operator posts a bond. Bob challenges the receipt of his withdrawal and the operator
+//     answers with its path in batch 2's receipts root; a receipt for an action the operator
+//     dropped goes unanswered and the bond pays Bob.
 //     Bob then forces a withdrawal of his free collateral through the Bridge, paying the request
 //     fee. Batch 3, an hour of L2 time later: new indices, so funding is applied; the forced
 //     withdrawal is processed and Bob claims it from the DA; fees are swept and the accounts
@@ -31,12 +34,12 @@ import { Contract } from '@aztec-labs/aztec.js/contracts';
 import { TxStatus } from '@aztec-labs/aztec.js/tx';
 import { EmbeddedWallet } from '@aztec-labs/wallets/embedded';
 import { OUT, SHAPE, hex, randomField, readJson, timed, writeJson } from '../lib.ts';
-import { type ProvedBatch, Prover, assert, newApi, proveBatch } from '../pipeline.ts';
+import { type ProvedBatch, Prover, assert, newApi, proveBatch, receiptLeaf, receiptPath } from '../pipeline.ts';
 import { allPublicEvents, artifact, big, daLogs, eventMeta, rawArtifact } from './chain.ts';
 import { Engine, signAction, signUpdate } from './engine.ts';
 import * as X from './rules.ts';
 import { exitFromDa, withdrawalPath } from './exit.ts';
-import { keysFromSeed } from './grumpkin.ts';
+import { keysFromSeed, sign } from './grumpkin.ts';
 import * as M from './model.ts';
 import { TEST_FEE_SEED, protocolAccounts, testParams } from './params.ts';
 
@@ -46,6 +49,12 @@ const T_CLAIM = 86_400n;
 const REQUEST_FEE = 100n;
 const T_REFRESH = 14n * 86_400n;
 const T_LATE = 3600n;
+// Receipts (SPEC.md §11): the operator's receipt key, the challenge rules and its bond.
+const RECEIPT_SEED = 0x6c33782e72637074n; // "l3x.rcpt"
+const T_SETTLE = 60n;
+const T_RESP = 600n;
+const SLASH = 4000n;
+const BOND = 10_000n;
 const ALICE_SEED = 0xa11cen;
 const BOB_SEED = 0xb0bn;
 
@@ -85,6 +94,8 @@ async function main() {
     const protocol = await protocolAccounts(h, [big(operator), big(operator)]);
     const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
     log(`config hash ${hex(prover.configHash)}`);
+    const receiptKey = await keysFromSeed(h, RECEIPT_SEED);
+    const receiptDomain = await M.domainOf(h, params);
 
     // 1. Deploy, register, deposit.
     const tokenArtifact = artifact('l3x_token-L3XToken');
@@ -100,6 +111,7 @@ async function main() {
       T_REFRESH,
       T_LATE,
       REQUEST_FEE,
+      { domain: receiptDomain, pk_x: receiptKey.pk.x, pk_y: receiptKey.pk.y, t_settle: T_SETTLE, t_resp: T_RESP, slash: SLASH },
       [operator, operator],
       protocol.map((p) => p.pub.masterAuth),
       protocol.map((p) => p.pub.encCommitment),
@@ -201,8 +213,10 @@ async function main() {
       signAction(h, engine.domain, users[who].keys, kind, account, nonce, p);
     const { BID, ASK } = M.SIDE;
     const { PLACE, CANCEL, WITHDRAW } = X.KIND_ACT;
-    await runBatch('batch2', async () => {
+    let issued2 = 0n;
+    const b2 = await runBatch('batch2', async () => {
       const t = await l2Time();
+      issued2 = t;
       await engine.block(t, [await update(0n, 2100n, t)]);
       await engine.trade([
         await act('alice', A, 1n, PLACE, [0n, BID, 2100n, 100n, X.TIF.GTC, 0n]),
@@ -222,6 +236,37 @@ async function main() {
     await asOf(bob).methods.claim_withdrawal(2n, wp.index, bob, 1000n, wdSalt, wp.path).send({ from: bob, wait });
     assert((await balance(bob)) === bobBefore + 1000n, 'withdrawal not paid');
     log('bob claimed his 1000 withdrawal using the DA and his key alone');
+
+    // Receipts and accountability (SPEC.md §11). The operator posts a bond and signs a receipt for
+    // every action it sequences. Bob challenges the receipt of his withdrawal, and the operator
+    // answers with the action's path in batch 2's receipts root. The operator also signed a receipt
+    // for an action it then dropped; Bob challenges it, nobody can answer, and the bond pays him.
+    await token.methods.mint(operator, BOND).send({ from: operator, wait });
+    await tokenAt.methods.approve(bridge.address, BOND).send({ from: operator, wait });
+    await asOf(operator).methods.post_bond(BOND).send({ from: operator, wait });
+    const toScalar = (x: bigint) => ({ lo: x & ((1n << 128n) - 1n), hi: x >> 128n });
+    const signReceipt = async (msg: bigint, seq: bigint, issued: bigint) => sign(h, receiptKey.sk, await h([51n, receiptDomain, msg, seq, issued]));
+    const receipts2 = [...engine.receipts];
+    const bobWd = receipts2[receipts2.length - 1]; // Bob's withdrawal, the batch's last signed action
+    const sig1 = await signReceipt(bobWd.msg, bobWd.seq, issued2);
+    await (node as any).warpL2TimeAtLeastBy(Number(T_SETTLE + 10n));
+    bobBefore = await balance(bob);
+    await asOf(bob).methods.challenge(bobWd.msg, bobWd.seq, issued2, toScalar(sig1.s), toScalar(sig1.e)).send({ from: bob, wait });
+    const rpath = await receiptPath(api, b2, bobWd.segment, bobWd.slot);
+    await asOf(operator)
+      .methods.answer(bobWd.msg, bobWd.seq, 2n, rpath.depth, rpath.bits, [...rpath.path, ...Array(24 - rpath.path.length).fill(0n)])
+      .send({ from: operator, wait });
+    log(`bob challenged the receipt of his withdrawal (seq ${bobWd.seq}); the operator answered with a ${rpath.depth}-level path`);
+    const dropped = { msg: randomField(), seq: engine.lastSeq + 1000n };
+    const sig2 = await signReceipt(dropped.msg, dropped.seq, issued2);
+    await asOf(bob).methods.challenge(dropped.msg, dropped.seq, issued2, toScalar(sig2.s), toScalar(sig2.e)).send({ from: bob, wait });
+    await (node as any).warpL2TimeAtLeastBy(Number(T_RESP + 10n));
+    await asOf(alice).methods.slash(await receiptLeaf(api, dropped.seq, dropped.msg)).send({ from: alice, wait });
+    const bobNet = (await balance(bob)) - bobBefore;
+    assert(bobNet === SLASH - REQUEST_FEE, `bob's net from the two challenges: ${bobNet}`);
+    log(`a dropped receipt went unanswered: the bond paid bob ${SLASH} (net ${bobNet} after the answered challenge's fee)`);
+    report.receipts = { answeredDepth: rpath.depth, slashed: SLASH };
+    const bondLeft = BOND - SLASH;
 
     // Bob forces a withdrawal of his free collateral through the Bridge (SPEC.md §7.3), paying the
     // request fee to the operator; the next batch must process it.
@@ -301,7 +346,7 @@ async function main() {
     assert(paid.bob === exits.bob.equity, `bob received ${paid.bob}`);
     // What remains is the fee account's swept balance plus the funding rounding the users' claims
     // gave up (at most one unit per position).
-    const vault = await balance(bridge.address);
+    const vault = (await balance(bridge.address)) - bondLeft; // the bond is held apart from the vault
     const fees = engine.accts.get(M.FEE_INDEX)!.priv.collateral + engine.accts.get(M.INSURANCE_INDEX)!.priv.collateral;
     assert(vault >= fees && vault - fees <= 4n, `vault left with ${vault}, protocol balances ${fees}`);
     log(`alice received 5000 refund + ${exits.alice.equity}; bob received ${exits.bob.equity}; the vault keeps ${vault} (fees ${fees} + rounding)`);
@@ -316,7 +361,7 @@ async function main() {
     const opBefore2 = await balance(operator);
     await asOf(operator).methods.exit_withdraw(feeExit.index).send({ from: operator, wait });
     const feePaid = (await balance(operator)) - opBefore2;
-    const residual = await balance(bridge.address);
+    const residual = (await balance(bridge.address)) - bondLeft;
     assert(feePaid === fees && residual <= 4n, `fee account paid ${feePaid}, vault left with ${residual}`);
     log(`after t_late the operator claimed the fee account's ${feePaid}; the vault keeps ${residual} of funding rounding`);
     report.feeClaim = feePaid;

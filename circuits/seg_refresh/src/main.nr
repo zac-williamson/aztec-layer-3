@@ -90,5 +90,5 @@ fn main(
     }
     st.refresh_cursor = cursor;
     end.state = st.trees();
-    NodeOutput { config_hash: params.config(vk_tree_root), start, end }
+    NodeOutput { config_hash: params.config(vk_tree_root), start, end, receipts_root: 0 }
 }

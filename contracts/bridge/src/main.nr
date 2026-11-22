@@ -31,10 +31,11 @@ pub contract L3XBridge {
     use l3x_exchange::{
         account::{account_leaf, AccountPub, enc_commitment, from_plaintext},
         consts::{
-            ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, KIND_DEPOSIT, KIND_FORCED_CANCEL_ALL,
-            KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, MAX_DEPOSIT, PLAINTEXT_LEN, PROTOCOL_ACCOUNTS,
-            WD_HEIGHT,
+            ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_RECEIPT_SIG, DS_WD_NODE, KIND_DEPOSIT,
+            KIND_FORCED_CANCEL_ALL, KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, MAX_DEPOSIT,
+            PLAINTEXT_LEN, PROTOCOL_ACCOUNTS, RECEIPT_DEPTH, WD_HEIGHT,
         },
+        sig::{assert_signed, Signature},
         request::payload_hash,
         state::{genesis_state_root, index_and_funding, MARKET_DATA_LEN, market_data_hash},
         trade::equity_at,
@@ -43,9 +44,10 @@ pub contract L3XBridge {
     };
     use l3x_token::L3XToken;
     use l3x_types::{
-        BatchHeader, config_hash as config_hash_of, DA_MAX, da_hash_flat, HEADER_LEN,
-        merge::{VK_TREE_LEAVES, vk_tree_root_of}, priority_entry, priority_next_head,
+        BatchHeader, config_hash as config_hash_of, DA_MAX, da_hash_flat, hash::hash, HEADER_LEN,
+        merge::{VK_TREE_LEAVES, vk_tree_root_of}, priority_entry, priority_next_head, receipt_leaf, receipt_node,
     };
+    use std::embedded_curve_ops::EmbeddedCurveScalar;
 
     global T_LAG: u64 = 15 * 60;
     /// SPEC.md §12. Must exceed T_force + T_payout plus a margin, so users can exit before a change
@@ -128,10 +130,39 @@ pub contract L3XBridge {
     }
 
     #[event]
+    struct ReceiptChallenged {
+        id: Field,
+        challenger: AztecAddress,
+        msg: Field,
+        seq: u64,
+        deadline: u64,
+    }
+
+    #[event]
+    struct ChallengeResolved {
+        id: Field,
+        answered: bool,
+        payout: u128,
+    }
+
+    #[event]
     struct ExitClaimed {
         account_index: u32,
         owner: AztecAddress,
         equity: u128,
+    }
+
+    /// The operator's receipt key and the accountability rules (SPEC.md §11): a challenge is
+    /// accepted t_settle after the receipt was issued, the operator answers within t_resp, and an
+    /// unanswered challenge pays the challenger `slash` from the bond.
+    #[derive(Deserialize, Eq, Packable, Serialize)]
+    pub struct ReceiptConfig {
+        pub domain: Field,
+        pub pk_x: Field,
+        pub pk_y: Field,
+        pub t_settle: u64,
+        pub t_resp: u64,
+        pub slash: u128,
     }
 
     /// Fixed at deployment, including the public parts of the protocol accounts (insurance at
@@ -148,6 +179,7 @@ pub contract L3XBridge {
         t_late: u64,
         request_fee: u128,
         deployed_at: u64,
+        receipts: ReceiptConfig,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
@@ -181,7 +213,27 @@ pub contract L3XBridge {
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Settled {
         withdrawals_root: Field,
+        receipts_root: Field,
         time: u64,
+    }
+
+    /// Tokens the Bridge holds outside the vault: the operator's bond and open challenges' fees.
+    #[derive(Deserialize, Eq, Packable, Serialize)]
+    pub struct Escrow {
+        bond: u128,
+        fees: u128,
+    }
+
+    /// A receipt challenge, keyed by the receipt's leaf. `done` once answered or slashed.
+    #[derive(Deserialize, Eq, Packable, Serialize)]
+    pub struct Challenge {
+        open: bool,
+        done: bool,
+        challenger: AztecAddress,
+        deadline: u64,
+        fee: u128,
+        msg: Field,
+        seq: u64,
     }
 
     /// Desert mode (SPEC.md §12): frozen values, the claim window, the total of claims registered
@@ -228,6 +280,8 @@ pub contract L3XBridge {
         withdrawal_paid: Map<Field, PublicMutable<bool, Context>, Context>,
         refunded: Map<u64, PublicMutable<bool, Context>, Context>,
         claims: Map<u32, PublicMutable<Claim, Context>, Context>,
+        escrow: PublicMutable<Escrow, Context>,
+        challenges: Map<Field, PublicMutable<Challenge, Context>, Context>,
     }
 
     #[external("public")]
@@ -242,6 +296,7 @@ pub contract L3XBridge {
         t_refresh: u64,
         t_late: u64,
         request_fee: u128,
+        receipts: ReceiptConfig,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
@@ -258,6 +313,7 @@ pub contract L3XBridge {
                 t_late,
                 request_fee,
                 deployed_at: self.context.timestamp(),
+                receipts,
                 protocol_owners,
                 protocol_master_auths,
                 protocol_enc_commitments,
@@ -460,7 +516,9 @@ pub contract L3XBridge {
         tip.market_data_hash = h.market_data_hash;
         tip.withdrawals_owed += h.withdrawals_amount as u128;
         self.storage.tip.write(tip);
-        self.storage.settled.at(batch_number).write(Settled { withdrawals_root: h.withdrawals_root, time: now });
+        self.storage.settled.at(batch_number).write(
+            Settled { withdrawals_root: h.withdrawals_root, receipts_root: h.receipts_root, time: now },
+        );
 
         // 6. Mode R DA (SPEC.md §9.5): [DA_LOG_TAG, batch_number, payload[0..da_len]].
         let mut log = [DA_LOG_TAG, batch_number as Field].as_vector();
@@ -567,7 +625,11 @@ pub contract L3XBridge {
     /// The opening comes from the account's DA entries (SPEC.md §9.5) and the market data from the
     /// last BatchSettled event. A user claim registered within the window shares the vault pro
     /// rata; a later one, and any protocol account's, is paid from the residual.
-    #[external("public")]
+    ///
+    /// The leaf's root and the claim's value are computed here, in the private phase, which keeps
+    /// the arithmetic out of the published public bytecode; the public phase checks them against the
+    /// frozen accounts root and market data.
+    #[external("private")]
     fn exit_register(
         account_index: u32,
         owner: AztecAddress,
@@ -578,21 +640,24 @@ pub contract L3XBridge {
         path: [Field; ACCOUNTS_HEIGHT],
         market_data: [Field; MARKET_DATA_LEN],
     ) {
-        let mut d = self.storage.desert.read();
-        assert(d.active, "not in desert mode");
-        assert(market_data_hash(market_data) == d.market_data_hash, "market data");
-        let late = self.context.timestamp() > d.claim_close;
-        let protocol = class != CLASS_USER;
         let pubv = AccountPub { owner: owner.to_field(), master_auth, enc_commitment: enc_key_commitment, class };
         let privv = from_plaintext(plaintext);
-        assert(
-            merkle_root(DS_ACCT_NODE, account_leaf(pubv, privv), account_index, path) == d.accounts_root,
-            "not in the frozen accounts tree",
-        );
-        assert(!self.storage.claims.at(account_index).read().registered, "already claimed");
+        let root = merkle_root(DS_ACCT_NODE, account_leaf(pubv, privv), account_index, path);
         let (prices, cums) = index_and_funding(market_data);
         let equity = equity_at(privv, prices, cums);
         let value: u128 = if equity > 0 { (equity as u64) as u128 } else { 0 };
+        self.enqueue_self._register_claim(account_index, owner, class != CLASS_USER, value, root, market_data_hash(market_data));
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _register_claim(account_index: u32, owner: AztecAddress, protocol: bool, value: u128, root: Field, market_data: Field) {
+        let mut d = self.storage.desert.read();
+        assert(d.active, "not in desert mode");
+        assert(market_data == d.market_data_hash, "market data");
+        assert(root == d.accounts_root, "not in the frozen accounts tree");
+        assert(!self.storage.claims.at(account_index).read().registered, "already claimed");
+        let late = self.context.timestamp() > d.claim_close;
         self.storage.claims.at(account_index).write(
             Claim { registered: true, paid: false, late, protocol, equity: value, owner },
         );
@@ -625,7 +690,7 @@ pub contract L3XBridge {
             assert(now > d.claim_close + config.t_late, "protocol accounts are paid after t_late");
         }
         let token = config.token;
-        let vault = self.view(L3XToken::at(token).balance_of(self.address));
+        let vault = self.internal.vault_balance();
         let senior = self.storage.tip.read().withdrawals_owed + d.refunds_owed;
         if d.payout_den == 0 {
             // ratio = min(1, V/U), and 1 when no claim was registered in the window.
@@ -652,6 +717,120 @@ pub contract L3XBridge {
         claim.paid = true;
         self.storage.claims.at(account_index).write(claim);
         self.call(L3XToken::at(token).transfer(claim.owner, amount));
+    }
+
+    // ---- Receipts and accountability (SPEC.md §11) ----
+
+    /// Adds to the operator's bond, which unanswered receipt challenges are paid from.
+    #[external("public")]
+    fn post_bond(amount: u128) {
+        let token = self.storage.config.read().token;
+        self.call(L3XToken::at(token).transfer_from(self.msg_sender(), self.address, amount));
+        let mut e = self.storage.escrow.read();
+        e.bond += amount;
+        self.storage.escrow.write(e);
+    }
+
+    /// Challenges a receipt the operator signed for an action (SPEC.md §11): the operator must
+    /// show the action's leaf in a settled batch's receipts root within t_resp. The receipt's
+    /// signature is checked here, in the private phase, which keeps the curve arithmetic out of
+    /// the published public bytecode; the public phase requires the receipt to be at least
+    /// t_settle old, so the operator had time to settle it, and takes `request_fee` from the
+    /// challenger, returned if the operator fails to answer.
+    #[external("private")]
+    fn challenge(msg: Field, seq: u64, issued_at: u64, sig_s: EmbeddedCurveScalar, sig_e: EmbeddedCurveScalar) {
+        let rc = self.storage.config.read().receipts;
+        let receipt = hash([DS_RECEIPT_SIG, rc.domain, msg, seq as Field, issued_at as Field]);
+        assert_signed(rc.pk_x, rc.pk_y, Signature { s: sig_s, e: sig_e }, receipt);
+        self.enqueue_self._open_challenge(msg, seq, issued_at, self.msg_sender());
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _open_challenge(msg: Field, seq: u64, issued_at: u64, challenger: AztecAddress) {
+        let config = self.storage.config.read();
+        let now = self.context.timestamp();
+        assert(issued_at + config.receipts.t_settle <= now, "receipt too recent to challenge");
+        let id = receipt_leaf(seq, msg);
+        let existing = self.storage.challenges.at(id).read();
+        assert(!existing.open & !existing.done, "receipt already challenged");
+        if config.request_fee > 0 {
+            self.call(L3XToken::at(config.token).transfer_from(challenger, self.address, config.request_fee));
+        }
+        let mut e = self.storage.escrow.read();
+        e.fees += config.request_fee;
+        self.storage.escrow.write(e);
+        let deadline = now + config.receipts.t_resp;
+        self.storage.challenges.at(id).write(
+            Challenge { open: true, done: false, challenger, deadline, fee: config.request_fee, msg, seq },
+        );
+        self.emit(ReceiptChallenged { id, challenger, msg, seq, deadline });
+    }
+
+    /// Answers a challenge with the path of the receipt's leaf in a settled batch's receipts
+    /// root; `bits` gives, level by level from the leaf, whether the node is the right child. The
+    /// path is folded here, in the private phase; the public phase compares the result with the
+    /// batch's receipts root and pays the challenge fee to the operator.
+    #[external("private")]
+    fn answer(msg: Field, seq: u64, batch: u64, depth: u32, bits: u32, path: [Field; RECEIPT_DEPTH]) {
+        assert(depth <= RECEIPT_DEPTH, "path too long");
+        let id = receipt_leaf(seq, msg);
+        let mut node = id;
+        for i in 0..RECEIPT_DEPTH {
+            if i < depth {
+                node = if ((bits >> i) & 1) == 1 { receipt_node(path[i], node) } else { receipt_node(node, path[i]) };
+            }
+        }
+        self.enqueue_self._resolve_challenge(id, batch, node);
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _resolve_challenge(id: Field, batch: u64, root: Field) {
+        let mut c = self.storage.challenges.at(id).read();
+        assert(c.open, "no open challenge");
+        assert(root == self.storage.settled.at(batch).read().receipts_root, "receipt not in the batch");
+        c.open = false;
+        c.done = true;
+        self.storage.challenges.at(id).write(c);
+        let mut e = self.storage.escrow.read();
+        e.fees -= c.fee;
+        self.storage.escrow.write(e);
+        if c.fee > 0 {
+            let config = self.storage.config.read();
+            self.call(L3XToken::at(config.token).transfer(self.internal.current_operator(), c.fee));
+        }
+        self.emit(ChallengeResolved { id, answered: true, payout: c.fee });
+    }
+
+    /// Settles a challenge the operator did not answer in time: the challenger gets its fee back
+    /// and `slash` from the bond, as far as the bond goes.
+    #[external("public")]
+    fn slash(id: Field) {
+        let mut c = self.storage.challenges.at(id).read();
+        assert(c.open, "no open challenge");
+        assert(self.context.timestamp() > c.deadline, "challenge still open");
+        let config = self.storage.config.read();
+        let mut e = self.storage.escrow.read();
+        let penalty = if e.bond < config.receipts.slash { e.bond } else { config.receipts.slash };
+        e.bond -= penalty;
+        e.fees -= c.fee;
+        self.storage.escrow.write(e);
+        c.open = false;
+        c.done = true;
+        self.storage.challenges.at(id).write(c);
+        self.call(L3XToken::at(config.token).transfer(c.challenger, penalty + c.fee));
+        self.emit(ChallengeResolved { id, answered: false, payout: penalty + c.fee });
+    }
+
+    /// The vault: the Bridge's token balance less the bond and open challenges' fees.
+    #[internal("public")]
+    fn vault_balance() -> u128 {
+        let token = self.storage.config.read().token;
+        let balance = self.view(L3XToken::at(token).balance_of(self.address));
+        let e = self.storage.escrow.read();
+        let held = e.bond + e.fees;
+        if balance > held { balance - held } else { 0 }
     }
 
     // ---- Configuration (SPEC.md §12) ----
@@ -746,6 +925,14 @@ pub contract L3XBridge {
     fn get_protocol_accounts() -> ([AztecAddress; PROTOCOL_ACCOUNTS], [Field; PROTOCOL_ACCOUNTS], [Field; PROTOCOL_ACCOUNTS]) {
         let c = self.storage.config.read();
         (c.protocol_owners, c.protocol_master_auths, c.protocol_enc_commitments)
+    }
+
+    /// (open, done, deadline) of the challenge for a receipt leaf, and the bond.
+    #[external("public")]
+    #[view]
+    fn get_challenge(id: Field) -> (bool, bool, u64, u128) {
+        let c = self.storage.challenges.at(id).read();
+        (c.open, c.done, c.deadline, self.storage.escrow.read().bond)
     }
 
     #[external("public")]
