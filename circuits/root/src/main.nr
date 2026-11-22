@@ -71,7 +71,7 @@ fn main(
         withdrawals_count: e.withdrawals_count as u64,
         action_log_root: e.action_log,
         da_hash: da_finalize(e.da, e.da_len),
-        market_data_hash: market_data_hash(market_data(end_state.markets)),
+        market_data_hash: market_data_hash(market_data(end_state.markets, batch_number)),
         config_hash: config,
         cycle_start: end_state.cycle_start,
         receipts_root: out.receipts_root,

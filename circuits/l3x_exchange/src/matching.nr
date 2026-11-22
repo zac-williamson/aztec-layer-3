@@ -160,6 +160,8 @@ pub fn match_order<let F: u32>(
                     st.fees_pending += tfee;
                     notional += q * mp_price;
                     remaining -= q;
+                    // The batch's print summary (SPEC.md §8.4, [D1]).
+                    mkt = mkt.record_print(r.batch, mp_price, q);
                 }
                 st.activity_root =
                     update(DS_ACTV_NODE, st.activity_root, f.order.account_index, f.maker_actv.hash(), mact.hash(), f.maker_actv_path);

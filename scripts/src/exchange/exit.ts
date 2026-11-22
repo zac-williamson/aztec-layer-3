@@ -33,9 +33,8 @@ export async function exitFromDa(h: M.H, node: any, bridge: any, seed: bigint, f
   const keys = await keysFromSeed(h, seed);
   const opened = await openAccount(h, rebuilt, keys.kEnc, await M.masterAuthOf(h, keys.pk!.x, keys.pk!.y));
 
-  // The frozen market data is the last settled batch's, published in its BatchSettled event.
-  const settled = await allPublicEvents(node, await eventMeta(rawArtifact('l3x_bridge-L3XBridge'), 'BatchSettled'), bridge);
-  const marketData: bigint[] = (settled[settled.length - 1] as any).market_data.map(big);
+  // The frozen market data is the last settled batch's, published at the head of its DA log.
+  const marketData: bigint[] = logs[logs.length - 1].marketData;
   assert((await M.marketDataHash(h, marketData)) === frozen.marketDataHash, 'published market data != frozen market data');
   const md = M.decodeMarketData(marketData);
   const equity = X.equityAt(opened.priv, md.map((m) => m.indexPrice), md.map((m) => m.cumFunding));

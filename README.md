@@ -35,6 +35,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - Unswept deposits return to their refund address after `t_dep`; records custody leaves unpaid are claimable from the vault after `t_payout`.
 - **P2.14**: the token's bridge to L1. Aztec's standard escrow portal holds the ERC-20 on L1; the L2 bridge, the token's minter, claims deposits into public balances or straight into credits and burns exits from either.
 - **P2.15**: stop and take-profit triggers. Each market keeps a trigger tree beside its book; every mark tick proves whether a trigger is due and, while one is, the market takes no new orders until the operator fires the due triggers in price-time order as reduce-only IOC orders.
+- **P2.16**: public market data per D1. Each batch publishes, per market, the last, VWAP, high and low of its fills, and its volume and the open interest rounded down to a power of two.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -198,6 +199,8 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.14: tests | 15 bridge TXE tests; an L1 round trip through deposits, claims, exits and Outbox withdrawals on the local network. |
 | P2.15: triggers | Trigger trees per market; ticks flag due triggers and block new orders; `seg_trigger` fires them in price-time order, reduce-only, keeping a remainder only when its matching steps run out. |
 | P2.15: tests | Native batch 9 fires a stop, removes a void stop and partly fills a take-profit; 8 more adversarial witnesses (87 in all). |
+| P2.16: market data | Per-batch print summary (last, VWAP, high, low) and bucketed volume and open interest in the header's market data, published at the head of the DA log. |
+| P2.16: tests | Native batch 9 checks market 0's prints and buckets; every root proof binds them; exit clients read the frozen market data from the DA log. |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats

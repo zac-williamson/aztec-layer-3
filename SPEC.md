@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.13, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), and stop and take-profit triggers (P2.15), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.14, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), and the print summary with bucketed volume and open interest (P2.16), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -338,7 +338,7 @@ Default fractions follow Lighter: `imr = 1/max_leverage` (2% at 50×), `mmr = 0.
   - `P` is the time-weighted premium, sampled every second rather than at a sequencer-chosen random minute, so sampling needs no trusted randomness.
   - Each interval, `cum_funding += rate·mark`.
   - Positions settle funding lazily when touched, and equity always includes accrued funding.
-- **Public output**: per batch and market, the header's `market_data` carries index, mark, funding rate, cumulative funding, best bid and ask prices, and the print summary [D1]. Consumers should treat these as the prices of one venue: proven to follow the rules, not proven sound.
+- **Public output**: per batch and market, the header's `market_data` carries index, mark, funding rate, cumulative funding, best bid and ask prices, the print summary (last, VWAP, high and low of the batch's fills) and the batch's volume and the open interest, each rounded down to a power of two [D1]. Consumers should treat these as the prices of one venue: proven to follow the rules, not proven sound.
 
 ### 8.5 Liquidation
 
@@ -513,10 +513,10 @@ No Bridge function may change the Bridge's own contract class (§12). Configurat
 
 It then:
 
-- emits `[DA_LOG_TAG, batch_number, payload…]` as one public log;
+- emits `[DA_LOG_TAG, batch_number, market_data…, payload…]` as one public log;
 - updates `state_root`, `accounts_root`, `batch_number`, `last_time` and `priority_cursor`;
 - stores `withdrawals_root[batch_number]`, `settled_time[batch_number]` and `market_data_hash`;
-- emits `market_data` as a public event, roughly 8 fields per market from the same 4,096-field log budget.
+- puts `market_data` in that log, 13 fields per market (§8.4), from the same 4,096-field log budget.
 
 `settle` checks `config_hash` in the private phase. The value is a `DelayedPublicMutable`, so the transaction expires before any scheduled change can take effect.
 
@@ -895,6 +895,7 @@ P2 is built in increments, each leaving every test green.
 - P2.13: C1 custody over the D7 collateral token.
 - P2.14: the collateral token's bridge to L1.
 - P2.15: stop and take-profit triggers.
+- P2.16: the print summary and bucketed volume and open interest [D1].
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -982,7 +983,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Bridge**:
 
-- Settlement carries 28 fields of market data, seven per market: index, index time, mark, cumulative funding, funding rate, best bid and best ask. They are hashed into the header and emitted in `BatchSettled`.
+- Settlement carries 28 fields of market data, seven per market: index, index time, mark, cumulative funding, funding rate, best bid and best ask. They are hashed into the header and emitted in `BatchSettled`. P2.16 adds the print summary and the bucketed volume and open interest (13 fields per market) and moves them to the DA log.
 - `exit_register` values a user account at the frozen index prices, with funding accrued to the frozen cumulative indices.
 - Claims by protocol accounts are rejected until their seniority rule (§12) is built.
 
@@ -1314,6 +1315,18 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - The segment then proves the next trigger due in each direction and clears the flag once none is due.
 - **Narrowing.** Triggers are reduce-only and do not expire, so a stop that opens a position is deferred. §7.3's single `PlaceOrder` with a trigger field is built as two separate kinds.
 - **Cost.** `seg_block`: 317,728 gates, for two more 80-level walks per update. `seg_trade`: 438,638, for one trigger write per action, placement and cancellation sharing it. `seg_trigger`: 150,096.
+
+**Market data** (P2.16, §8.4, [D1]):
+
+- **Prints.** Every fill against the book, including liquidation closes and trigger firings, records its price and lots in the market's print summary: the last, highest and lowest price, the lots and the quote notional of batch `print_batch`, reset at the batch's first fill. ADL and takeovers are transfers at the bankruptcy price or the mark, not trades, and do not print.
+- **Published.** A batch's market data per market is 13 fields: the seven of P2.1, then last, VWAP (quote notional over lots, truncated), high, low, the batch's volume and the open interest. Volume and open interest are rounded down to a power of two, which publishes their magnitude, not their digits. A market without a fill in the batch publishes zero prints.
+- **DA log.** The 52 fields go at the head of the batch's DA log, `[DA_LOG_TAG, batch, market_data, payload]`, instead of the `BatchSettled` event: one loop in the Bridge instead of a larger event, which keeps its public bytecode at 1,604 fields. Exit clients read the frozen market data there.
+- **Cost.** `MarketLeaf` gains six fields (24 in all). `seg_trade` 442,282 gates; the root stays at 2^23.
+
+**Tests** (P2.16):
+
+- **Native**, batch 9: market 0 publishes the stop's 25 lots at 1695 and the take-profit's 4 at 1795, so last 1795, VWAP 1708, high 1795, low 1695, volume 16 (29 rounded down), and the open interest rounded down; a market without fills publishes zero prints. Every root proof binds the market data through the header.
+- **Exit test:** exit clients read the frozen market data from the last DA log.
 
 **Tests** (P2.15):
 

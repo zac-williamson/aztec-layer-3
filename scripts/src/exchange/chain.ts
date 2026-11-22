@@ -8,6 +8,7 @@ import { getPublicEvents } from '@aztec-labs/aztec.js/events';
 import { Fr } from '@aztec-labs/aztec.js/fields';
 import { Tag } from '@aztec-labs/stdlib/logs';
 import { ROOT } from '../lib.ts';
+import { MARKET_DATA_LEN } from './model.ts';
 
 export const DA_LOG_TAG = 0x6c33782e64612e7631n;
 
@@ -44,9 +45,12 @@ export async function allPublicEvents<T = any>(node: any, meta: any, contractAdd
 
 export const big = (x: any): bigint => (typeof x === 'bigint' ? x : BigInt(x?.toBigInt?.() ?? x?.toString?.() ?? x));
 
-/** Every DA log of the Bridge, as (batch, payload), in batch order (SPEC.md §9.5). */
-export async function daLogs(node: any, contractAddress: any): Promise<{ batch: bigint; payload: bigint[]; blockNumber: number }[]> {
-  const out: { batch: bigint; payload: bigint[]; blockNumber: number }[] = [];
+/**
+ * Every DA log of the Bridge, as (batch, market data, payload), in batch order (SPEC.md §8.4,
+ * §9.5): the log is [DA_LOG_TAG, batch, market data, payload].
+ */
+export async function daLogs(node: any, contractAddress: any): Promise<{ batch: bigint; marketData: bigint[]; payload: bigint[]; blockNumber: number }[]> {
+  const out: { batch: bigint; marketData: bigint[]; payload: bigint[]; blockNumber: number }[] = [];
   let afterLog: any;
   for (;;) {
     const [logs] = await node.getPublicLogsByTags({
@@ -57,7 +61,7 @@ export async function daLogs(node: any, contractAddress: any): Promise<{ batch: 
     for (const l of logs) {
       const f = l.logData.map(big);
       if (f[0] !== DA_LOG_TAG) continue;
-      out.push({ batch: f[1], payload: f.slice(2), blockNumber: Number(l.blockNumber) });
+      out.push({ batch: f[1], marketData: f.slice(2, 2 + MARKET_DATA_LEN), payload: f.slice(2 + MARKET_DATA_LEN), blockNumber: Number(l.blockNumber) });
     }
     const last = logs[logs.length - 1];
     if (!last.cursor && !last.logCursor) break;

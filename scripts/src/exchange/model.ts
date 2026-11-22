@@ -68,7 +68,7 @@ export const FEE_INDEX = 1n;
 export const PROTOCOL_ACCOUNTS = 2;
 export const MAX_DEPOSIT = 1n << 62n;
 export const SIDE = { BID: 0n, ASK: 1n } as const;
-export const MARKET_DATA_FIELDS = 7;
+export const MARKET_DATA_FIELDS = 13;
 export const MARKET_DATA_LEN = MARKET_DATA_FIELDS * MARKETS;
 
 export type H = (inputs: bigint[]) => Promise<bigint>;
@@ -107,6 +107,13 @@ export type Market = {
   oiShort: bigint;
   bestBid: bigint;
   bestAsk: bigint;
+  /** Batch `printBatch`'s print summary (SPEC.md §8.4, [D1]). */
+  printBatch: bigint;
+  printLast: bigint;
+  printHigh: bigint;
+  printLow: bigint;
+  printLots: bigint;
+  printQuote: bigint;
 };
 export type State = {
   accountsRoot: bigint;
@@ -185,7 +192,28 @@ export const genesisMarket = (emptyRoot: bigint): Market => ({
   oiShort: 0n,
   bestBid: 0n,
   bestAsk: 0n,
+  printBatch: 0n,
+  printLast: 0n,
+  printHigh: 0n,
+  printLow: 0n,
+  printLots: 0n,
+  printQuote: 0n,
 });
+/** Records a fill in batch `batch`'s print summary (l3x_exchange Market::record_print). */
+export function recordPrint(m: Market, batch: bigint, price: bigint, q: bigint): Market {
+  const fresh = m.printBatch !== batch;
+  return {
+    ...m,
+    printBatch: batch,
+    printLast: price,
+    printHigh: fresh || price > m.printHigh ? price : m.printHigh,
+    printLow: fresh || price < m.printLow ? price : m.printLow,
+    printLots: (fresh ? 0n : m.printLots) + q,
+    printQuote: (fresh ? 0n : m.printQuote) + q * price,
+  };
+}
+/** The largest power of two not above x, or zero ([D1]). */
+export const bucket = (x: bigint) => (x === 0n ? 0n : 1n << BigInt(x.toString(2).length - 1));
 
 export const packPosition = (p: Position) => enc(p.size) + enc(p.entry) * TWO_64 + enc(p.funding) * TWO_128;
 export function unpackPosition(x: bigint): Position {
@@ -243,15 +271,40 @@ export const marketHash = (h: H, m: Market) =>
     m.oiShort,
     m.bestBid,
     m.bestAsk,
+    m.printBatch,
+    m.printLast,
+    m.printHigh,
+    m.printLow,
+    m.printLots,
+    m.printQuote,
   ]);
-export const marketDataOf = (m: Market): bigint[] => [m.indexPrice, m.indexTime, m.markPrice, enc(m.cumFunding), enc(m.fundingRate), m.bestBid, m.bestAsk];
-export const marketData = (ms: Market[]): bigint[] => ms.flatMap(marketDataOf);
+/** The fields batch `batch` publishes for a market (Market::data). */
+export function marketDataOf(m: Market, batch: bigint): bigint[] {
+  const printed = m.printBatch === batch && m.printLots > 0n;
+  const [last, vwap, high, low, lots] = printed ? [m.printLast, m.printQuote / m.printLots, m.printHigh, m.printLow, m.printLots] : [0n, 0n, 0n, 0n, 0n];
+  return [m.indexPrice, m.indexTime, m.markPrice, enc(m.cumFunding), enc(m.fundingRate), m.bestBid, m.bestAsk, last, vwap, high, low, bucket(lots), bucket(m.oiLong)];
+}
+export const marketData = (ms: Market[], batch: bigint): bigint[] => ms.flatMap((m) => marketDataOf(m, batch));
 export const marketDataHash = (h: H, data: bigint[]) => h([DS.MARKET_DATA, ...data]);
 /** Decodes a batch's published market data into per-market fields. */
 export function decodeMarketData(data: bigint[]) {
   return Array.from({ length: MARKETS }, (_, m) => {
     const d = data.slice(m * MARKET_DATA_FIELDS, (m + 1) * MARKET_DATA_FIELDS);
-    return { indexPrice: d[0], indexTime: d[1], markPrice: d[2], cumFunding: dec(d[3]), fundingRate: dec(d[4]), bestBid: d[5], bestAsk: d[6] };
+    return {
+      indexPrice: d[0],
+      indexTime: d[1],
+      markPrice: d[2],
+      cumFunding: dec(d[3]),
+      fundingRate: dec(d[4]),
+      bestBid: d[5],
+      bestAsk: d[6],
+      last: d[7],
+      vwap: d[8],
+      high: d[9],
+      low: d[10],
+      volumeBucket: d[11],
+      oiBucket: d[12],
+    };
   });
 }
 export const marketsHash = async (h: H, ms: Market[]) => h([DS.MKTS, ...(await Promise.all(ms.map((m) => marketHash(h, m))))]);
@@ -350,6 +403,12 @@ export const marketToNoir = (m: Market) => ({
   oi_short: m.oiShort.toString(),
   best_bid: m.bestBid.toString(),
   best_ask: m.bestAsk.toString(),
+  print_batch: m.printBatch.toString(),
+  print_last: m.printLast.toString(),
+  print_high: m.printHigh.toString(),
+  print_low: m.printLow.toString(),
+  print_lots: m.printLots.toString(),
+  print_quote: m.printQuote.toString(),
 });
 export const stateToNoir = (s: State) => ({
   accounts_root: hex(s.accountsRoot),

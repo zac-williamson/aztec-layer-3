@@ -81,7 +81,8 @@ pub contract L3XBridge {
         time: u64,
     }
 
-    /// The batch's DA payload is in a separate public log: [DA_LOG_TAG, batch_number, payload...].
+    /// The batch's market data and DA payload are in a separate public log:
+    /// [DA_LOG_TAG, batch_number, market_data..., payload...].
     #[event]
     struct BatchSettled {
         batch_number: u64,
@@ -90,7 +91,6 @@ pub contract L3XBridge {
         priority_end: u64,
         da_len: u32,
         withdrawals_count: u64,
-        market_data: [Field; MARKET_DATA_LEN],
     }
 
     /// Private event that delivers a new account's encryption key to the operator.
@@ -801,8 +801,12 @@ pub contract L3XBridge {
             Settled { withdrawals_root: h.withdrawals_root, receipts_root: h.receipts_root, time: now },
         );
 
-        // 6. Mode R DA (SPEC.md §9.5): [DA_LOG_TAG, batch_number, payload[0..da_len]].
+        // 6. Mode R DA (SPEC.md §9.5) and market data (§8.4), in one public log:
+        // [DA_LOG_TAG, batch_number, market_data, payload[0..da_len]].
         let mut log = [DA_LOG_TAG, batch_number as Field].as_vector();
+        for i in 0..MARKET_DATA_LEN {
+            log = log.push_back(market_data[i]);
+        }
         for i in 0..da_len {
             log = log.push_back(da_payload[i]);
         }
@@ -816,7 +820,6 @@ pub contract L3XBridge {
                 priority_end: h.priority_end,
                 da_len,
                 withdrawals_count: h.withdrawals_count,
-                market_data,
             },
         );
     }

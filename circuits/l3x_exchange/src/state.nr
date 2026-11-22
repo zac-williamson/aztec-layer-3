@@ -34,6 +34,15 @@ pub struct Market {
     pub oi_short: u64,
     pub best_bid: u64,
     pub best_ask: u64,
+    /// The print summary of batch `print_batch` (SPEC.md §8.4, [D1]): its last, highest and lowest
+    /// fill prices, and the lots and quote notional it filled. A market with no fill in the current
+    /// batch still holds an earlier batch's, which the batch's market data ignores.
+    pub print_batch: u64,
+    pub print_last: u64,
+    pub print_high: u64,
+    pub print_low: u64,
+    pub print_lots: u64,
+    pub print_quote: u64,
 }
 
 impl Market {
@@ -58,7 +67,27 @@ impl Market {
             oi_short: 0,
             best_bid: 0,
             best_ask: 0,
+            print_batch: 0,
+            print_last: 0,
+            print_high: 0,
+            print_low: 0,
+            print_lots: 0,
+            print_quote: 0,
         }
+    }
+
+    /// Records a fill of `q` lots at `price` in batch `batch`'s print summary, starting a fresh one at
+    /// the batch's first fill.
+    pub fn record_print(self, batch: u64, price: u64, q: u64) -> Self {
+        let mut out = self;
+        let fresh = self.print_batch != batch;
+        out.print_batch = batch;
+        out.print_last = price;
+        out.print_high = if fresh | (price > self.print_high) { price } else { self.print_high };
+        out.print_low = if fresh | (price < self.print_low) { price } else { self.print_low };
+        out.print_lots = (if fresh { 0 } else { self.print_lots }) + q;
+        out.print_quote = (if fresh { 0 } else { self.print_quote }) + q * price;
+        out
     }
 
     pub fn hash(self) -> Field {
@@ -69,21 +98,59 @@ impl Market {
                 self.index_time as Field, self.mark_price as Field, enc(self.premium), enc(self.premium_acc),
                 self.last_tick as Field, enc(self.cum_funding), enc(self.funding_rate),
                 self.window_start as Field, self.next_funding as Field, self.oi_long as Field,
-                self.oi_short as Field, self.best_bid as Field, self.best_ask as Field,
+                self.oi_short as Field, self.best_bid as Field, self.best_ask as Field, self.print_batch as Field,
+                self.print_last as Field, self.print_high as Field, self.print_low as Field,
+                self.print_lots as Field, self.print_quote as Field,
             ],
         )
     }
 
-    /// The fields a batch publishes for this market (SPEC.md §8.4).
-    pub fn data(self) -> [Field; MARKET_DATA_FIELDS] {
+    /// The fields batch `batch` publishes for this market (SPEC.md §8.4, [D1]): the index and its
+    /// time, the mark, cumulative funding and the funding rate, the best bid and ask, the batch's
+    /// print summary (last, VWAP, high, low; zero without a fill in this batch), and its volume
+    /// and the open interest, each rounded down to a power of two.
+    pub fn data(self, batch: u64) -> [Field; MARKET_DATA_FIELDS] {
+        let printed = (self.print_batch == batch) & (self.print_lots > 0);
+        let (last, vwap, high, low, lots) = if printed {
+            (self.print_last, self.print_quote / self.print_lots, self.print_high, self.print_low, self.print_lots)
+        } else {
+            (0, 0, 0, 0, 0)
+        };
         [
             self.index_price as Field, self.index_time as Field, self.mark_price as Field,
             enc(self.cum_funding), enc(self.funding_rate), self.best_bid as Field, self.best_ask as Field,
+            last as Field, vwap as Field, high as Field, low as Field, bucket(lots) as Field,
+            bucket(self.oi_long) as Field,
         ]
     }
 }
 
-pub global MARKET_DATA_FIELDS: u32 = 7;
+/// The largest power of two not above `x`, or zero: a magnitude without its digits ([D1]).
+pub fn bucket(x: u64) -> u64 {
+    let bits: [bool; 64] = (x as Field).to_le_bits();
+    let mut b: u64 = 0;
+    let mut p: u64 = 1;
+    for i in 0..64 {
+        if bits[i] {
+            b = p;
+        }
+        if i < 63 {
+            p = p * 2;
+        }
+    }
+    b
+}
+
+#[test]
+fn buckets() {
+    assert(bucket(0) == 0);
+    assert(bucket(1) == 1);
+    assert(bucket(1000) == 512);
+    assert(bucket(1024) == 1024);
+    assert(bucket(0xffffffffffffffff) == 0x8000000000000000);
+}
+
+pub global MARKET_DATA_FIELDS: u32 = 13;
 pub global MARKET_DATA_LEN: u32 = MARKET_DATA_FIELDS * MARKETS;
 
 pub fn markets_hash(markets: [Market; MARKETS]) -> Field {
@@ -95,10 +162,10 @@ pub fn markets_hash(markets: [Market; MARKETS]) -> Field {
     hash(inputs)
 }
 
-pub fn market_data(markets: [Market; MARKETS]) -> [Field; MARKET_DATA_LEN] {
+pub fn market_data(markets: [Market; MARKETS], batch: u64) -> [Field; MARKET_DATA_LEN] {
     let mut out: [Field; MARKET_DATA_LEN] = [0; MARKET_DATA_LEN];
     for m in 0..MARKETS {
-        let d = markets[m].data();
+        let d = markets[m].data(batch);
         for i in 0..MARKET_DATA_FIELDS {
             out[m * MARKET_DATA_FIELDS + i] = d[i];
         }

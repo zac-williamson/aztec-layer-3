@@ -492,6 +492,12 @@ async function main() {
   log(`batch 9: ${w9.segments.map((s) => s.label).join(' | ')}; ${w9.daPayload.length} DA fields`);
   const b9 = await settle(w9);
   assert(b9.header[0] === b8.header[1], 'batch 9 does not chain from batch 8');
+  // Batch 9's market data [D1]: market 0 printed Alice's stop (25 at 1695) and take-profit (4 at
+  // 1795); VWAP 49,555 / 29 = 1708; volume 29 publishes as 16.
+  const md9 = M.decodeMarketData(w9.marketData)[0];
+  assert(md9.last === 1795n && md9.high === 1795n && md9.low === 1695n && md9.vwap === 1708n && md9.volumeBucket === 16n, `batch 9 prints: ${show(md9)}`);
+  assert(md9.oiBucket === M.bucket(engine.markets[0].oiLong) && M.decodeMarketData(w9.marketData)[1].last === 0n, 'batch 9 open interest and quiet market');
+  log(`batch 9 market 0 prints: last ${md9.last}, VWAP ${md9.vwap}, high ${md9.high}, low ${md9.low}, volume ~${md9.volumeBucket}, open interest ~${md9.oiBucket}`);
 
   // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the nine
   // batches, then open every user's account and compare with the engine.

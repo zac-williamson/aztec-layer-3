@@ -200,7 +200,7 @@ export class Engine {
 
   async endBatch(): Promise<BatchWitness> {
     const st = this.state();
-    const marketData = M.marketData(st.markets);
+    const marketData = M.marketData(st.markets, this.running.batch);
     return {
       batchNumber: this.running.batch,
       start: this.batchStartRunning,
@@ -1554,6 +1554,7 @@ export class Engine {
       this.feesPending += tfee;
       notional += q * o.price;
       remaining -= q;
+      this.markets[m] = M.recordPrint(this.markets[m], this.running.batch, o.price, q);
     }
     if (this.markets[m].oiLong !== this.markets[m].oiShort) throw new Error('open interest out of balance');
     return { fills, remaining, notional };
