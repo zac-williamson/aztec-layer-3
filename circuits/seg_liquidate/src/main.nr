@@ -1,6 +1,6 @@
 use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Position},
-    book::{Order, order_index, replace, Sibling, SIDE_ASK, SIDE_BID},
+    book::{Sibling, SIDE_ASK, SIDE_BID},
     consts::{
         ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_LIQ,
         INSURANCE_INDEX, LOG_LIQUIDATE, MARKETS, MAX_COLLATERAL,
@@ -34,13 +34,11 @@ struct Step {
     acct_path: [Field; ACCOUNTS_HEIGHT],
     actv: Activity,
     actv_path: [Field; ACCOUNTS_HEIGHT],
-    /// Cancel: the order. Close: the lots to close, the matching steps, and the no-crossing probe.
-    /// `book_path` is the cancelled order's path or the probe's.
+    /// Logged with the step; zero for every step kind since cancellation advances the epoch.
     side: Field,
     price: u32,
     seq: u64,
-    cancel_lots: u64,
-    cancel_expiry: u64,
+    /// Close: the lots to close, the matching steps, and the no-crossing probe (`book_path`).
     lots: u64,
     n_fills: u32,
     fills: [Fill; F],
@@ -135,18 +133,14 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
     let uses_insurance = (s.kind == LIQ_TAKEOVER) | (s.kind == LIQ_DEFICIT) | (s.kind == LIQ_ADL);
 
     if s.kind == LIQ_CANCEL {
+        // Every order of the account goes at once: its order epoch advances (SPEC.md §6.5), as for a
+        // CancelAll, and matching removes the void orders when it meets them.
         assert(below(e, mm), "account is not liquidatable");
-        assert(s.cancel_lots > 0, "no such order");
-        let o = Order { side: s.side, account_index: idx, lots: s.cancel_lots, expiry: s.cancel_expiry };
-        let index = order_index(s.side, s.price, s.seq);
-        let (root, _) = replace(st.markets[m].book_root, index, o, Order::empty(), s.book_path);
-        st.markets[m].book_root = root;
-        if s.side == SIDE_BID {
-            act.open_bid[m] = s.actv.open_bid[m] - s.cancel_lots;
-        } else {
-            act.open_ask[m] = s.actv.open_ask[m] - s.cancel_lots;
-        }
-        act.open_orders = s.actv.open_orders - 1;
+        assert(s.actv.open_orders > 0, "no orders to cancel");
+        act.epoch = s.actv.epoch + 1;
+        act.open_orders = 0;
+        act.open_bid = [0; MARKETS];
+        act.open_ask = [0; MARKETS];
     } else if s.kind == LIQ_CLOSE {
         assert(below(e, mm), "account is not liquidatable");
         assert(s.actv.open_orders == 0, "orders must be cancelled first");

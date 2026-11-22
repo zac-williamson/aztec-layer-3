@@ -236,7 +236,7 @@ async function main() {
   log(`engine refused: ${reasons5.join('; ')}`);
   assert(
     reasons5.join('|') ===
-      "market not allowed for the session key|order above the session key's notional limit|session keys only place, cancel and modify|signing key is not the slot's",
+      "market not allowed for the session key|order above the session key's notional limit|session keys only place, cancel, modify and cancel all|signing key is not the slot's",
     'unexpected batch 5 rejections',
   );
   assert(engine.accts.get(C)!.priv.positions[0].size === 30n && engine.orders[0].size > 0, 'GTT removal and fill');
@@ -369,7 +369,7 @@ async function main() {
   log(`engine refused: ${reasons7.join('; ')}`);
   assert(
     reasons7.join('|') ===
-      'a modification only reduces an order|collateral below the amount|no such account|transfers go to user accounts|session keys only place, cancel and modify',
+      'a modification only reduces an order|collateral below the amount|no such account|transfers go to user accounts|session keys only place, cancel, modify and cancel all',
     'unexpected batch 7 rejections',
   );
   assert(engine.accts.get(D)!.priv.positions[0].size === daveBefore + 8n && engine.accts.get(Hd)!.priv.positions[0].size === 2n, 'the modified bid kept its place');
@@ -382,12 +382,44 @@ async function main() {
   const b7 = await settle(w7);
   assert(b7.header[0] === b6.header[1], 'batch 7 does not chain from batch 6');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the seven
+  // Batch 8: CancelAll in constant time (SPEC.md §6.5). Heidi's session key cancels all her orders
+  // and Alice does the same with her master key; Carol's ForcedCancelAll through the queue voids
+  // hers. Void orders stay in the books until matching meets them: Bob's sell removes Heidi's
+  // market-0 bid instead of filling it, and Dave's sell removes Carol's.
+  await engine.beginBatch(8n, b7.end.priorityHead, b7.end.priorityCursor, b7.end.time);
+  const t8 = now + 4200n;
+  await engine.block(t8, [await update(0n, 1750n, 1750n, t8 - 1n), await update(1n, 30_010n, 30_010n, t8 - 1n)]);
+  const { CANCEL_ALL } = X.KIND_ACT;
+  await engine.trade([await byHeidiKey(4n, CANCEL_ALL, []), await act(alice, A, 8n, CANCEL_ALL, [])]);
+  await engine.priority([{ kind: M.KIND.FORCED_CANCEL_ALL, a: C, b: 0n, sender: users[2].addr, time: t8 }]);
+  const voided = (i: bigint) => {
+    const x = engine.actv.get(i)!;
+    return x.epoch > 0n && x.openOrders === 0n && x.openBid.every((b) => b === 0n) && x.openAsk.every((b) => b === 0n);
+  };
+  assert(voided(Hd) && voided(A) && voided(C), 'cancel-all voids every order');
+  const restingOf = (i: bigint) => engine.orders.reduce((n, o) => n + [...o.values()].filter((x) => x.account === i).length, 0);
+  const sizes = () => [B, D, Hd, C].map((i) => engine.accts.get(i)!.priv.positions[0].size).join(',');
+  const before8 = { sizes: sizes(), heidi: restingOf(Hd), carol: restingOf(C) };
+  await engine.trade([
+    await act(bob, B, 8n, PLACE, [0n, ASK, 1745n, 3n, IOC, 0n]), // removes Heidi's void bid, fills nothing
+    await act(dave, D, 5n, PLACE, [0n, ASK, 1740n, 5n, IOC, 0n]), // removes Carol's void bid, fills nothing
+  ]);
+  assert(Number(engine.rejected.length) === 19, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  assert(sizes() === before8.sizes, 'void orders were filled');
+  assert(restingOf(Hd) === before8.heidi - 1 && restingOf(C) === before8.carol - 1, 'void orders not removed');
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 8');
+  const w8 = await engine.endBatch();
+  log(`batch 8: ${w8.segments.map((s) => s.label).join(' | ')}; ${w8.daPayload.length} DA fields`);
+  const b8 = await settle(w8);
+  assert(b8.header[0] === b7.header[1], 'batch 8 does not chain from batch 7');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the eight
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b7.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b8.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
@@ -403,13 +435,13 @@ async function main() {
   assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 30n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 7 ${hex(b7.headerHash)}`);
+  log(`header of batch 8 ${hex(b8.headerHash)}`);
   await api.destroy();
 }
 

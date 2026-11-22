@@ -1,6 +1,6 @@
 use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment},
-    book::{Order, order_index, replace, Sibling, SIDE_ASK, SIDE_BID},
+    book::{Sibling, SIDE_ASK, SIDE_BID},
     consts::{
         ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, KIND_FORCED_CANCEL_ALL, KIND_FORCED_CLOSE,
         LOG_PRIORITY, MARKETS, MAX_FEES, MAX_PRICE,
@@ -15,19 +15,8 @@ use l3x_exchange::{
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, priority_next_head, Running};
 
-/// Matching steps per forced close, and orders cancelled per forced cancel-all.
+/// Matching steps per forced close.
 global F: u32 = 2;
-global FC: u32 = 4;
-
-struct CancelItem {
-    market: u32,
-    side: Field,
-    price: u32,
-    seq: u64,
-    lots: u64,
-    expiry: u64,
-    path: [Sibling; BOOK_HEIGHT],
-}
 
 /// Forced segment (SPEC.md §7.3, §12): executes the next queued request when it is a ForcedClose
 /// or a ForcedCancelAll, which need the book. A request whose account does not exist, that did not
@@ -38,8 +27,8 @@ struct CancelItem {
 ///   reduce-only IOC order, paying the taker fee, at prices no worse than c. It stops early only
 ///   when its matching steps run out or no liquidity is left within c; the owner can submit
 ///   another request for the rest.
-/// - ForcedCancelAll: cancels min(FC, open orders) of the account's orders; the owner submits more
-///   requests if more remain.
+/// - ForcedCancelAll: advances the account's order epoch, as a signed CancelAll does, which voids
+///   all its orders at once.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -56,8 +45,6 @@ fn main(
     n_fills: u32,
     fills: [Fill; F],
     probe_path: [Sibling; BOOK_HEIGHT],
-    n_cancels: u32,
-    cancels: [CancelItem; FC],
 ) -> pub NodeOutput {
     assert(start.state == state.trees(), "state opening");
     assert((req.kind == KIND_FORCED_CLOSE) | (req.kind == KIND_FORCED_CANCEL_ALL), "not a forced close or cancel-all");
@@ -123,27 +110,10 @@ fn main(
         }
 
         if authorized & (req.kind == KIND_FORCED_CANCEL_ALL) {
-            let due = if actv.open_orders < FC { actv.open_orders } else { FC };
-            assert(n_cancels == due, "forced cancel-all must cancel every order it can");
-            for i in 0..FC {
-                if i < n_cancels {
-                    let c = cancels[i];
-                    assert(c.market < MARKETS, "market");
-                    assert(c.lots > 0, "no such order");
-                    let o = Order { side: c.side, account_index: idx, lots: c.lots, expiry: c.expiry };
-                    let index = order_index(c.side, c.price, c.seq);
-                    let (root, _) = replace(st.markets[c.market].book_root, index, o, Order::empty(), c.path);
-                    st.markets[c.market].book_root = root;
-                    if c.side == SIDE_BID {
-                        act.open_bid[c.market] -= c.lots;
-                    } else {
-                        act.open_ask[c.market] -= c.lots;
-                    }
-                    act.open_orders -= 1;
-                }
-            }
-        } else {
-            assert(n_cancels == 0, "nothing to cancel");
+            act.epoch = actv.epoch + 1;
+            act.open_orders = 0;
+            act.open_bid = [0; MARKETS];
+            act.open_ask = [0; MARKETS];
         }
 
         st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, actv.hash(), act.hash(), actv_path);
@@ -159,7 +129,7 @@ fn main(
             end = emit_change(end, idx, new_leaf, a, k_enc, da_nonce);
         }
     } else {
-        assert((n_fills == 0) & (n_cancels == 0), "no such account");
+        assert(n_fills == 0, "no such account");
     }
     end.state = st.trees();
     NodeOutput { config_hash: params.config(vk_tree_root), start, end, receipts_root: 0 }

@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), and order modification and transfers (P2.8), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), and constant-time cancel-all (P2.9), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -826,6 +826,7 @@ P2 is built in increments, each leaving every test green.
 - P2.6: client-proof withdrawals.
 - P2.7: the client subtree, with a P-256 client circuit.
 - P2.8: `ModifyOrder` and `Transfer`.
+- P2.9: `CancelAll` in constant time, through order epochs.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -836,7 +837,7 @@ These are built. Where they narrow the design, the full design remains normative
   - `pack(p) = size + entry·2^64 + funding·2^128`, each limb a 64-bit two's complement.
   - `funding` is the market's cumulative funding index when the position last settled.
   - The hashed fields are exactly the plaintext a DA entry encrypts, so decrypting an entry yields the leaf opening.
-- `ActivityLeaf = H(DS_ACTV, nonce, keys_root, open_orders, open_bid_m + open_ask_m·2^64 for each m)` (P2.3 added `keys_root`).
+- `ActivityLeaf = H(DS_ACTV, nonce, keys_root, open_orders, open_bid_m + open_ask_m·2^64 for each m, epoch)`. P2.3 added `keys_root`, and P2.9 added the order `epoch`.
 - `MarketLeaf` has 16 fields:
   - the book root and next sequence number;
   - the index price and its time;
@@ -948,7 +949,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **GTT orders** (P2.3, §6.5):
 
-- `OrderLeaf = H(DS_ORDER, side, account, lots, expiry)`. Only GTT orders have an expiry, and it must lie in the future when the order is placed.
+- `OrderLeaf = H(DS_ORDER, side, account, lots, expiry, epoch)`; P2.9 added the owner's order epoch. Only GTT orders have an expiry, and it must lie in the future when the order is placed.
 - When matching meets an expired order, it removes the order instead of filling it, and the owner's open lots shrink. The step counts against the action's matching steps.
 - An expired order counts toward its owner's margin, and toward a tick's top of book, until it is removed.
 
@@ -963,7 +964,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - `ForcedWithdraw` (in `seg_priority`): withdraws all free collateral, `max(0, min(collateral, equity − IM))`, to the recipient. Equity needs fresh indices wherever the account is exposed. An account that is not exposed needs none, so a user can always close first and then withdraw.
 - `ForcedClose` and `ForcedCancelAll` (in `seg_forced`, one per segment):
   - The close is a reduce-only IOC order at the taker fee, no worse than the worst price. It may stop early only when its two matching steps run out or no liquidity is left within that price.
-  - Cancel-all removes `min(4, open orders)` of the account's orders.
+  - Cancel-all advances the account's order epoch, as a signed `CancelAll` does, which voids all its orders at once (P2.9). Before P2.9 it removed `min(4, open orders)` of them per request.
   - In both cases the owner can submit more requests for the rest.
 
 **Liquidation** (P2.2, §8.5):
@@ -973,7 +974,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 | Step | Precondition | Effect |
 | --- | --- | --- |
-| Cancel | `equity < MM` | Removes one of the account's resting orders. |
+| Cancel | `equity < MM`, open orders | Advances the account's order epoch, which voids all its resting orders at once (P2.9; before, one order per step). |
 | Close | `equity < MM`, no open orders | Closes up to the whole position in one market against the book, reduce-only, at prices no worse than the limit below. Pays the liquidation fee to the insurance fund. |
 | Takeover | `equity < CM`, no open orders | The insurance account takes over the position with the lowest unrealized PnL at the mark. Both settle funding first, and the account realizes its PnL. The insurance account must still meet its IM. |
 | Deficit | no positions or orders, negative collateral | The insurance account absorbs the deficit and must still meet its IM. |
@@ -1159,6 +1160,33 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Cost.** `seg_trade` grows from 430,919 to 476,001 gates (+10.5%), still within 2^19: each action slot carries a destination account update and change entry.
 - **Not built.** Client-proof transfers, and `CancelAll`.
 
+**CancelAll** (P2.9, §6.5, §7.3):
+
+- **Order epochs.** Every activity leaf carries the account's order epoch, and every order leaf the epoch its owner had when placing it. An order is live while the two are equal, and void once the owner's epoch moves past it.
+- **CancelAll** advances the epoch and sets the account's open orders and open lots to zero, in every market. That is one activity update, however many orders rest.
+  - Session keys may send it, whatever their market mask, since it only reduces risk.
+  - `ForcedCancelAll` and the liquidation cancel step make the same update. A forced cancel-all now completes in one request, `seg_forced` has no cancellation loop, and a liquidation needs at most one cancel step.
+- **Lazy removal.** Void orders stay in the book until matching meets them.
+  - Every step against another account's order already proves that account's activity. If the epochs differ, the step removes the order without touching the owner's counters, which already exclude it.
+  - A taker's own void order is removed the same way, without shrinking its open lots.
+  - `CancelOrder` and `ModifyOrder` accept only live orders.
+- **Limitation.** Like an expired GTT order, a void order counts toward a tick's top of book until something removes it. A trader can therefore leave a void order at the top of the book. It cannot be filled, and it moves the mark only through `mid`, which is one input of a median clamped to `mark_band`. An operator step that removes void and expired orders is a next increment.
+- **Cost.** The epoch adds one field to two leaves.
+  - Matching was restructured at the same time. A circuit evaluates every branch, so each step used to pay for a book walk and an activity update in each of its cases. It now writes the order's leaf once and, for another account's order, that account's activity once.
+  - `seg_trade`: 395,115 gates, down from 476,001 in P2.8.
+  - `seg_forced`: 103,254, down from 221,271 in P2.3; it also lost its loop of four 80-level cancellations.
+  - `seg_liquidate`: 254,897, down from 386,374 in P2.2.
+
+**Tests** (P2.9):
+
+- **Native**, batch 8:
+  - Heidi's session key cancels all her orders, Alice cancels all with her master key, and Carol's `ForcedCancelAll` voids hers.
+  - Bob's sell then meets Heidi's void bid, and Dave's sell meets Carol's. Matching removes both without filling them, and no position changes.
+  - The liquidation waterfall of batch 4 cancels Eve's orders with one epoch step.
+- **Adversarial:** 70 in all.
+  - Two new witnesses: a void order filled, using its owner's activity from before the cancel-all, and a live order removed as void, using an activity whose epoch moved. Neither activity is in the tree.
+  - The forced cancel-all case that left orders behind no longer applies.
+
 **Tests** (P2.8):
 
 - **Native**, batch 7:
@@ -1189,7 +1217,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. `CancelAll` in constant time: a per-account order epoch, with cancelled orders removed lazily, as expired GTT orders are.
+2. An operator step that removes void and expired orders, so they stop counting toward a tick's top of book.
 3. WebAuthn passkeys as a client circuit.
 
 ## 16. Decisions

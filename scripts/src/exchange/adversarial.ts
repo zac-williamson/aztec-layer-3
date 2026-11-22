@@ -198,7 +198,7 @@ async function main() {
   await expectFail('block time regresses', 'seg_block', t, 'time regressed');
   // The operator hides the bids to move the mark: an empty side must be proved empty.
   t = clone(tick);
-  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0' } };
+  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0' } };
   await expectFail('tick hides the best bid', 'seg_block', t, 'empty bid side path');
   t = clone(tick);
   t.updates[0].ask.seq = (BigInt(t.updates[0].ask.seq) + 2n).toString(); // a later ask at the same price (not the leaf's sibling)
@@ -265,11 +265,9 @@ async function main() {
       L.restore(snap);
     }
   };
-  const vOrder = [...L.orders[0].entries()].find(([, o]) => o.account === V)![0];
-  const pOrder = [...L.orders[0].entries()].find(([, o]) => o.account === P)![0];
-  await expectFail('liquidating a healthy account', 'seg_liquidate', await relaxed({ kind: 'cancel', account: P, market: 0, index: pOrder }), 'account is not liquidatable');
+  await expectFail('liquidating a healthy account', 'seg_liquidate', await relaxed({ kind: 'cancel', account: P }), 'account is not liquidatable');
   await expectFail('closing before the orders are cancelled', 'seg_liquidate', await relaxed({ kind: 'close', account: V, market: 0 }), 'orders must be cancelled first');
-  await L.liquidate([{ kind: 'cancel', account: V, market: 0, index: vOrder }]); // honest
+  await L.liquidate([{ kind: 'cancel', account: V }]); // honest: voids all of V's orders
   const cancelStep = clone(L.segments[L.segments.length - 1].inputs) as any;
   await execute('seg_liquidate', cancelStep);
   await expectFail('close below the liquidation limit', 'seg_liquidate', await relaxed({ kind: 'close', account: V, market: 0 }), 'best bid below the limit');
@@ -359,9 +357,9 @@ async function main() {
   };
   await expectFail('session key outside its markets', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [1n, BID, 30_000n, 1n, GTC, 0n]), 'market not allowed for the session key');
   await expectFail('session key above its notional cap', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 100n, GTC, 0n]), "order above the session key's notional limit");
-  await expectFail('session key withdrawing', 'seg_trade', await reSess(clone(sessPlace), 1n, WITHDRAW, [10n, 77n]), 'session keys only place, cancel and modify');
-  await expectFail('session key adding a key', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.ADD_KEY, [1n, 5n, 6n, 1n, 1n, keyExpiry]), 'session keys only place, cancel and modify');
-  await expectFail('session key transferring', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.TRANSFER, [10n, Q]), 'session keys only place, cancel and modify');
+  await expectFail('session key withdrawing', 'seg_trade', await reSess(clone(sessPlace), 1n, WITHDRAW, [10n, 77n]), 'session keys only place, cancel, modify and cancel all');
+  await expectFail('session key adding a key', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.ADD_KEY, [1n, 5n, 6n, 1n, 1n, keyExpiry]), 'session keys only place, cancel, modify and cancel all');
+  await expectFail('session key transferring', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.TRANSFER, [10n, Q]), 'session keys only place, cancel, modify and cancel all');
   await expectFail('session key nonce replayed', 'seg_trade', await reSess(clone(sessPlace), 0n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n]), 'nonce');
   t = clone(sessPlace);
   t.start.time = (keyExpiry + 1n).toString();
@@ -375,8 +373,9 @@ async function main() {
   const st0 = BigInt(sessPlace.start.time);
   await expectFail('GTT order already expired', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 10n, X.TIF.GTT, 0n, st0]), 'order already expired');
   await expectFail('GTC order with an expiry', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n, st0 + 100n]), 'only GTT orders expire');
-  // Forced requests: R closes its long against Q's bids; Q cancels its orders. The probe path a
-  // close that stopped at once would need, on the book as it stands before the close:
+  // Forced requests: R closes its long against Q's bids; Q cancels all its orders, which voids
+  // them. The probe path a close that stopped at once would need, on the book as it stands before
+  // the close:
   const probe = K.books[0].path(X.orderIndex(M.SIDE.ASK, 1900n, K.markets[0].nextSeq)).map((x) => ({ hash: hex(x.hash), ask: x.ask.toString(), bid: x.bid.toString() }));
   const kf = K.segments.length;
   await K.priority([
@@ -386,16 +385,35 @@ async function main() {
   const forcedClose = clone(K.segments[kf].inputs) as any;
   const forcedCancel = clone(K.segments[kf + 1].inputs) as any;
   // The close first cancels R's own resting bid (self-trade prevention), then fills against Q.
-  assert(forcedClose.n_fills === 2 && forcedCancel.n_cancels === 4, `forced setup: ${forcedClose.n_fills} steps, ${forcedCancel.n_cancels} cancels`);
+  assert(forcedClose.n_fills === 2 && K.actv.get(Q)!.epoch === 1n && K.actv.get(Q)!.openOrders === 0n, `forced setup: ${forcedClose.n_fills} steps`);
   await execute('seg_forced', forcedClose);
   await execute('seg_forced', forcedCancel);
   t = clone(forcedClose);
   t.n_fills = 0;
   t.probe_path = probe;
   await expectFail('forced close stops with liquidity left', 'seg_forced', t, 'crossing bids remain');
-  t = clone(forcedCancel);
-  t.n_cancels = 3;
-  await expectFail('forced cancel-all leaves cancellable orders', 'seg_forced', t, 'forced cancel-all must cancel every order it can');
+  // Order epochs (SPEC.md §6.5). R's sell meets Q's void best bid, which matching removes instead of
+  // filling. Filling it would need Q's activity from before the cancel-all; removing a live order
+  // as void would need an activity whose epoch moved. Neither is in the activity tree.
+  const kv = K.segments.length;
+  await K.trade([await kact(1, 3n, PLACE, [0n, ASK, 1990n, 5n, IOC, 0n])]);
+  assert(K.rejected.length === 0 && K.segments.length === kv + 1, `void-order setup: ${K.rejected.map((r) => r.reason)}`);
+  const voidHit = clone(K.segments[kv].inputs) as any;
+  assert(voidHit.actions[0].n_fills === 1, 'the sell meets one void order');
+  await execute('seg_trade', voidHit);
+  t = clone(voidHit);
+  const qRec = K.accts.get(Q)!;
+  Object.assign(t.actions[0].fills[0], {
+    maker_actv: forcedCancel.actv,
+    maker_pub: M.pubToNoir(qRec.pub),
+    maker_priv: M.privToNoir(qRec.priv),
+    maker_k_enc: hex(qRec.kEnc),
+    maker_acct_path: K.accounts.path(Q).map(hex),
+  });
+  await expectFail('void order filled', 'seg_trade', t, 'Merkle path does not match root');
+  t = clone(buy);
+  t.actions[0].fills[0].maker_actv.epoch = '1';
+  await expectFail('live order removed as void', 'seg_trade', t, 'Merkle path does not match root');
 
   // Client-proof actions (SPEC.md §7.4). S is a lane-P account, U a lane-S one. An honest P-segment
   // grants S two session keys and withdraws 1,000 of its collateral; the tampered tube witnesses are

@@ -13,7 +13,8 @@ use l3x_exchange::{
     state::State,
     trade::{
         abs, ACTION_PAYLOAD, action_msg, covers, credit, debit, equity, exposure_fresh, initial_margin,
-        KIND_ADD_KEY, KIND_CANCEL, KIND_MODIFY, KIND_PLACE, KIND_REVOKE_KEY, KIND_TRANSFER, KIND_WITHDRAW,
+        KIND_ADD_KEY, KIND_CANCEL, KIND_CANCEL_ALL, KIND_MODIFY, KIND_PLACE, KIND_REVOKE_KEY, KIND_TRANSFER,
+        KIND_WITHDRAW,
         TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC, TIF_POST_ONLY, withdraw as withdraw_collateral, worst,
         write_key_slot,
     },
@@ -64,9 +65,9 @@ struct Action {
 }
 
 /// Trade segment (SPEC.md §6.5, §7.2, §8.1–§8.6, §10.4): executes up to TA signed PlaceOrder,
-/// CancelOrder, ModifyOrder, Withdraw, Transfer, AddKey and RevokeKey actions in order, in any
-/// listed market. The master key may sign anything; a session key only places, cancels and
-/// modifies, within its markets, notional and expiry. An order matches the best
+/// CancelOrder, ModifyOrder, CancelAll, Withdraw, Transfer, AddKey and RevokeKey actions in order,
+/// in any listed market. The master key may sign anything; a session key only places, cancels,
+/// modifies and cancels all, within its markets, notional and expiry. An order matches the best
 /// opposite orders, up to F steps, at the makers' prices, settling both sides' funding and
 /// charging maker and taker fees; then its remainder rests (GTC, post-only) or cancels (IOC) once
 /// no crossing liquidity is left. Only accounts whose balances change get DA entries: quoting and
@@ -137,12 +138,15 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         assert(a.key.nonce + 1 == a.nonce, "nonce");
         assert(running.time <= a.key.expiry, "session key expired");
         assert(
-            (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY),
-            "session keys only place, cancel and modify",
+            (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) | (a.kind == KIND_CANCEL_ALL),
+            "session keys only place, cancel, modify and cancel all",
         );
-        let m = a.p[0] as u32;
-        assert((m as Field == a.p[0]) & (m < MARKETS), "market");
-        assert(a.key.allows_market(m), "market not allowed for the session key");
+        // CancelAll only reduces risk, so any session key may send it; the others name a market.
+        if a.kind != KIND_CANCEL_ALL {
+            let m = a.p[0] as u32;
+            assert((m as Field == a.p[0]) & (m < MARKETS), "market");
+            assert(a.key.allows_market(m), "market not allowed for the session key");
+        }
         if a.kind == KIND_PLACE {
             let notional = ((a.p[2] as u64) as u128) * ((a.p[3] as u64) as u128);
             assert(notional <= a.key.max_notional as u128, "order above the session key's notional limit");
@@ -159,6 +163,8 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         withdraw(state, running, a, act, da_nonce, params)
     } else if a.kind == KIND_TRANSFER {
         transfer(state, running, a, act, da_nonce, params)
+    } else if a.kind == KIND_CANCEL_ALL {
+        (cancel_all(state, a, act), running)
     } else {
         assert((a.kind == KIND_ADD_KEY) | (a.kind == KIND_REVOKE_KEY), "unknown action kind");
         (set_key(state, a, act), running)
@@ -309,7 +315,7 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         let seq = market.next_seq;
         let slot = assert_no_crossing(market.book_root, side, price, seq, a.rest_path);
         if rests {
-            let o = Order { side, account_index: idx, lots: remaining, expiry };
+            let o = Order { side, account_index: idx, lots: remaining, expiry, epoch: act.epoch };
             market.book_root = walk(o.leaf(), o.ask_lots(), o.bid_lots(), slot, a.rest_path).root;
             market.next_seq = seq + 1;
             if side == SIDE_BID {
@@ -352,6 +358,23 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
     (st, r)
 }
 
+/// CancelAll (SPEC.md §6.5, §7.3): advances the account's order epoch, which voids every resting
+/// order it placed before, in every market, at once. Its open lots and order count drop to zero;
+/// matching removes the void orders when it meets them, as it removes expired GTT orders.
+fn cancel_all(state: State, a: Action, act_auth: Activity) -> State {
+    let mut st = state;
+    let leaf = account_leaf(a.taker_pub, a.taker_priv);
+    st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, a.account_index, leaf, leaf, a.taker_acct_path);
+    let mut act = act_auth;
+    act.epoch = act_auth.epoch + 1;
+    act.open_orders = 0;
+    act.open_bid = [0; MARKETS];
+    act.open_ask = [0; MARKETS];
+    st.activity_root =
+        update(DS_ACTV_NODE, st.activity_root, a.account_index, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
+    st
+}
+
 /// CancelOrder, p = (market, side, price, seq), and ModifyOrder, p = (market, side, price, seq,
 /// lots): removes the account's resting order, or reduces it in place to `lots`, which keeps its
 /// place in the queue (SPEC.md §7.3). A modification that would add lots or move the price is a
@@ -375,8 +398,15 @@ fn cancel(state: State, a: Action, act_auth: Activity) -> State {
         assert((lots as Field == a.p[4]) & (lots > 0) & (lots < a.cancel_lots), "a modification only reduces an order");
     }
     let index = order_index(side, price, seq);
-    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry };
-    let kept = if modify { Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry } } else { Order::empty() };
+    // Only a live order can be cancelled or modified: a void one is already gone from the account's
+    // open lots, and its leaf records an earlier epoch.
+    let epoch = a.taker_actv.epoch;
+    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry, epoch };
+    let kept = if modify {
+        Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry, epoch }
+    } else {
+        Order::empty()
+    };
     let (root, _) = replace(st.markets[mid].book_root, index, o, kept, a.rest_path);
     st.markets[mid].book_root = root;
     let mut act = act_auth;

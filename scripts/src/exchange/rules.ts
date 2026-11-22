@@ -2,7 +2,7 @@
 // margin, mark ticks and the book index.
 import * as M from './model.ts';
 
-export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n, MODIFY: 6n, TRANSFER: 7n } as const;
+export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n, MODIFY: 6n, TRANSFER: 7n, CANCEL_ALL: 8n } as const;
 export const TIF = { GTC: 0n, IOC: 1n, FOK: 2n, POST_ONLY: 3n, GTT: 4n } as const;
 export const ACTION_PAYLOAD = 8;
 export const PPM = 1_000_000n;
@@ -156,9 +156,10 @@ export function orderIndex(side: bigint, price: bigint, seq: bigint): bigint {
 export const RIGHTMOST = (1n << 80n) - 1n;
 export const LEFTMOST = 0n;
 
-export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint };
-export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint) =>
-  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots, expiry]);
+/** A resting order; `epoch` is its owner's order epoch when it was placed (SPEC.md §6.5). */
+export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint; epoch: bigint };
+export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint, epoch: bigint) =>
+  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots, expiry, epoch]);
 export const expired = (o: { expiry: bigint }, now: bigint) => o.expiry !== 0n && o.expiry < now;
 export const askLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.ASK ? o.lots : 0n);
 export const bidLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.BID ? o.lots : 0n);

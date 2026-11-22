@@ -20,6 +20,7 @@ pub global KIND_ADD_KEY: Field = 4;
 pub global KIND_REVOKE_KEY: Field = 5;
 pub global KIND_MODIFY: Field = 6;
 pub global KIND_TRANSFER: Field = 7;
+pub global KIND_CANCEL_ALL: Field = 8;
 pub global TIF_GTC: Field = 0;
 pub global TIF_IOC: Field = 1;
 pub global TIF_FOK: Field = 2;

@@ -78,7 +78,8 @@ const TWO_128 = 1n << 128n;
 export type AccountPub = { owner: bigint; masterAuth: bigint; encCommitment: bigint; class: bigint };
 export type Position = { size: bigint; entry: bigint; funding: bigint };
 export type AccountPriv = { collateral: bigint; positions: Position[]; blind: bigint };
-export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[] };
+/** An account's activity leaf (SPEC.md §6.4); `epoch` is its order epoch, which CancelAll advances (§6.5). */
+export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[]; epoch: bigint };
 /** A session key (SPEC.md §7.2). */
 export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint };
 export type Market = {
@@ -145,7 +146,7 @@ export async function initModel(h: H) {
 }
 export const newActivity = (): Activity => {
   if (EMPTY_KEYS_ROOT === 0n) throw new Error('initModel was not called');
-  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n) };
+  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n), epoch: 0n };
 };
 export const emptyKey = (): Key => ({ pkX: 0n, pkY: 0n, marketMask: 0n, maxNotional: 0n, expiry: 0n, nonce: 0n });
 export const keyLeaf = (h: H, k: Key) =>
@@ -199,7 +200,7 @@ export const blindOf = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number
 export const keystream = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number, i: number) =>
   h([DS.KS, k, idx, nonce, BigInt(pos + i)]);
 export const activityHash = (h: H, a: Activity) =>
-  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64)]);
+  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64), a.epoch]);
 
 export const marketHash = (h: H, m: Market) =>
   h([
@@ -281,6 +282,7 @@ export const activityToNoir = (a: Activity) => ({
   open_orders: a.openOrders.toString(),
   open_bid: a.openBid.map(String),
   open_ask: a.openAsk.map(String),
+  epoch: a.epoch.toString(),
 });
 export const marketToNoir = (m: Market) => ({
   book_root: hex(m.bookRoot),

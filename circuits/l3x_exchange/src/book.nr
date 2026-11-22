@@ -31,11 +31,14 @@ pub struct Order {
     pub account_index: u32,
     pub lots: u64,
     pub expiry: u64,
+    /// The owner's order epoch when the order was placed. Once the owner's epoch moves past it
+    /// (CancelAll) the order is void: matching removes it, and it no longer counts as open.
+    pub epoch: u64,
 }
 
 impl Order {
     pub fn empty() -> Self {
-        Order { side: 0, account_index: 0, lots: 0, expiry: 0 }
+        Order { side: 0, account_index: 0, lots: 0, expiry: 0, epoch: 0 }
     }
 
     /// The leaf value; an order with no lots left is the empty leaf.
@@ -43,7 +46,9 @@ impl Order {
         if self.lots == 0 {
             0
         } else {
-            hash([DS_ORDER, self.side, self.account_index as Field, self.lots as Field, self.expiry as Field])
+            hash(
+                [DS_ORDER, self.side, self.account_index as Field, self.lots as Field, self.expiry as Field, self.epoch as Field],
+            )
         }
     }
 

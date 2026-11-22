@@ -203,15 +203,25 @@ pub struct Activity {
     pub open_orders: u32,
     pub open_bid: [u64; MARKETS],
     pub open_ask: [u64; MARKETS],
+    /// The account's order epoch (SPEC.md §6.5). Orders record the epoch they were placed in, and
+    /// CancelAll advances it, which voids every order placed before at once.
+    pub epoch: u64,
 }
 
 impl Activity {
     pub fn new() -> Self {
-        Activity { nonce: 0, keys_root: empty_keys_root(), open_orders: 0, open_bid: [0; MARKETS], open_ask: [0; MARKETS] }
+        Activity {
+            nonce: 0,
+            keys_root: empty_keys_root(),
+            open_orders: 0,
+            open_bid: [0; MARKETS],
+            open_ask: [0; MARKETS],
+            epoch: 0,
+        }
     }
 
     pub fn hash(self) -> Field {
-        let mut inputs: [Field; 4 + MARKETS] = [0; 4 + MARKETS];
+        let mut inputs: [Field; 5 + MARKETS] = [0; 5 + MARKETS];
         inputs[0] = DS_ACTV;
         inputs[1] = self.nonce as Field;
         inputs[2] = self.keys_root;
@@ -219,6 +229,7 @@ impl Activity {
         for m in 0..MARKETS {
             inputs[4 + m] = (self.open_bid[m] as Field) + (self.open_ask[m] as Field) * TWO_64;
         }
+        inputs[4 + MARKETS] = self.epoch as Field;
         hash(inputs)
     }
 }

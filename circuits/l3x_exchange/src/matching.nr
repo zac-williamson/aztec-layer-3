@@ -40,8 +40,9 @@ pub struct Taker {
 /// Matches up to `lots` of a taker order on `side` with limit price `limit` against the best
 /// opposite orders of market `mid`, in up to F steps (`n` used). Every step proves that its order
 /// is the best on its side. A step cancels the taker's own order (self-trade prevention), removes
-/// an expired GTT order, or fills: fills execute at the maker's price, settle both sides' funding
-/// first, and charge `maker_fee_ppm` and `taker_fee_ppm` into `fees_pending`. Makers' leaves are
+/// a void order (its owner cancelled all since placing it) or an expired GTT order, or fills:
+/// fills execute at the maker's price, settle both sides' funding first, and charge
+/// `maker_fee_ppm` and `taker_fee_ppm` into `fees_pending`. Makers' leaves are
 /// written and published here; the taker's is left to the caller. Returns the updated state,
 /// running values, market and taker, the unfilled lots and the filled notional.
 pub fn match_order<let F: u32>(
@@ -84,66 +85,84 @@ pub fn match_order<let F: u32>(
                 assert(before.bids_right == 0, "not the best bid");
                 assert(mp_price >= limit, "best bid below the limit");
             }
-            if f.order.account_index == t.index {
-                // Self-trade prevention: cancel the taker's own resting order and continue.
-                mkt.book_root = walk(0, 0, 0, f.index, f.book_path).root;
-                if f.order.side == SIDE_BID {
-                    t.act.open_bid[mid] -= f.order.lots;
-                } else {
-                    t.act.open_ask[mid] -= f.order.lots;
-                }
-                t.act.open_orders -= 1;
-            } else if f.order.expired(r.time) {
-                // An expired GTT order is removed instead of filled; its owner's open lots shrink.
-                mkt.book_root = walk(0, 0, 0, f.index, f.book_path).root;
-                let mut mact = f.maker_actv;
-                if f.order.side == SIDE_BID {
-                    mact.open_bid[mid] = f.maker_actv.open_bid[mid] - f.order.lots;
-                } else {
-                    mact.open_ask[mid] = f.maker_actv.open_ask[mid] - f.order.lots;
-                }
-                mact.open_orders = f.maker_actv.open_orders - 1;
-                st.activity_root = update(
-                    DS_ACTV_NODE,
-                    st.activity_root,
-                    f.order.account_index,
-                    f.maker_actv.hash(),
-                    mact.hash(),
-                    f.maker_actv_path,
-                );
+            // The step: the taker's own order goes (self-trade prevention); a void order (its owner
+            // cancelled all since placing it) or an expired GTT order goes; anything else fills.
+            // Every case ends in one write of the order's leaf, and every case but the first in
+            // one write of the maker's activity, which the void test needs proved anyway.
+            let own = f.order.account_index == t.index;
+            let is_void = !own & (f.order.epoch != f.maker_actv.epoch);
+            let is_expired = !own & !is_void & f.order.expired(r.time);
+            let is_fill = !own & !is_void & !is_expired;
+            let q = if !is_fill {
+                0
+            } else if remaining < f.order.lots {
+                remaining
             } else {
-                let q = if remaining < f.order.lots { remaining } else { f.order.lots };
-                let left = Order {
+                f.order.lots
+            };
+            let left = if is_fill {
+                Order {
                     side: f.order.side,
                     account_index: f.order.account_index,
                     lots: f.order.lots - q,
                     expiry: f.order.expiry,
-                };
-                mkt.book_root = walk(left.leaf(), left.ask_lots(), left.bid_lots(), f.index, f.book_path).root;
-                let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, f, q, left.lots, da_nonce);
-                st = st2;
-                r = r2;
-                mkt = m2;
-
-                // Taker side of the fill.
-                if !t.traded {
-                    let (c, pos, dust) = settle_funding(t.priv.collateral, t.priv.positions[mid], mkt.cum_funding);
-                    t.priv.collateral = c;
-                    t.priv.positions[mid] = pos;
-                    st.insurance_micro += dust;
-                    t.traded = true;
+                    epoch: f.order.epoch,
                 }
-                let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
-                let tpos = t.priv.positions[mid];
-                let (ts, te, tpnl) = fill(tpos.size, tpos.entry, 0 - dm, mp_price as i64);
-                let tfee = fee(q, mp_price, taker_fee_ppm);
-                mkt = shift_oi(mkt, tpos.size, ts);
-                t.priv.positions[mid] = Position { size: ts, entry: te, funding: tpos.funding };
-                t.priv.collateral = t.priv.collateral + tpnl - tfee as i64;
-                assert(abs(t.priv.collateral) < MAX_COLLATERAL, "collateral out of range");
-                st.fees_pending += tfee;
-                notional += q * mp_price;
-                remaining -= q;
+            } else {
+                Order::empty()
+            };
+            mkt.book_root = walk(left.leaf(), left.ask_lots(), left.bid_lots(), f.index, f.book_path).root;
+            if own {
+                // A void order of the taker's no longer counts as open; only a live one shrinks its lots.
+                if f.order.epoch == t.act.epoch {
+                    if f.order.side == SIDE_BID {
+                        t.act.open_bid[mid] -= f.order.lots;
+                    } else {
+                        t.act.open_ask[mid] -= f.order.lots;
+                    }
+                    t.act.open_orders -= 1;
+                }
+            } else {
+                // A void order is already gone from its owner's open lots; an expired one takes all
+                // its lots out of them, and a fill the lots it fills.
+                let mut mact = f.maker_actv;
+                let gone = if is_expired { f.order.lots } else { q };
+                if f.order.side == SIDE_BID {
+                    mact.open_bid[mid] = f.maker_actv.open_bid[mid] - gone;
+                } else {
+                    mact.open_ask[mid] = f.maker_actv.open_ask[mid] - gone;
+                }
+                if is_expired | (is_fill & (left.lots == 0)) {
+                    mact.open_orders = f.maker_actv.open_orders - 1;
+                }
+                if is_fill {
+                    let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, f, q, da_nonce);
+                    st = st2;
+                    r = r2;
+                    mkt = m2;
+
+                    // Taker side of the fill.
+                    if !t.traded {
+                        let (c, pos, dust) = settle_funding(t.priv.collateral, t.priv.positions[mid], mkt.cum_funding);
+                        t.priv.collateral = c;
+                        t.priv.positions[mid] = pos;
+                        st.insurance_micro += dust;
+                        t.traded = true;
+                    }
+                    let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
+                    let tpos = t.priv.positions[mid];
+                    let (ts, te, tpnl) = fill(tpos.size, tpos.entry, 0 - dm, mp_price as i64);
+                    let tfee = fee(q, mp_price, taker_fee_ppm);
+                    mkt = shift_oi(mkt, tpos.size, ts);
+                    t.priv.positions[mid] = Position { size: ts, entry: te, funding: tpos.funding };
+                    t.priv.collateral = t.priv.collateral + tpnl - tfee as i64;
+                    assert(abs(t.priv.collateral) < MAX_COLLATERAL, "collateral out of range");
+                    st.fees_pending += tfee;
+                    notional += q * mp_price;
+                    remaining -= q;
+                }
+                st.activity_root =
+                    update(DS_ACTV_NODE, st.activity_root, f.order.account_index, f.maker_actv.hash(), mact.hash(), f.maker_actv_path);
             }
         }
     }
@@ -151,9 +170,9 @@ pub fn match_order<let F: u32>(
     (st, r, mkt, t, remaining, notional)
 }
 
-/// The maker side of a fill of `q` lots at the maker's price, leaving `left` lots resting:
-/// settles the maker's funding, applies the fill and the maker fee, writes and publishes the
-/// maker's leaf, and updates its open lots.
+/// The maker side of a fill of `q` lots at the maker's price: settles the maker's funding, applies
+/// the fill and the maker fee, and writes and publishes the maker's leaf. The caller writes the
+/// maker's activity.
 fn fill_maker(
     state: State,
     running: Running,
@@ -162,7 +181,6 @@ fn fill_maker(
     maker_fee_ppm: u64,
     f: Fill,
     q: u64,
-    left: u64,
     da_nonce: Field,
 ) -> (State, Running, Market) {
     let mut st = state;
@@ -187,16 +205,6 @@ fn fill_maker(
     st.accounts_root =
         update(DS_ACCT_NODE, st.accounts_root, mi, account_leaf(f.maker_pub, f.maker_priv), maker_leaf, f.maker_acct_path);
     r = emit_change(r, mi, maker_leaf, mpriv, f.maker_k_enc, da_nonce);
-    let mut mact = f.maker_actv;
-    if f.order.side == SIDE_BID {
-        mact.open_bid[mid] = f.maker_actv.open_bid[mid] - q;
-    } else {
-        mact.open_ask[mid] = f.maker_actv.open_ask[mid] - q;
-    }
-    if left == 0 {
-        mact.open_orders = f.maker_actv.open_orders - 1;
-    }
-    st.activity_root = update(DS_ACTV_NODE, st.activity_root, mi, f.maker_actv.hash(), mact.hash(), f.maker_actv_path);
     (st, r, mkt)
 }
 
