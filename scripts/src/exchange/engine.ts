@@ -44,6 +44,7 @@ const PRIORITY_PER_SEGMENT = 4;
 const TRADE_PER_SEGMENT = 2;
 const UPDATES_PER_BLOCK = 4;
 const REFRESH_PER_SEGMENT = 4;
+const CLEANUPS_PER_SEGMENT = 4;
 const LIQ_PER_SEGMENT = 2;
 const FILLS = 2;
 const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
@@ -59,6 +60,7 @@ const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: b
   epoch: o.epoch.toString(),
 });
 const pad = <T>(xs: T[], n: number, f: () => T) => [...xs, ...Array.from({ length: n - xs.length }, f)];
+const emptyOwner = () => ({ owner_actv: M.activityToNoir(M.newActivity()), owner_actv_path: zeros(M.ACCOUNTS_HEIGHT) });
 
 export class Engine {
   readonly api: Barretenberg;
@@ -101,7 +103,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup'>();
 
   // The batch being built.
   running!: Running;
@@ -274,17 +276,57 @@ export class Engine {
     const best = this.best(m, side);
     if (!best) {
       const slot = side === M.SIDE.ASK ? X.RIGHTMOST : X.LEFTMOST;
-      return { price: 0n, witness: { has: false, price: '0', seq: '0', order: emptyOrder(), path: siblingsToNoir(this.books[m].path(slot)) } };
+      return { price: 0n, witness: { has: false, price: '0', seq: '0', order: emptyOrder(), path: siblingsToNoir(this.books[m].path(slot)), ...emptyOwner() } };
     }
     const index = X.orderIndex(best.side, best.price, best.seq);
     return {
       price: best.price,
-      witness: { has: true, price: best.price.toString(), seq: best.seq.toString(), order: orderToNoir(best), path: siblingsToNoir(this.books[m].path(index)) },
+      witness: {
+        has: true,
+        price: best.price.toString(),
+        seq: best.seq.toString(),
+        order: orderToNoir(best),
+        path: siblingsToNoir(this.books[m].path(index)),
+        owner_actv: M.activityToNoir(this.actv.get(best.account)!),
+        owner_actv_path: this.activity.path(best.account).map(hex),
+      },
     };
+  }
+
+  /** An order that can never fill: void (its owner cancelled all since) or expired at `time`. */
+  private dead(o: X.Order, time: bigint) {
+    return o.epoch !== this.actv.get(o.account)!.epoch || X.expired(o, time);
+  }
+
+  /**
+   * Before a tick at `time`, removes dead orders from the top of the books it reads (SPEC.md §6.5):
+   * a tick may use only live orders. An order that is dead only at `time`, being expired by then,
+   * can be removed only once L3 time reaches it, so a block without updates comes first.
+   */
+  private async clearTops(time: bigint, markets: number[]) {
+    for (;;) {
+      // The dead orders at the top of each side, best first, down to its first live order.
+      const dead: { market: number; index: bigint; o: X.Order }[] = [];
+      for (const m of new Set(markets)) {
+        for (const side of [M.SIDE.BID, M.SIDE.ASK]) {
+          const ranked = [...this.orders[m].entries()]
+            .filter(([, o]) => o.side === side)
+            .sort(([a], [b]) => (side === M.SIDE.ASK ? (a < b ? -1 : 1) : a > b ? -1 : 1));
+          for (const [index, o] of ranked) {
+            if (!this.dead(o, time)) break;
+            dead.push({ market: m, index, o });
+          }
+        }
+      }
+      if (!dead.length) return;
+      if (time > this.running.time && dead.some((d) => !this.dead(d.o, this.running.time))) await this.block(time, []);
+      for (let i = 0; i < dead.length; i += CLEANUPS_PER_SEGMENT) await this.maintenance({ clean: dead.slice(i, i + CLEANUPS_PER_SEGMENT) });
+    }
   }
 
   /** Block segment: opens an L3 block at `time`, with up to four signed index updates. */
   async block(time: bigint, updates: OracleUpdate[] = []) {
+    if (updates.length && !this.relax.has('cleanup')) await this.clearTops(time, updates.map((u) => Number(u.market)));
     assert(updates.length <= UPDATES_PER_BLOCK, 'too many updates for one block segment');
     const start = copyRunning(this.running);
     const before = this.state();
@@ -326,7 +368,7 @@ export class Engine {
         ask: ask.witness,
       });
     }
-    const emptyTop = () => ({ has: false, price: '0', seq: '0', order: emptyOrder(), path: emptyBookPath() });
+    const emptyTop = () => ({ has: false, price: '0', seq: '0', order: emptyOrder(), path: emptyBookPath(), ...emptyOwner() });
     const emptyUpdate = () => ({
       market: '0',
       price: '0',
@@ -571,12 +613,50 @@ export class Engine {
    * and whole micro-units of funding remainders into the insurance account, then republishes the
    * next `refresh` accounts after the refresh cursor under fresh keystreams.
    */
-  async maintenance(opts: { sweep?: boolean; refresh?: number }) {
+  /**
+   * Maintenance segment: removes dead orders (`clean`), sweeps the protocol accounts' credits, and
+   * refreshes the next accounts. A removal must be of a void or expired order unless the engine is
+   * relaxed ('cleanup').
+   */
+  async maintenance(opts: { sweep?: boolean; refresh?: number; clean?: { market: number; index: bigint }[] }) {
     const n = opts.refresh ?? 0;
+    const clean = opts.clean ?? [];
     assert(n <= REFRESH_PER_SEGMENT && BigInt(n) <= this.numAccounts, 'refresh count');
+    assert(clean.length <= CLEANUPS_PER_SEGMENT, 'too many removals');
     const start = copyRunning(this.running);
     const before = this.state();
-    const daNonce = await M.segmentNonce(this.h, start.batch, start.actionLog, start.daLen);
+    const removals: unknown[] = [];
+    for (const c of clean) {
+      const o = this.orders[c.market].get(c.index);
+      assert(o, 'no such order to remove');
+      const owner = this.actv.get(o.account)!;
+      const isVoid = o.epoch !== owner.epoch;
+      const isExpired = !isVoid && X.expired(o, this.running.time);
+      assert(isVoid || isExpired || this.relax.has('cleanup'), 'order is live');
+      removals.push({
+        market: c.market.toString(),
+        price: o.price.toString(),
+        seq: o.seq.toString(),
+        order: orderToNoir(o),
+        path: siblingsToNoir(this.books[c.market].path(c.index)),
+        owner_actv: M.activityToNoir(owner),
+        owner_actv_path: this.activity.path(o.account).map(hex),
+      });
+      await this.books[c.market].set(c.index, 0n, 0n, 0n);
+      this.orders[c.market].delete(c.index);
+      this.markets[c.market].bookRoot = this.books[c.market].root;
+      if (isExpired) {
+        const nact = M.copyActivity(owner);
+        if (o.side === M.SIDE.BID) nact.openBid[c.market] -= o.lots;
+        else nact.openAsk[c.market] -= o.lots;
+        nact.openOrders -= 1n;
+        this.actv.set(o.account, nact);
+        await this.activity.set(o.account, await M.activityHash(this.h, nact));
+      }
+      const msg = await this.h([M.DS.CLEAN, BigInt(c.market), o.side, o.price, o.seq]);
+      this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, msg, M.LOG.CLEANUP);
+    }
+    const daNonce = await M.segmentNonce(this.h, start.batch, this.running.actionLog, start.daLen);
     await this.absorb(M.TAG.SEG);
     await this.absorb(daNonce);
     const protocol: unknown[] = [];
@@ -613,9 +693,13 @@ export class Engine {
         this.refreshCursor = rec.index + 1n;
       }
     }
-    const label = [opts.sweep ? `sweep (${swept.join(', ')})` : '', n ? `refresh [${indices.join(', ')}]` : ''].filter(Boolean).join(', ');
+    const label = [clean.length ? `remove ${clean.length} dead order${clean.length > 1 ? 's' : ''}` : '', opts.sweep ? `sweep (${swept.join(', ')})` : '', n ? `refresh [${indices.join(', ')}]` : '']
+      .filter(Boolean)
+      .join(', ');
     await this.finishSegment('seg_refresh', label || 'maintenance', {
       ...this.base(start, before),
+      n_clean: clean.length,
+      removals: pad(removals, CLEANUPS_PER_SEGMENT, () => ({ market: '0', price: '0', seq: '0', order: emptyOrder(), path: emptyBookPath(), ...emptyOwner() })),
       sweep: !!opts.sweep,
       protocol,
       n,

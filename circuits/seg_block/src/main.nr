@@ -1,24 +1,43 @@
 use l3x_exchange::{
+    account::Activity,
     book::{best_ask, best_bid, Order, Sibling},
-    consts::{BOOK_HEIGHT, DS_BLOCK, LOG_BLOCK, LOG_ORACLE, MARKETS, MAX_PRICE, N_ORACLES, PPM},
+    consts::{ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACTV_NODE, DS_BLOCK, LOG_BLOCK, LOG_ORACLE, MARKETS, MAX_PRICE, N_ORACLES, PPM},
     mark::tick,
     oracle_message,
     params::Params,
     sig::{assert_signed, Signature},
     state::State,
+    tree::merkle_root,
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
 
 /// Oracle updates per block segment.
 global U: u32 = 4;
 
-/// A side's best order at the moment of the tick, or a proof that the side is empty.
+/// A side's best order at the moment of the tick, or a proof that the side is empty. The order's
+/// owner's activity shows the order is live.
 struct TopOfBook {
     has: bool,
     price: u32,
     seq: u64,
     order: Order,
     path: [Sibling; BOOK_HEIGHT],
+    owner_actv: Activity,
+    owner_actv_path: [Field; ACCOUNTS_HEIGHT],
+}
+
+/// A tick's mid uses only orders that can fill: neither void (its owner cancelled all since
+/// placing it) nor expired at the block time. The operator removes dead orders first (seg_refresh).
+fn assert_live(top: TopOfBook, activity_root: Field, block_time: u64) {
+    if top.has {
+        let o = top.order;
+        assert(
+            merkle_root(DS_ACTV_NODE, top.owner_actv.hash(), o.account_index, top.owner_actv_path) == activity_root,
+            "top of book owner activity",
+        );
+        assert(o.epoch == top.owner_actv.epoch, "void order at the top of the book");
+        assert(!o.expired(block_time), "expired order at the top of the book");
+    }
 }
 
 struct OracleUpdate {
@@ -34,9 +53,10 @@ struct OracleUpdate {
 
 /// Block segment (SPEC.md §8.4, §9.1): opens an L3 block at `block_time` and applies up to U
 /// index updates, each signed by at least `oracle_k` of the configured publishers. Every update is
-/// a mark tick for its market: it proves the top of book, recomputes the mark, accrues the premium
-/// and applies funding when an interval is due. This is the only segment that advances L3 time, so
-/// a long gap is always crossed by a block that carries nothing but oracle data.
+/// a mark tick for its market: it proves the top of book, whose orders must be live, recomputes the
+/// mark, accrues the premium and applies funding when an interval is due. This is the only segment
+/// that advances L3 time, so a long gap is always crossed by a block that carries nothing but
+/// oracle data.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -83,6 +103,8 @@ fn main(
             }
             let bb = best_bid(m.book_root, u.bid.has, u.bid.price, u.bid.seq, u.bid.order, u.bid.path);
             let ba = best_ask(m.book_root, u.ask.has, u.ask.price, u.ask.seq, u.ask.order, u.ask.path);
+            assert_live(u.bid, st.activity_root, block_time);
+            assert_live(u.ask, st.activity_root, block_time);
             st.markets[u.market] =
                 tick(m, mp, params.funding_interval, u.price, u.external, u.time, bb, ba, block_time);
             end.action_log = hash([DS_ACTION_LOG, end.action_log, msg, LOG_ORACLE]);

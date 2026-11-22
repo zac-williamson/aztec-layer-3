@@ -315,6 +315,37 @@ async function main() {
   t.actions[1].dest_k_enc = hex(5n);
   await expectFail('transfer published under another key', 'seg_trade', t, 'k_enc does not open the commitment');
 
+  // Dead orders (SPEC.md §6.5): a tick reads only live orders, and maintenance removes only void or
+  // expired ones. Account 2 cancels all, voiding its last ask at 2,002; account 3 then rests a GTT
+  // bid at 1,995 that expires before the next tick. A relaxed engine ticks over them, or removes
+  // account 4's live bid; the honest engine removes the dead orders first, once time reaches them.
+  await engine.trade([await act(0, 6n, X.KIND_ACT.CANCEL_ALL, [])]);
+  const tickAt = now + 5n;
+  engine.relax.add('cleanup');
+  let saved = engine.snapshot();
+  await engine.block(tickAt, [await update(engine, 0n, 2001n, tickAt)]);
+  const voidTop = clone(engine.segments.at(-1)!.inputs) as any;
+  engine.restore(saved);
+  await engine.trade([await act(1, 5n, PLACE, [0n, BID, 1995n, 1n, X.TIF.GTT, 0n, now + 3n])]);
+  saved = engine.snapshot();
+  await engine.block(tickAt, [await update(engine, 0n, 2001n, tickAt)]);
+  const expiredTop = clone(engine.segments.at(-1)!.inputs) as any;
+  engine.restore(saved);
+  saved = engine.snapshot();
+  await engine.maintenance({ clean: [{ market: 0, index: X.orderIndex(BID, 1990n, bid1990.seq) }] });
+  const liveRemoval = clone(engine.segments.at(-1)!.inputs) as any;
+  engine.restore(saved);
+  engine.relax.delete('cleanup');
+  assert(engine.rejected.length === 0, `dead-order setup rejected: ${engine.rejected.map((r) => r.reason)}`);
+  const nh = engine.segments.length;
+  await engine.block(tickAt, [await update(engine, 0n, 2001n, tickAt)]);
+  const honest = engine.segments.slice(nh);
+  assert(honest.map((x) => x.pkg).join(',') === 'seg_block,seg_refresh,seg_block', `dead-order handling: ${honest.map((x) => x.label).join(' | ')}`);
+  for (const x of honest) await execute(x.pkg, x.inputs);
+  await expectFail('tick over a void order', 'seg_block', voidTop, 'void order at the top of the book');
+  await expectFail('tick over an expired order', 'seg_block', expiredTop, 'expired order at the top of the book');
+  await expectFail('removal of a live order', 'seg_refresh', liveRemoval, 'order is live');
+
   // Session keys, GTT and forced requests (SPEC.md §6.5, §7.2, §7.3). Q provides liquidity; R gives
   // a session key market 0 only, a 100,000 notional cap and an expiry, and its key rests a bid.
   const K = await Engine.create(api, params, prover.vkTreeRoot, protocol);

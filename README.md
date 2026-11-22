@@ -26,6 +26,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.7**: the client subtree. `agg_app` accepts any client circuit whose VK is in the VK tree's client subtree, so the configuration decides which circuits authorize lane-P actions. A P-256 client circuit joins the secret-knowledge one, for hardware keys.
 - **P2.8**: `ModifyOrder` reduces a resting order in place and keeps its queue position; `Transfer` moves collateral between user accounts under the withdrawal rules, revealing which accounts changed but not the amount.
 - **P2.9**: `CancelAll` in constant time. Orders record their owner's order epoch; cancelling all advances the epoch, and matching removes void orders when it meets them. Forced cancel-all and liquidation use the same step.
+- **P2.10**: dead orders. Maintenance removes void and expired orders, and a tick proves its top-of-book orders live, so an order that cannot fill never moves the mark.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -38,7 +39,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick |
 | `circuits/seg_priority` | X-segment: Register, Deposit and ForcedWithdraw requests in queue order (refunds for missing accounts) |
 | `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
-| `circuits/seg_refresh` | X-segment (maintenance): sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
+| `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
 | `circuits/client_auth` | P-lane client circuit (client slot 0): knowledge of the secret behind an account's auth binding, authorizing `msg` |
@@ -168,7 +169,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.8: tests | Native batch 7 shows a modified order keeping its place; 7 more adversarial witnesses (69 in all). |
 | P2.9: cancel-all | Order epochs: CancelAll, ForcedCancelAll and the liquidation cancel step void every order in one activity update; matching removes void orders lazily, and writes each order leaf and maker activity once per step (seg_trade 395k gates, seg_forced 103k, seg_liquidate 255k). |
 | P2.9: tests | Native batch 8 voids orders three ways and shows them removed without fills; 2 new adversarial witnesses (70 in all). |
-| P2: next | C1 custody once the D7 token is specified; an operator step that removes void and expired orders; WebAuthn passkeys. |
+| P2.10: dead orders | Maintenance removes up to four void or expired orders, each logged; ticks prove their top-of-book orders live and unexpired. |
+| P2.10: tests | Native batch 6 clears two void asks before ticking; 3 more adversarial witnesses (73 in all). |
+| P2: next | C1 custody once the D7 token is specified; WebAuthn passkeys; from P3, the risk sweep and ADL ranking. |
 
 ## Caveats
 

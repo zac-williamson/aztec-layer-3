@@ -50,6 +50,7 @@ pub global DS_KEY: Field = 49;
 pub global DS_KEY_NODE: Field = 50;
 pub global DS_RECEIPT_SIG: Field = 51;
 pub global DS_MAUTH_P: Field = 52;
+pub global DS_CLEAN: Field = 53;
 /// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
 /// tree's depth (SPEC.md §11).
 pub global RECEIPT_DEPTH: u32 = 24;
@@ -70,6 +71,7 @@ pub global LOG_BLOCK: Field = 2;
 pub global LOG_ORACLE: Field = 3;
 pub global LOG_SIGNED: Field = 4;
 pub global LOG_LIQUIDATE: Field = 5;
+pub global LOG_CLEANUP: Field = 6;
 
 // DA entries (SPEC.md §9.5). Every entry starts with its tag and has a fixed length.
 pub global TAG_SEG: Field = 1; // [tag, da_nonce]: opens a segment's encryption context

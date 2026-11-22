@@ -39,6 +39,7 @@ export const DS = {
   KEY_NODE: 50n,
   RECEIPT_SIG: 51n,
   MAUTH_P: 52n,
+  CLEAN: 53n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -52,7 +53,7 @@ export const KEY_SLOTS = 256;
 /** The key id of actions the master key signs. */
 export const MASTER_KEY = 256n;
 export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n } as const;
-export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n } as const;
+export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
 export const CHANGE_ENTRY_LEN = 3 + PLAINTEXT_LEN;

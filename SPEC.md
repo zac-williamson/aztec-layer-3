@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), and constant-time cancel-all (P2.9), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), and dead-order removal with live-only ticks (P2.10), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -827,6 +827,7 @@ P2 is built in increments, each leaving every test green.
 - P2.7: the client subtree, with a P-256 client circuit.
 - P2.8: `ModifyOrder` and `Transfer`.
 - P2.9: `CancelAll` in constant time, through order epochs.
+- P2.10: dead-order removal, and ticks that read only live orders.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -951,7 +952,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 - `OrderLeaf = H(DS_ORDER, side, account, lots, expiry, epoch)`; P2.9 added the owner's order epoch. Only GTT orders have an expiry, and it must lie in the future when the order is placed.
 - When matching meets an expired order, it removes the order instead of filling it, and the owner's open lots shrink. The step counts against the action's matching steps.
-- An expired order counts toward its owner's margin, and toward a tick's top of book, until it is removed.
+- An expired order counts toward its owner's margin until it is removed. Since P2.10 a tick never reads it (see Dead orders).
 
 **Forced priority requests** (P2.3, §7.3, §12):
 
@@ -1170,12 +1171,29 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - Every step against another account's order already proves that account's activity. If the epochs differ, the step removes the order without touching the owner's counters, which already exclude it.
   - A taker's own void order is removed the same way, without shrinking its open lots.
   - `CancelOrder` and `ModifyOrder` accept only live orders.
-- **Limitation.** Like an expired GTT order, a void order counts toward a tick's top of book until something removes it. A trader can therefore leave a void order at the top of the book. It cannot be filled, and it moves the mark only through `mid`, which is one input of a median clamped to `mark_band`. An operator step that removes void and expired orders is a next increment.
+- **Ticks.** In P2.9 a void order still counted toward a tick's top of book, like an expired GTT order, until something removed it. P2.10 closes this (see Dead orders).
 - **Cost.** The epoch adds one field to two leaves.
   - Matching was restructured at the same time. A circuit evaluates every branch, so each step used to pay for a book walk and an activity update in each of its cases. It now writes the order's leaf once and, for another account's order, that account's activity once.
   - `seg_trade`: 395,115 gates, down from 476,001 in P2.8.
   - `seg_forced`: 103,254, down from 221,271 in P2.3; it also lost its loop of four 80-level cancellations.
   - `seg_liquidate`: 254,897, down from 386,374 in P2.2.
+
+**Dead orders** (P2.10, §6.5):
+
+- **Removal.** The maintenance segment removes up to four dead orders before its sweep and refreshes.
+  - A dead order is void, or an expired GTT order. It proves its owner's activity, which shows which: a moved epoch, or an expiry before the segment's time.
+  - An expired order's lots leave its owner's open lots. A void order's already have.
+  - Each removal is an operator action, logged as `H(DS_CLEAN, market, side, price, seq)`. A live order cannot be removed.
+- **Ticks read only live orders.** For each side, a tick proves the top order's owner activity against the activity root. It requires the same epoch, and no expiry at the block time. A trader can therefore no longer leave an order that cannot fill at the top of the book to move the mark.
+- **Operator.** Before ticking a book, the operator removes the dead orders at its top.
+  - An order that expires only by the new block's time can be removed only once L3 time reaches it.
+  - So the engine first opens the block without updates, then removes the orders, then ticks at the same time. Blocks may repeat a time.
+- **Cost.** `seg_block`: 188,143 gates, up 16% for eight activity proofs. `seg_refresh`: 141,339, up from about 48,000, at roughly 23,000 per removal.
+
+**Tests** (P2.10):
+
+- **Native**, batch 6: before its market-0 tick, a maintenance segment removes the two void asks left by batches 4 and 5. They are Eve's ask, voided by her liquidation's cancel step, and Dave's, voided by his forced cancel-all.
+- **Adversarial:** 3 more witnesses, 73 in all: a tick over a void order, a tick over an expired order, and the removal of a live order. The honest sequence for the same book also executes: a block without updates, the removals, then the tick.
 
 **Tests** (P2.9):
 
@@ -1217,8 +1235,8 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. An operator step that removes void and expired orders, so they stop counting toward a tick's top of book.
-3. WebAuthn passkeys as a client circuit.
+2. WebAuthn passkeys as a client circuit.
+3. From P3: the risk sweep (§8.7), so every due liquidation is shown to happen, and the ranking of ADL counterparties (§8.5).
 
 ## 16. Decisions
 

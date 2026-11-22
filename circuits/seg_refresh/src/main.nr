@@ -1,8 +1,9 @@
 use l3x_exchange::{
-    account::{account_leaf, AccountPriv, AccountPub, blind, enc_commitment},
+    account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment},
+    book::{Order, order_index, replace, Sibling, SIDE_BID},
     consts::{
-        ACCOUNTS_HEIGHT, CLASS_FEE, CLASS_INSURANCE, DS_ACCT_NODE, FEE_INDEX, INSURANCE_INDEX, MAX_COLLATERAL, MICRO,
-        PROTOCOL_ACCOUNTS, TAG_REFRESH,
+        ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_FEE, CLASS_INSURANCE, DS_ACCT_NODE, DS_ACTV_NODE, DS_CLEAN, FEE_INDEX,
+        INSURANCE_INDEX, LOG_CLEANUP, MARKETS, MAX_COLLATERAL, MICRO, PROTOCOL_ACCOUNTS, TAG_REFRESH,
     },
     da::{emit_change, emit_full, open_segment, segment_nonce},
     params::Params,
@@ -10,9 +11,22 @@ use l3x_exchange::{
     trade::abs,
     tree::{merkle_root, update},
 };
-use l3x_types::{NodeOutput, Running};
+use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
 
 global RF: u32 = 4;
+/// Order removals per maintenance segment.
+global CL: u32 = 4;
+
+/// A resting order that is void or expired, and its owner's activity, which says which.
+struct Removal {
+    market: u32,
+    price: u32,
+    seq: u64,
+    order: Order,
+    path: [Sibling; BOOK_HEIGHT],
+    owner_actv: Activity,
+    owner_actv_path: [Field; ACCOUNTS_HEIGHT],
+}
 
 struct Item {
     pub_part: AccountPub,
@@ -21,7 +35,12 @@ struct Item {
     k_enc: Field,
 }
 
-/// Maintenance segment (SPEC.md §8.6, §9.5).
+/// Maintenance segment (SPEC.md §6.5, §8.6, §9.5).
+///
+/// It first removes up to CL orders that can never fill: void orders, whose owner has cancelled all
+/// since placing them, and expired GTT orders, whose lots leave the owner's open lots. Each removal
+/// is an operator action in the action log. A tick may use only a live order as its top of book
+/// (seg_block), so the operator removes dead orders from the top of a book before ticking it.
 ///
 /// With `sweep`, it first credits the fees collected so far to the fee account, and the liquidation
 /// fees and whole units of funding remainders to the insurance account, which keeps those balances
@@ -36,6 +55,8 @@ fn main(
     params: Params,
     start: Running,
     state: State,
+    n_clean: u32,
+    removals: [Removal; CL],
     sweep: bool,
     protocol: [Item; PROTOCOL_ACCOUNTS],
     n: u32,
@@ -44,9 +65,37 @@ fn main(
     assert(start.state == state.trees(), "state opening");
     assert(n <= RF, "too many refresh entries");
     assert(n <= state.num_accounts, "more refresh entries than accounts");
-    let da_nonce = segment_nonce(start, start.action_log);
-    let mut end = open_segment(start, da_nonce);
+    assert(n_clean <= CL, "too many removals");
     let mut st = state;
+    let mut end = start;
+    for i in 0..CL {
+        if i < n_clean {
+            let c = removals[i];
+            assert(c.market < MARKETS, "market");
+            assert(c.order.lots > 0, "no such order");
+            let owner = c.order.account_index;
+            let is_void = c.order.epoch != c.owner_actv.epoch;
+            let is_expired = !is_void & c.order.expired(end.time);
+            assert(is_void | is_expired, "order is live");
+            let index = order_index(c.order.side, c.price, c.seq);
+            let (root, _) = replace(st.markets[c.market].book_root, index, c.order, Order::empty(), c.path);
+            st.markets[c.market].book_root = root;
+            let mut act = c.owner_actv;
+            if is_expired {
+                if c.order.side == SIDE_BID {
+                    act.open_bid[c.market] = c.owner_actv.open_bid[c.market] - c.order.lots;
+                } else {
+                    act.open_ask[c.market] = c.owner_actv.open_ask[c.market] - c.order.lots;
+                }
+                act.open_orders = c.owner_actv.open_orders - 1;
+            }
+            st.activity_root = update(DS_ACTV_NODE, st.activity_root, owner, c.owner_actv.hash(), act.hash(), c.owner_actv_path);
+            let msg = hash([DS_CLEAN, c.market as Field, c.order.side, c.price as Field, c.seq as Field]);
+            end.action_log = hash([DS_ACTION_LOG, end.action_log, msg, LOG_CLEANUP]);
+        }
+    }
+    let da_nonce = segment_nonce(start, end.action_log);
+    end = open_segment(end, da_nonce);
     if sweep {
         for k in 0..PROTOCOL_ACCOUNTS {
             let w = protocol[k];
