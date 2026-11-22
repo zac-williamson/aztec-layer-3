@@ -13,6 +13,7 @@ pub mod trade;
 pub mod mark;
 pub mod matching;
 pub mod liq;
+pub mod trigger;
 
 pub fn book_empty_root() -> Field {
     book::empty_root()

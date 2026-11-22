@@ -55,6 +55,9 @@ pub global DS_CLEAN: Field = 53;
 pub global DS_DEPAMT: Field = 54;
 /// A deposit's credit blind, H(DS_DEP, account index, refund_to, depositor, salt) (SPEC.md §10.3).
 pub global DS_DEP: Field = 55;
+/// A trigger's leaf, and a trigger firing's log message (SPEC.md §6.5).
+pub global DS_TRIGGER: Field = 56;
+pub global DS_FIRE: Field = 57;
 /// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
 /// tree's depth (SPEC.md §11).
 pub global RECEIPT_DEPTH: u32 = 24;
@@ -76,6 +79,8 @@ pub global LOG_ORACLE: Field = 3;
 pub global LOG_SIGNED: Field = 4;
 pub global LOG_LIQUIDATE: Field = 5;
 pub global LOG_CLEANUP: Field = 6;
+/// A trigger firing (SPEC.md §6.5), logged as H(DS_FIRE, market, index).
+pub global LOG_TRIGGER: Field = 7;
 
 // DA entries (SPEC.md §9.5). Every entry starts with its tag and has a fixed length.
 pub global TAG_SEG: Field = 1; // [tag, da_nonce]: opens a segment's encryption context

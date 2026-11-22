@@ -13,8 +13,12 @@ use l3x_types::{hash::hash, state_root, trees};
 /// premium over the index in ppm, `premium_acc` its time integral (ppm · s) since `window_start`;
 /// `cum_funding` is in micro-units per lot and grows by `funding_rate · mark` per interval.
 /// `best_bid` and `best_ask` are the top of book proved at the last mark tick (zero if empty).
+/// `trigger_root` is the market's trigger tree (SPEC.md §6.5); `trigger_pending` is set while a
+/// trigger is due at the mark, and then the market takes no new orders until the due triggers fire.
 pub struct Market {
     pub book_root: Field,
+    pub trigger_root: Field,
+    pub trigger_pending: bool,
     pub next_seq: u64,
     pub index_price: u64,
     pub index_time: u64,
@@ -33,9 +37,12 @@ pub struct Market {
 }
 
 impl Market {
-    pub fn genesis(book_root: Field) -> Self {
+    /// A market with empty books: `empty_root` is the empty tree's root, for orders and triggers.
+    pub fn genesis(empty_root: Field) -> Self {
         Market {
-            book_root,
+            book_root: empty_root,
+            trigger_root: empty_root,
+            trigger_pending: false,
             next_seq: 0,
             index_price: 0,
             index_time: 0,
@@ -57,7 +64,8 @@ impl Market {
     pub fn hash(self) -> Field {
         hash(
             [
-                DS_MKT, self.book_root, self.next_seq as Field, self.index_price as Field,
+                DS_MKT, self.book_root, self.trigger_root, self.trigger_pending as Field, self.next_seq as Field,
+                self.index_price as Field,
                 self.index_time as Field, self.mark_price as Field, enc(self.premium), enc(self.premium_acc),
                 self.last_tick as Field, enc(self.cum_funding), enc(self.funding_rate),
                 self.window_start as Field, self.next_funding as Field, self.oi_long as Field,

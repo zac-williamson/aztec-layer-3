@@ -13,12 +13,13 @@ use l3x_exchange::{
     state::State,
     trade::{
         abs, ACTION_PAYLOAD, action_msg, covers, credit, debit, equity, exposure_fresh, initial_margin,
-        KIND_ADD_KEY, KIND_CANCEL, KIND_CANCEL_ALL, KIND_MODIFY, KIND_PLACE, KIND_REVOKE_KEY, KIND_TRANSFER,
-        KIND_WITHDRAW,
+        KIND_ADD_KEY, KIND_CANCEL, KIND_CANCEL_ALL, KIND_CANCEL_TRIGGER, KIND_MODIFY, KIND_PLACE, KIND_PLACE_TRIGGER,
+        KIND_REVOKE_KEY, KIND_TRANSFER, KIND_WITHDRAW,
         TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC, TIF_POST_ONLY, withdraw as withdraw_collateral, worst,
         write_key_slot,
     },
     tree::{merkle_root, update},
+    trigger::{DIR_DOWN, DIR_UP, replace_trigger, Trigger, trigger_index},
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, receipt_leaf, receipt_node, Running};
 
@@ -62,12 +63,16 @@ struct Action {
     dest_priv: AccountPriv,
     dest_k_enc: Field,
     dest_acct_path: [Field; ACCOUNTS_HEIGHT],
+    /// CancelTrigger: the trigger; PlaceTrigger and CancelTrigger: the path of its slot.
+    trigger: Trigger,
+    trigger_path: [Sibling; BOOK_HEIGHT],
 }
 
 /// Trade segment (SPEC.md §6.5, §7.2, §8.1–§8.6, §10.4): executes up to TA signed PlaceOrder,
-/// CancelOrder, ModifyOrder, CancelAll, Withdraw, Transfer, AddKey and RevokeKey actions in order,
-/// in any listed market. The master key may sign anything; a session key only places, cancels,
-/// modifies and cancels all, within its markets, notional and expiry. An order matches the best
+/// CancelOrder, ModifyOrder, CancelAll, PlaceTrigger, CancelTrigger, Withdraw, Transfer, AddKey
+/// and RevokeKey actions in order, in any listed market. The master key may sign anything; a
+/// session key only places, cancels and modifies orders and triggers and cancels all, within its
+/// markets, notional and expiry. While a market has triggers due, it takes no new orders. An order matches the best
 /// opposite orders, up to F steps, at the makers' prices, settling both sides' funding and
 /// charging maker and taker fees; then its remainder rests (GTC, post-only) or cancels (IOC) once
 /// no crossing liquidity is left. Only accounts whose balances change get DA entries: quoting and
@@ -138,7 +143,9 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         assert(a.key.nonce + 1 == a.nonce, "nonce");
         assert(running.time <= a.key.expiry, "session key expired");
         assert(
-            (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) | (a.kind == KIND_CANCEL_ALL),
+            (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) | (a.kind == KIND_CANCEL_ALL)
+                | (a.kind == KIND_PLACE_TRIGGER)
+                | (a.kind == KIND_CANCEL_TRIGGER),
             "session keys only place, cancel, modify and cancel all",
         );
         // CancelAll only reduces risk, so any session key may send it; the others name a market.
@@ -147,7 +154,8 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
             assert((m as Field == a.p[0]) & (m < MARKETS), "market");
             assert(a.key.allows_market(m), "market not allowed for the session key");
         }
-        if a.kind == KIND_PLACE {
+        // An order's and a trigger's limit price and lots are at p[2] and p[3].
+        if (a.kind == KIND_PLACE) | (a.kind == KIND_PLACE_TRIGGER) {
             let notional = ((a.p[2] as u64) as u128) * ((a.p[3] as u64) as u128);
             assert(notional <= a.key.max_notional as u128, "order above the session key's notional limit");
         }
@@ -165,6 +173,8 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         transfer(state, running, a, act, da_nonce, params)
     } else if a.kind == KIND_CANCEL_ALL {
         (cancel_all(state, a, act), running)
+    } else if (a.kind == KIND_PLACE_TRIGGER) | (a.kind == KIND_CANCEL_TRIGGER) {
+        (trigger_action(state, a, act, params), running)
     } else {
         assert((a.kind == KIND_ADD_KEY) | (a.kind == KIND_REVOKE_KEY), "unknown action kind");
         (set_key(state, a, act), running)
@@ -269,6 +279,8 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         assert(a.n_fills == 0, "post-only order would take liquidity");
     }
     let mut market = st.markets[mid];
+    // Due triggers fire before new orders trade (SPEC.md §6.5).
+    assert(!market.trigger_pending, "triggers are due in this market");
     let mark = market.mark_price;
     assert(mark > 0, "no mark price");
     let diff = if price > mark { price - mark } else { mark - price };
@@ -356,6 +368,60 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         assert(covers(equity(taker, st.markets), initial_margin(taker, act, st.markets, params)), "insufficient margin");
     }
     (st, r)
+}
+
+/// PlaceTrigger, p = (market, side, limit, lots, dir, trigger price, 0, 0), and CancelTrigger,
+/// p = (market, dir, trigger price, seq, 0, 0, 0, 0) (SPEC.md §6.5), in one tree write.
+/// - PlaceTrigger rests a stop or take-profit in the market's trigger tree, at the market's next
+///   sequence number. It must not be due at the current mark, so placing one never leaves a due
+///   trigger unflagged. A trigger is a reduce-only IOC order once fired, so it reserves no margin.
+/// - CancelTrigger removes one of the account's triggers, live or void.
+fn trigger_action(state: State, a: Action, act: Activity, params: Params) -> State {
+    let mut st = state;
+    let idx = a.account_index;
+    let leaf = account_leaf(a.taker_pub, a.taker_priv);
+    st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, leaf, leaf, a.taker_acct_path);
+    let mid = a.p[0] as u32;
+    assert((mid as Field == a.p[0]) & (mid < MARKETS), "market");
+    let mut market = st.markets[mid];
+    let place = a.kind == KIND_PLACE_TRIGGER;
+    let (dir, price, seq) = if place {
+        (a.p[4], a.p[5] as u32, market.next_seq)
+    } else {
+        (a.p[1], a.p[2] as u32, a.p[3] as u64)
+    };
+    let mut old = Trigger::empty();
+    let mut new = Trigger::empty();
+    if place {
+        let side = a.p[1];
+        let limit = a.p[2] as u64;
+        let lots = a.p[3] as u64;
+        assert(params.markets[mid].listed(), "market not listed");
+        assert((side == SIDE_BID) | (side == SIDE_ASK), "side");
+        assert((dir == DIR_UP) | (dir == DIR_DOWN), "trigger direction");
+        assert((limit as Field == a.p[2]) & (limit > 0) & (limit < MAX_PRICE), "price out of range");
+        assert((lots as Field == a.p[3]) & (lots > 0) & (lots < MAX_LOTS), "lots out of range");
+        assert((price as Field == a.p[5]) & (price > 0) & ((price as u64) < MAX_PRICE), "trigger price out of range");
+        assert((a.p[6] == 0) & (a.p[7] == 0), "trigger payload");
+        let mark = market.mark_price;
+        assert(mark > 0, "no mark price");
+        if dir == DIR_UP {
+            assert(price as u64 > mark, "trigger already due");
+        } else {
+            assert((price as u64) < mark, "trigger already due");
+        }
+        new = Trigger { dir, side, account_index: idx, lots, limit, epoch: a.taker_actv.epoch };
+        market.next_seq = seq + 1;
+    } else {
+        assert((price as Field == a.p[2]) & (seq as Field == a.p[3]), "trigger reference");
+        old = a.trigger;
+        assert((old.account_index == idx) & (old.lots > 0) & (old.dir == dir), "not the account's trigger");
+    }
+    let (root, _) = replace_trigger(market.trigger_root, trigger_index(dir, price, seq), old, new, a.trigger_path);
+    market.trigger_root = root;
+    st.markets[mid] = market;
+    st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
+    st
 }
 
 /// CancelAll (SPEC.md §6.5, §7.3): advances the account's order epoch, which voids every resting

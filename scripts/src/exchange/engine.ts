@@ -64,6 +64,16 @@ const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: b
   epoch: o.epoch.toString(),
 });
 const pad = <T>(xs: T[], n: number, f: () => T) => [...xs, ...Array.from({ length: n - xs.length }, f)];
+const emptyTrigger = () => ({ dir: hex(0n), side: hex(0n), account_index: '0', lots: '0', limit: '0', epoch: '0' });
+const triggerToNoir = (t: { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint }) => ({
+  dir: hex(t.dir),
+  side: hex(t.side),
+  account_index: t.account.toString(),
+  lots: t.lots.toString(),
+  limit: t.limit.toString(),
+  epoch: t.epoch.toString(),
+});
+const emptyTriggerTop = () => ({ has: false, price: '0', seq: '0', trigger: emptyTrigger(), path: emptyBookPath() });
 const emptyOwner = () => ({ owner_actv: M.activityToNoir(M.newActivity()), owner_actv_path: zeros(M.ACCOUNTS_HEIGHT) });
 const emptyOwnerActv = () => ({ actv: M.activityToNoir(M.newActivity()), actv_path: zeros(M.ACCOUNTS_HEIGHT) });
 
@@ -97,6 +107,9 @@ export class Engine {
   insuranceMicro = 0n;
   /** Resting orders, per market, by book index. */
   orders: Map<bigint, BookOrder>[] = [];
+  /** Trigger trees and resting triggers, per market, by tree index (SPEC.md §6.5). */
+  triggerTrees: BookTree[] = [];
+  triggers: Map<bigint, X.Trigger>[] = [];
   /** Session keys per account: the slots in use and the account's keys tree (SPEC.md §6.4). */
   keys = new Map<bigint, Map<number, M.Key>>();
   keyTrees = new Map<bigint, MerkleTree>();
@@ -108,7 +121,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers'>();
 
   // The batch being built.
   running!: Running;
@@ -137,6 +150,8 @@ export class Engine {
     for (let m = 0; m < M.MARKETS; m++) {
       e.books.push(await new BookTree(api, M.BOOK_HEIGHT).init());
       e.orders.push(new Map());
+      e.triggerTrees.push(await new BookTree(api, M.BOOK_HEIGHT).init());
+      e.triggers.push(new Map());
       e.markets.push(M.genesisMarket(e.books[m].root));
     }
     for (const [i, a] of protocol.entries()) {
@@ -297,6 +312,21 @@ export class Engine {
     };
   }
 
+  /** The next trigger due as the mark rises (UP) or falls (DOWN), as a witness (SPEC.md §6.5). */
+  private triggerTop(m: number, dir: bigint) {
+    const ranked = [...this.triggers[m].entries()].filter(([, t]) => t.dir === dir).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const best = dir === X.DIR.UP ? ranked[0] : ranked[ranked.length - 1];
+    if (!best) {
+      const slot = dir === X.DIR.UP ? X.RIGHTMOST : X.LEFTMOST;
+      return { price: 0n, witness: { ...emptyTriggerTop(), path: siblingsToNoir(this.triggerTrees[m].path(slot)) } };
+    }
+    const [index, t] = best;
+    return {
+      price: t.price,
+      witness: { has: true, price: t.price.toString(), seq: t.seq.toString(), trigger: triggerToNoir(t), path: siblingsToNoir(this.triggerTrees[m].path(index)) },
+    };
+  }
+
   /** An order that can never fill: void (its owner cancelled all since) or expired at `time`. */
   private dead(o: X.Order, time: bigint) {
     return o.epoch !== this.actv.get(o.account)!.epoch || X.expired(o, time);
@@ -360,6 +390,10 @@ export class Engine {
       const bid = this.topOfBook(m, M.SIDE.BID);
       const ask = this.topOfBook(m, M.SIDE.ASK);
       this.markets[m] = { ...X.tick(mk, mp, this.params.fundingInterval, u.price, u.external, u.time, bid.price, ask.price, time), bookRoot: this.books[m].root };
+      // The tick flags the market while a trigger is due at the new mark (SPEC.md §6.5).
+      const up = this.triggerTop(m, X.DIR.UP);
+      const down = this.triggerTop(m, X.DIR.DOWN);
+      this.markets[m].triggerPending = X.due(up.price, down.price, this.markets[m].markPrice);
       r.actionLog = await M.logAppend(this.h, r.actionLog, msg, M.LOG.ORACLE);
       witnesses.push({
         market: u.market.toString(),
@@ -370,6 +404,8 @@ export class Engine {
         sigs: Array.from({ length: M.N_ORACLES }, (_, j) => (u.sigs[j] ? sigToNoir(u.sigs[j]!) : zeroSig())),
         bid: bid.witness,
         ask: ask.witness,
+        up: up.witness,
+        down: down.witness,
       });
     }
     const emptyTop = () => ({ has: false, price: '0', seq: '0', order: emptyOrder(), path: emptyBookPath(), ...emptyOwner() });
@@ -382,6 +418,8 @@ export class Engine {
       sigs: Array.from({ length: M.N_ORACLES }, zeroSig),
       bid: emptyTop(),
       ask: emptyTop(),
+      up: emptyTriggerTop(),
+      down: emptyTriggerTop(),
     });
     const label = updates.length ? ` ${updates.map((u) => `m${u.market}=${u.price}`).join(' ')}` : '';
     await this.finishSegment('seg_block', `block t=${time}${label}`, {
@@ -751,6 +789,8 @@ export class Engine {
       accounts: this.accounts.snapshot(),
       activity: this.activity.snapshot(),
       books: this.books.map((b) => b.snapshot()),
+      triggerTrees: this.triggerTrees.map((b) => b.snapshot()),
+      triggers: this.triggers.map((t) => new Map([...t].map(([k, v]) => [k, { ...v }]))),
       accts: new Map([...this.accts].map(([k, v]) => [k, { ...v, pub: { ...v.pub }, priv: M.copyPriv(v.priv) }])),
       actv: new Map([...this.actv].map(([k, v]) => [k, M.copyActivity(v)])),
       orders: this.orders.map((o) => new Map([...o].map(([k, v]) => [k, { ...v }]))),
@@ -774,6 +814,8 @@ export class Engine {
     this.accounts.restore(s.accounts);
     this.activity.restore(s.activity);
     this.books.forEach((b, i) => b.restore(s.books[i]));
+    this.triggerTrees.forEach((b, i) => b.restore(s.triggerTrees[i]));
+    this.triggers = s.triggers;
     this.accts = s.accts;
     this.actv = s.actv;
     this.orders = s.orders;
@@ -857,7 +899,18 @@ export class Engine {
     const labels = actions.map((a) => {
       const by = a.keyId === M.MASTER_KEY ? '' : ` by key ${a.keyId}`;
       if (a.kind === X.KIND_ACT.CANCEL_ALL) return `cancel all${by}`;
-      const book = a.kind === X.KIND_ACT.PLACE ? 'place' : a.kind === X.KIND_ACT.CANCEL ? 'cancel' : a.kind === X.KIND_ACT.MODIFY ? 'modify' : '';
+      const book =
+        a.kind === X.KIND_ACT.PLACE
+          ? 'place'
+          : a.kind === X.KIND_ACT.CANCEL
+            ? 'cancel'
+            : a.kind === X.KIND_ACT.MODIFY
+              ? 'modify'
+              : a.kind === X.KIND_ACT.PLACE_TRIGGER
+                ? 'trigger'
+                : a.kind === X.KIND_ACT.CANCEL_TRIGGER
+                  ? 'cancel trigger'
+                  : '';
       return (book ? `${book} m${a.p[0]}` : names[a.kind.toString()]) + by;
     });
     await this.finishSegment(
@@ -912,6 +965,8 @@ export class Engine {
       dest_priv: M.privToNoir(M.emptyPriv()),
       dest_k_enc: hex(0n),
       dest_acct_path: zeros(M.ACCOUNTS_HEIGHT),
+      trigger: emptyTrigger(),
+      trigger_path: emptyBookPath(),
     };
   }
 
@@ -1101,10 +1156,10 @@ export class Engine {
       if (!(await verify(this.h, a.pk, a.sig, msg))) throw new Error('bad signature');
       if (key.nonce + 1n !== a.nonce) throw new Error('nonce');
       if (this.running.time > key.expiry) throw new Error('session key expired');
-      const { PLACE, CANCEL, MODIFY, CANCEL_ALL } = X.KIND_ACT;
-      if (a.kind !== PLACE && a.kind !== CANCEL && a.kind !== MODIFY && a.kind !== CANCEL_ALL) throw new Error('session keys only place, cancel, modify and cancel all');
+      const { PLACE, CANCEL, MODIFY, CANCEL_ALL, PLACE_TRIGGER, CANCEL_TRIGGER } = X.KIND_ACT;
+      if (![PLACE, CANCEL, MODIFY, CANCEL_ALL, PLACE_TRIGGER, CANCEL_TRIGGER].includes(a.kind as any)) throw new Error('session keys only place, cancel, modify and cancel all');
       if (a.kind !== CANCEL_ALL && (a.p[0] >= BigInt(M.MARKETS) || ((key.marketMask >> a.p[0]) & 1n) !== 1n)) throw new Error('market not allowed for the session key');
-      if (a.kind === X.KIND_ACT.PLACE && a.p[2] * a.p[3] > key.maxNotional) throw new Error("order above the session key's notional limit");
+      if ((a.kind === PLACE || a.kind === PLACE_TRIGGER) && a.p[2] * a.p[3] > key.maxNotional) throw new Error("order above the session key's notional limit");
       keyWitness = { key: M.keyToNoir(key), key_path: this.keyTrees.get(a.account)!.path(BigInt(slot)).map(hex) };
       act.keysRoot = await this.writeKey(a.account, slot, { ...key, nonce: a.nonce });
     }
@@ -1129,7 +1184,155 @@ export class Engine {
     if (a.kind === X.KIND_ACT.TRANSFER) return { ...this.emptyAction(), ...common, ...(await this.execTransfer(a, rec, act, daNonce)) };
     if (a.kind === X.KIND_ACT.CANCEL_ALL) return { ...this.emptyAction(), ...common, ...(await this.execCancelAll(a, act)) };
     if (a.kind === X.KIND_ACT.ADD_KEY || a.kind === X.KIND_ACT.REVOKE_KEY) return { ...this.emptyAction(), ...common, ...(await this.execSetKey(a, act)) };
+    if (a.kind === X.KIND_ACT.PLACE_TRIGGER || a.kind === X.KIND_ACT.CANCEL_TRIGGER) return { ...this.emptyAction(), ...common, ...(await this.execTrigger(a, act)) };
     throw new Error('unknown action kind');
+  }
+
+  /**
+   * PlaceTrigger, p = (market, side, limit, lots, dir, trigger price), and CancelTrigger,
+   * p = (market, dir, trigger price, seq) (seg_trade `trigger_action`, SPEC.md §6.5). A new trigger
+   * must not be due at the current mark; it takes the market's next sequence number.
+   */
+  private async execTrigger(a: SignedAction, act: M.Activity) {
+    const m = Number(a.p[0]);
+    if (a.p[0] < 0n || m >= M.MARKETS) throw new Error('market');
+    const mk = this.markets[m];
+    const witness: Record<string, unknown> = {};
+    const acctPath = this.accounts.path(a.account).map(hex);
+    if (a.kind === X.KIND_ACT.PLACE_TRIGGER) {
+      const [, side, limit, lots, dir, price, p6, p7] = a.p;
+      if (this.params.markets[m].imrPpm === 0n) throw new Error('market not listed');
+      if (side !== M.SIDE.BID && side !== M.SIDE.ASK) throw new Error('side');
+      if (dir !== X.DIR.UP && dir !== X.DIR.DOWN) throw new Error('trigger direction');
+      if (limit <= 0n || limit >= X.MAX_PRICE || lots <= 0n || lots >= X.MAX_LOTS || price <= 0n || price >= X.MAX_PRICE) throw new Error('trigger out of range');
+      if (p6 !== 0n || p7 !== 0n) throw new Error('trigger payload');
+      if (mk.markPrice === 0n) throw new Error('no mark price');
+      if (dir === X.DIR.UP ? price <= mk.markPrice : price >= mk.markPrice) throw new Error('trigger already due');
+      const seq = mk.nextSeq;
+      const index = X.triggerIndex(dir, price, seq);
+      witness.trigger_path = siblingsToNoir(this.triggerTrees[m].path(index));
+      const t: X.Trigger = { dir, side, account: a.account, lots, limit, epoch: act.epoch, price, seq };
+      await this.triggerTrees[m].set(index, await X.triggerLeaf(this.h, t), dir === X.DIR.UP ? lots : 0n, dir === X.DIR.DOWN ? lots : 0n);
+      this.triggers[m].set(index, t);
+      mk.nextSeq = seq + 1n;
+    } else {
+      const [, dir, price, seq] = a.p;
+      const index = X.triggerIndex(dir, price, seq);
+      const t = this.triggers[m].get(index);
+      if (!t || t.account !== a.account || t.dir !== dir) throw new Error("not the account's trigger");
+      Object.assign(witness, { trigger: triggerToNoir(t), trigger_path: siblingsToNoir(this.triggerTrees[m].path(index)) });
+      await this.triggerTrees[m].set(index, 0n, 0n, 0n);
+      this.triggers[m].delete(index);
+    }
+    mk.triggerRoot = this.triggerTrees[m].root;
+    const actvPath = this.activity.path(a.account).map(hex);
+    this.actv.set(a.account, act);
+    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    return { taker_acct_path: acctPath, taker_actv_path: actvPath, ...witness };
+  }
+
+  // ---- Trigger firings (seg_trigger, SPEC.md §6.5) ----
+
+  /** The next trigger due in market m, UP first, as [index, trigger], or undefined. */
+  nextDue(m: number): [bigint, X.Trigger] | undefined {
+    const mark = this.markets[m].markPrice;
+    const ranked = [...this.triggers[m].entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const up = ranked.find(([, t]) => t.dir === X.DIR.UP);
+    if (up && up[1].price <= mark) return up;
+    const downs = ranked.filter(([, t]) => t.dir === X.DIR.DOWN);
+    const down = downs[downs.length - 1];
+    if (down && down[1].price >= mark) return down;
+    return undefined;
+  }
+
+  /** Fires the triggers due in the given markets, one seg_trigger segment each, until none is. */
+  async fireTriggers(markets: number[] = [...Array(M.MARKETS).keys()]) {
+    for (const m of markets) {
+      for (let guard = 0; this.markets[m].triggerPending; guard++) {
+        assert(guard < 64, `trigger firing in market ${m} does not converge`);
+        const next = this.nextDue(m);
+        assert(!!next, `market ${m} is flagged but no trigger is due`);
+        await this.triggerSegment(m, next[0], next[1]);
+      }
+    }
+  }
+
+  /**
+   * One firing: a reduce-only IOC order at the trigger's limit for at most the owner's position on
+   * its other side. The rest stays in the tree only when the matching steps ran out.
+   */
+  async triggerSegment(m: number, index: bigint, t: X.Trigger) {
+    const start = copyRunning(this.running);
+    const before = this.state();
+    const r = this.running;
+    r.actionLog = await M.logAppend(this.h, r.actionLog, await this.h([M.DS.FIRE, BigInt(m), index]), M.LOG.TRIGGER);
+    const daNonce = await M.segmentNonce(this.h, start.batch, r.actionLog, start.daLen);
+    await this.absorb(M.TAG.SEG);
+    await this.absorb(daNonce);
+    const mp = this.params.markets[m];
+    const rec = this.accts.get(t.account)!;
+    const act0 = this.actv.get(t.account)!;
+    const w: Record<string, unknown> = {
+      market: m.toString(),
+      dir: hex(t.dir),
+      price: t.price.toString(),
+      seq: t.seq.toString(),
+      trigger: triggerToNoir(t),
+      trigger_path: siblingsToNoir(this.triggerTrees[m].path(index)),
+      acct_pub: M.pubToNoir(rec.pub),
+      acct_priv: M.privToNoir(rec.priv),
+      k_enc: hex(rec.kEnc),
+      actv: M.activityToNoir(act0),
+      n_fills: 0,
+      fills: Array.from({ length: FILLS }, () => this.emptyFill()),
+      probe_path: emptyBookPath(),
+    };
+    const live = t.epoch === act0.epoch;
+    const pos = rec.priv.positions[m].size;
+    const held = t.side === M.SIDE.ASK && pos > 0n ? pos : t.side === M.SIDE.BID && pos < 0n ? -pos : 0n;
+    const q = !live ? 0n : t.lots < held ? t.lots : held;
+    let priv = M.copyPriv(rec.priv);
+    let act = M.copyActivity(act0);
+    let traded = false;
+    let left = 0n;
+    let effect = live ? 'nothing to reduce' : 'void';
+    if (q > 0n) {
+      const taker = { index: t.account, priv, act, traded: false };
+      const matched = await this.matchOrder(m, t.side, t.limit, q, taker, daNonce, mp.makerFeePpm, mp.takerFeePpm);
+      if (matched.remaining > 0n) {
+        if (matched.fills.length < FILLS) w.probe_path = siblingsToNoir(this.books[m].path(X.orderIndex(t.side, t.limit, this.markets[m].nextSeq)));
+        else left = matched.remaining;
+      }
+      this.markets[m].bookRoot = this.books[m].root;
+      priv = taker.priv;
+      act = taker.act;
+      traded = taker.traded;
+      Object.assign(w, { n_fills: matched.fills.length, fills: pad(matched.fills, FILLS, () => this.emptyFill()) });
+      effect = `filled ${q - matched.remaining} of ${q}${left ? `, ${left} left to fire` : ''}`;
+    }
+    if (left > 0n) {
+      const kept = { ...t, lots: left };
+      await this.triggerTrees[m].set(index, await X.triggerLeaf(this.h, kept), t.dir === X.DIR.UP ? left : 0n, t.dir === X.DIR.DOWN ? left : 0n);
+      this.triggers[m].set(index, kept);
+    } else {
+      await this.triggerTrees[m].set(index, 0n, 0n, 0n);
+      this.triggers[m].delete(index);
+    }
+    this.markets[m].triggerRoot = this.triggerTrees[m].root;
+    const up = this.triggerTop(m, X.DIR.UP);
+    const down = this.triggerTop(m, X.DIR.DOWN);
+    this.markets[m].triggerPending = X.due(up.price, down.price, this.markets[m].markPrice);
+    Object.assign(w, { up: up.witness, down: down.witness });
+    w.actv_path = this.activity.path(t.account).map(hex);
+    this.actv.set(t.account, act);
+    await this.activity.set(t.account, await M.activityHash(this.h, act));
+    w.acct_path = this.accounts.path(t.account).map(hex);
+    if (traded) {
+      const leaf = await this.writeAccount(rec, priv, daNonce);
+      await this.emitChange(rec, leaf, daNonce);
+    }
+    const name = `${t.dir === X.DIR.UP ? 'UP' : 'DOWN'} ${t.side === M.SIDE.ASK ? 'sell' : 'buy'} m${m} @${t.price} for ${t.account}`;
+    await this.finishSegment('seg_trigger', `fire ${name} (${effect})`, { ...this.base(start, before), ...w });
   }
 
   /** AddKey and RevokeKey (seg_trade `set_key`): master only; the slot keeps its nonce. */
@@ -1168,6 +1371,7 @@ export class Engine {
     if ((tif === X.TIF.GTT) !== (expiry !== 0n)) throw new Error('only GTT orders expire');
     if (expiry !== 0n && expiry <= this.running.time) throw new Error('order already expired');
     if (reduceOnly === 1n && rests) throw new Error('reduce-only orders cannot rest');
+    if (this.markets[m].triggerPending && !this.relax.has('triggers')) throw new Error('triggers are due in this market');
     const mark = this.markets[m].markPrice;
     if (mark === 0n) throw new Error('no mark price');
     if (X.abs(price - mark) * X.PPM > mark * mp.priceBandPpm) throw new Error('limit price outside the band');

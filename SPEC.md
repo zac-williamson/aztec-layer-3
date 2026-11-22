@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.12, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), and the token's bridge to L1 (P2.14), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.13, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), and stop and take-profit triggers (P2.15), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -209,7 +209,7 @@ Node       = H(DS_NODE, left, right, ask_lots, bid_lots, ask_quote, bid_quote)
 - **Depth**: the same sums prove the impact price used by the mark (§8.4) and any bucketed depth published under [D1].
 - **Fill, cancel**: update the leaf (emptied on removal) and its path.
 - **Expiry**: an expired GTT order met during matching is removed instead of filled.
-- **Triggers**: stop and take-profit orders live in a second per-market tree with the same layout, keyed by trigger price. Triggers are evaluated only at mark ticks (§8.4), and the mark does not change between ticks, so firing a trigger cannot cascade within a tick. At each tick the circuit sets the market's `trigger_pending` flag if the aggregates show any trigger due at the new mark. While the flag is set, the market accepts only trigger firings and cancels; the flag clears when the aggregates show none due.
+- **Triggers**: stop and take-profit orders live in a second per-market tree with the same layout, keyed by trigger price. An UP trigger fires once the mark rises to its price and uses the ask slot; a DOWN trigger fires once the mark falls to it and uses the bid slot. So the aggregates locate the next trigger due in each direction with one walk, as they locate the best ask and bid. Triggers are evaluated only at mark ticks (§8.4), and the mark does not change between ticks, so firing a trigger cannot cascade within a tick. At each tick the circuit sets the market's `trigger_pending` flag if the aggregates show any trigger due at the new mark. While the flag is set, the market accepts no new orders, only trigger firings and cancels; the flag clears when the aggregates show none due. Due triggers fire in price-time order, one operator action each (§15, P2 profile).
 
 Order leaves never enter DA, and open orders are void in desert mode. An account may hold at most 1,000 open orders.
 
@@ -261,6 +261,7 @@ Signers MUST derive Schnorr nonces deterministically, hedged with fresh randomne
 | --- | --- |
 | `PlaceOrder` | market, side, limit price, lots, type (limit, or market with a worst price), TIF (GTC, IOC, FOK, post-only, GTT), reduce-only, trigger, display [D1], client order id |
 | `CancelOrder` | market, order reference |
+| `PlaceTrigger`, `CancelTrigger` | as built (P2.15): market, side, limit price, lots, direction, trigger price; and market, direction, trigger price, sequence number |
 | `CancelAll` | optional market |
 | `ModifyOrder` | order reference, price, lots; time priority kept only if lots decrease and price is unchanged |
 | `Withdraw` | amount, recipient Aztec address (§10.4) |
@@ -733,7 +734,7 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 | M2 | Chonk IVC over `agg_app` plus three kernels (11,445, 15,339 and 36,862 gates): 1.6 s. The proof is 1,221 fields plus the user public inputs, which come first. |
 | M3 | Tube: 1,473,521 gates, 4.5 s, 480-field RollupHonk proof. |
 | M4 | Root, with two RollupHonk verifications and full IPA verification: 8,388,352 gates (≈ 2^23), 42–46 s, 458-field ZK proof. This is a fixed cost per batch. |
-| M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity. |
+| M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity.<br>Custody (P2.13): a custody transaction with up to four deposits and four payouts, each payout a constrained delivery, proves on the client and lands checkpointed in 6.5–7.3 s; a deposit, with its authorization, in 6.5–7.1 s. Per-flow gas is not yet measured. |
 | M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. P2.2: `seg_liquidate` 327,161 gates for two liquidation steps (each any of cancel, close with two matching steps, takeover, deficit, ADL); its segments prove in 3.6–6.3 s under load. P2.3 (session keys, GTT, forced requests): `seg_trade` 430,513; `seg_priority` 155,159; `seg_liquidate` 386,374; `seg_forced` 221,271. Risk-sweep costs await phase 3. |
 | M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
@@ -893,6 +894,7 @@ P2 is built in increments, each leaving every test green.
 - P2.12: a WebAuthn passkey client circuit.
 - P2.13: C1 custody over the D7 collateral token.
 - P2.14: the collateral token's bridge to L1.
+- P2.15: stop and take-profit triggers.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -904,8 +906,8 @@ These are built. Where they narrow the design, the full design remains normative
   - `funding` is the market's cumulative funding index when the position last settled.
   - The hashed fields are exactly the plaintext a DA entry encrypts, so decrypting an entry yields the leaf opening.
 - `ActivityLeaf = H(DS_ACTV, nonce, keys_root, open_orders, open_bid_m + open_ask_m·2^64 for each m, epoch)`. P2.3 added `keys_root`, and P2.9 added the order `epoch`.
-- `MarketLeaf` has 16 fields:
-  - the book root and next sequence number;
+- `MarketLeaf` has 18 fields (16 before P2.15):
+  - the book root, the trigger root and the trigger-pending flag (P2.15), and the next sequence number;
   - the index price and its time;
   - the mark, the premium and its time integral, and the last tick time;
   - the cumulative funding index, the last funding rate, the funding window start and the next funding time;
@@ -1297,6 +1299,35 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 - **Contracts.** `ConfidentialTokenBridge` (`contracts/ctbridge`) is the token's minter, and Aztec's prebuilt `TokenPortal` and `TestERC20` serve as the L1 half in tests. The token gains `mint_confidential`, `burn_public` and `burn_confidential`, all minter-only.
 - **Messages.** The bridge rebuilds the portal's message contents in the circuit: the ABI encoding of each pseudo-call with its 4-byte selector, then SHA-256 truncated to a field.
+
+**Triggers** (P2.15, §6.5):
+
+- **Tree.** Each market has a trigger tree with the book's layout and node aggregates, keyed by trigger price. A stop-loss on a long is a DOWN sell, a take-profit an UP sell, and the mirror image for a short. UP triggers use the ask slot, so the lowest price, earliest first, is leftmost; DOWN triggers use the bid slot, so the highest price, earliest first, is rightmost.
+  - `TriggerLeaf = H(DS_TRIGGER, dir, side, account, lots, limit, epoch)`. The owner's order epoch makes CancelAll void triggers as it voids orders.
+  - `MarketLeaf` gains `trigger_root` and `trigger_pending`: 18 fields.
+- **Placement.** `PlaceTrigger` and `CancelTrigger` are signed actions in `seg_trade`, and session keys may send them within their markets and notional. A trigger takes the market's next sequence number and must not be due at the current mark, so placing one never leaves a due trigger unflagged. A void trigger can still be cancelled.
+- **Ticks.** Every mark tick proves the next trigger due in each direction and sets `trigger_pending` if either is due at the new mark. While it is set, the market's `PlaceOrder`s are refused. Cancels, modifications, forced closes and liquidations go on, so leaving a due trigger unfired cannot void a forced close.
+- **Firing.** `seg_trigger` fires one trigger per segment, logged as the operator action `H(DS_FIRE, market, index)`. It must be the next due in its direction, so due triggers fire in price-time order.
+  - A live trigger is a reduce-only IOC order at its limit, paying the taker fee, for at most the owner's position on its other side. It reserves no margin and never increases risk.
+  - It stops early only when its two matching steps run out, and then the rest stays in the tree to fire again; otherwise any rest is dropped, once no order within the limit crosses.
+  - A void trigger, or one whose owner has nothing left to reduce, is removed without effect.
+  - The segment then proves the next trigger due in each direction and clears the flag once none is due.
+- **Narrowing.** Triggers are reduce-only and do not expire, so a stop that opens a position is deferred. §7.3's single `PlaceOrder` with a trigger field is built as two separate kinds.
+- **Cost.** `seg_block`: 317,728 gates, for two more 80-level walks per update. `seg_trade`: 438,638, for one trigger write per action, placement and cancellation sharing it. `seg_trigger`: 150,096.
+
+**Tests** (P2.15):
+
+- **Native**, batch 9:
+  - Alice sets a stop-loss and a take-profit on her long in market 0, Bob a stop on his short, and Carol places a trigger and cancels it. A trigger already due is refused.
+  - The index falls to 1695. Alice's stop is due, Bob's order in the market is refused, and the stop fires against Dave's bid.
+  - At 1780 Bob's stop, voided by his CancelAll, is removed without effect. At 1800 Alice's take-profit fills Carol's 4-lot bid and drops the rest, as no other bid lies within its limit.
+  - Every segment is proved, conservation holds exactly, and the DA reopens every account.
+- **Adversarial:** 8 more witnesses, 87 in all:
+  - a trigger placed already due, and another account's trigger cancelled;
+  - a tick that hides the due stops, or reports a lower stop as the next due;
+  - an order traded while triggers are due;
+  - a take-profit fired before its price, and a stop fired out of order;
+  - a firing that drops a stop with bids left within its limit.
 
 **Tests** (P2.14):
 

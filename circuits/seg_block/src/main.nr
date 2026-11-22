@@ -8,6 +8,7 @@ use l3x_exchange::{
     sig::{assert_signed, Signature},
     state::State,
     tree::merkle_root,
+    trigger::{due, highest_down, lowest_up, TriggerTop},
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
 
@@ -49,14 +50,18 @@ struct OracleUpdate {
     sigs: [Signature; N_ORACLES],
     bid: TopOfBook,
     ask: TopOfBook,
+    /// The next trigger due as the mark rises, and as it falls (SPEC.md §6.5).
+    up: TriggerTop,
+    down: TriggerTop,
 }
 
 /// Block segment (SPEC.md §8.4, §9.1): opens an L3 block at `block_time` and applies up to U
 /// index updates, each signed by at least `oracle_k` of the configured publishers. Every update is
 /// a mark tick for its market: it proves the top of book, whose orders must be live, recomputes the
-/// mark, accrues the premium and applies funding when an interval is due. This is the only segment
-/// that advances L3 time, so a long gap is always crossed by a block that carries nothing but
-/// oracle data.
+/// mark, accrues the premium and applies funding when an interval is due. It then proves the next
+/// trigger due in each direction and sets the market's trigger_pending flag if either is due at
+/// the new mark (SPEC.md §6.5). This is the only segment that advances L3 time, so a long gap is
+/// always crossed by a block that carries nothing but oracle data.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -105,8 +110,11 @@ fn main(
             let ba = best_ask(m.book_root, u.ask.has, u.ask.price, u.ask.seq, u.ask.order, u.ask.path);
             assert_live(u.bid, st.activity_root, block_time);
             assert_live(u.ask, st.activity_root, block_time);
-            st.markets[u.market] =
-                tick(m, mp, params.funding_interval, u.price, u.external, u.time, bb, ba, block_time);
+            let mut ticked = tick(m, mp, params.funding_interval, u.price, u.external, u.time, bb, ba, block_time);
+            let up = lowest_up(ticked.trigger_root, u.up);
+            let down = highest_down(ticked.trigger_root, u.down);
+            ticked.trigger_pending = due(up, down, ticked.mark_price);
+            st.markets[u.market] = ticked;
             end.action_log = hash([DS_ACTION_LOG, end.action_log, msg, LOG_ORACLE]);
         }
     }

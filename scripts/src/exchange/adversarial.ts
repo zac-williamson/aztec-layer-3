@@ -574,6 +574,89 @@ async function main() {
   create.forEach((b, i) => (wt.client_data[i] = b));
   await expectFail('passkey registration in place of an assertion', 'client_webauthn', wt, 'not a WebAuthn assertion');
 
+  // Triggers (SPEC.md §6.5). A fresh exchange: account 3 buys 20 in market 0 from account 2 and
+  // sets two stop-losses (at 1960 and 1955) and a take-profit (at 2100); account 2 bids at 1950.
+  const T = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  const tu = await Promise.all([21n, 22n].map((x) => keysFromSeed(h, x)));
+  const treqs: M.Request[] = [];
+  for (const [i, k] of tu.entries()) {
+    const encC = await M.encCommitment(h, k.kEnc);
+    T.keyring.set(encC, k.kEnc);
+    const sender = randomField();
+    treqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender, time: now });
+    treqs.push(await M.depositRequest(h, BigInt(M.PROTOCOL_ACCOUNTS + i), 2_000_000n, sender, now));
+  }
+  await T.beginBatch(1n, 0n, 0n, 0n);
+  await T.block(now, [await update(T, 0n, 2000n, now)]);
+  await T.priority(treqs);
+  const { PLACE_TRIGGER, CANCEL_TRIGGER } = X.KIND_ACT;
+  const { UP, DOWN } = X.DIR;
+  const tacct = (u: number) => BigInt(M.PROTOCOL_ACCOUNTS + u);
+  const tact = (u: number, nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, T.domain, tu[u], kind, tacct(u), nonce, p);
+  const tresign = async (inputs: any, i: number, u: number, nonce: bigint, kind: bigint, p: bigint[]) => {
+    const a = await tact(u, nonce, kind, p);
+    inputs.actions[i] = { ...inputs.actions[i], nonce: nonce.toString(), p: a.p.map(hex), sig: sigToNoir(a.sig) };
+  };
+  await T.trade([await tact(0, 1n, PLACE, [0n, ASK, 2000n, 20n, GTC, 0n]), await tact(1, 1n, PLACE, [0n, BID, 2000n, 20n, IOC, 0n])]);
+  await T.trade([await tact(0, 2n, PLACE, [0n, BID, 1950n, 50n, GTC, 0n])]);
+  const tPlace = T.segments.length;
+  await T.trade([await tact(1, 2n, PLACE_TRIGGER, [0n, ASK, 1940n, 10n, DOWN, 1960n]), await tact(1, 3n, PLACE_TRIGGER, [0n, ASK, 1940n, 5n, DOWN, 1955n])]);
+  const placeW = T.segments[tPlace].inputs as any;
+  const spareSeq = T.markets[0].nextSeq + 1n;
+  await T.trade([await tact(1, 4n, PLACE_TRIGGER, [0n, ASK, 2090n, 5n, UP, 2100n]), await tact(1, 5n, PLACE_TRIGGER, [0n, ASK, 1800n, 1n, DOWN, 1800n])]);
+  const tCancel = T.segments.length;
+  await T.trade([await tact(1, 6n, CANCEL_TRIGGER, [0n, DOWN, 1800n, spareSeq])]);
+  const cancelW = T.segments[tCancel].inputs as any;
+  assert(T.rejected.length === 0 && T.accts.get(tacct(1))!.priv.positions[0].size === 20n, `trigger setup rejected: ${T.rejected.map((r) => r.reason)}`);
+  await T.block(now + 10n, [await update(T, 0n, 1950n, now + 9n)]);
+  const tickW = T.segments[T.segments.length - 1].inputs as any;
+  assert(T.markets[0].triggerPending, 'trigger setup: the stops are not due');
+  const pathOf = (tree: { path(i: bigint): { hash: bigint; ask: bigint; bid: bigint }[] }, i: bigint) =>
+    tree.path(i).map((x) => ({ hash: hex(x.hash), ask: x.ask.toString(), bid: x.bid.toString() }));
+  const trigNoir = (x: X.Trigger) => ({ dir: hex(x.dir), side: hex(x.side), account_index: x.account.toString(), lots: x.lots.toString(), limit: x.limit.toString(), epoch: x.epoch.toString() });
+  const resting = [...T.triggers[0].entries()];
+  const [laterIdx, later] = resting.find(([, x]) => x.price === 1955n)!;
+  const [tpIdx, tp] = resting.find(([, x]) => x.price === 2100n)!;
+  const leftPath = pathOf(T.triggerTrees[0], X.LEFTMOST);
+  const laterPath = pathOf(T.triggerTrees[0], laterIdx);
+  const tpPath = pathOf(T.triggerTrees[0], tpIdx);
+  // A malicious engine lets account 2 trade while the stops are due.
+  const tPending = T.segments.length;
+  T.relax.add('triggers');
+  await T.trade([await tact(0, 3n, PLACE, [0n, ASK, 1960n, 1n, GTC, 0n])]);
+  T.relax.clear();
+  const pendingW = T.segments[tPending].inputs as any;
+  const probePath = pathOf(T.books[0], X.orderIndex(ASK, 1940n, T.markets[0].nextSeq));
+  const tFire = T.segments.length;
+  await T.fireTriggers([0]);
+  const fireW = T.segments[tFire].inputs as any;
+  assert(!T.markets[0].triggerPending && T.accts.get(tacct(1))!.priv.positions[0].size === 5n, 'the stops did not fire');
+  for (const [pkg, seg] of [['seg_trade', placeW], ['seg_trade', cancelW], ['seg_block', tickW], ['seg_trigger', fireW]] as const) {
+    await execute(pkg, seg); // honest witnesses run
+  }
+  t = clone(placeW);
+  await tresign(t, 0, 1, 2n, PLACE_TRIGGER, [0n, ASK, 1940n, 10n, DOWN, 2010n]);
+  await expectFail('trigger placed already due', 'seg_trade', t, 'trigger already due');
+  t = clone(cancelW);
+  t.actions[0].trigger.account_index = tacct(0).toString();
+  await expectFail("another account's trigger cancelled", 'seg_trade', t, "not the account's trigger");
+  t = clone(tickW);
+  t.updates[0].down = { has: false, price: '0', seq: '0', trigger: trigNoir({ ...later, lots: 0n, dir: 0n, side: 0n, account: 0n, limit: 0n, epoch: 0n }), path: leftPath };
+  await expectFail('tick hides the due stops', 'seg_block', t, 'there are DOWN triggers');
+  t = clone(tickW);
+  t.updates[0].down = { has: true, price: later.price.toString(), seq: later.seq.toString(), trigger: trigNoir(later), path: laterPath };
+  await expectFail('tick reports a lower stop as the next due', 'seg_block', t, 'not the highest DOWN trigger');
+  await expectFail('order trades while triggers are due', 'seg_trade', pendingW, 'triggers are due in this market');
+  t = clone(fireW);
+  Object.assign(t, { dir: hex(UP), price: tp.price.toString(), seq: tp.seq.toString(), trigger: trigNoir(tp), trigger_path: tpPath });
+  await expectFail('take-profit fired before its price', 'seg_trigger', t, 'trigger not due');
+  t = clone(fireW);
+  Object.assign(t, { price: later.price.toString(), seq: later.seq.toString(), trigger: trigNoir(later), trigger_path: laterPath });
+  await expectFail('stop fired out of order', 'seg_trigger', t, 'an earlier trigger is due first');
+  t = clone(fireW);
+  Object.assign(t, { n_fills: 0, probe_path: probePath });
+  await expectFail('firing drops the stop with bids left within its limit', 'seg_trigger', t, 'crossing bids remain');
+
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);
   await api.destroy();

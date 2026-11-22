@@ -34,6 +34,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - A deposit moves a hidden amount into a credit the Bridge holds and delivers its opening to the operator. The operator's custody transaction sweeps deposits into the public vault and pays settled withdrawals as credits, so only its net is public; the queue holds deposits' amounts as commitments.
   - Unswept deposits return to their refund address after `t_dep`; records custody leaves unpaid are claimable from the vault after `t_payout`.
 - **P2.14**: the token's bridge to L1. Aztec's standard escrow portal holds the ERC-20 on L1; the L2 bridge, the token's minter, claims deposits into public balances or straight into credits and burns exits from either.
+- **P2.15**: stop and take-profit triggers. Each market keeps a trigger tree beside its book; every mark tick proves whether a trigger is due and, while one is, the market takes no new orders until the operator fires the due triggers in price-time order as reduce-only IOC orders.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -43,12 +44,13 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | --- | --- |
 | `circuits/l3x_types` | Shared constants, Poseidon2 sponge, running values and node output, VK tree, DA sponge, `BatchHeader` |
 | `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
-| `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick |
+| `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick that also flags due triggers |
 | `circuits/seg_priority` | X-segment: Register, Deposit and ForcedWithdraw requests in queue order (refunds for missing accounts) |
-| `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
+| `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, PlaceTrigger, CancelTrigger, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
 | `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
+| `circuits/seg_trigger` | X-segment: the operator fires the next due stop or take-profit as a reduce-only IOC order and re-proves whether any is still due |
 | `circuits/client_auth` | P-lane client circuit (client slot 0): knowledge of the secret behind an account's auth binding, authorizing `msg` |
 | `circuits/client_p256` | P-lane client circuit (client slot 1): an ECDSA P-256 signature on `msg` by the key the auth binding commits to |
 | `circuits/client_webauthn` | P-lane client circuit (client slot 2): a WebAuthn passkey assertion whose challenge is `msg`, bound to the relying party |
@@ -194,6 +196,8 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.13: tests | 18 token TXE tests; 82 Bridge TXE tests; 1 more adversarial witness (79 in all); the exit test deposits through custody, receives payouts as credits, and refunds and reclaims deposits in desert mode. |
 | P2.14: token bridge | `ConfidentialTokenBridge` mints claimed L1 deposits into public balances or credits and burns exits; Aztec's `TokenPortal` escrows the ERC-20 on L1. |
 | P2.14: tests | 15 bridge TXE tests; an L1 round trip through deposits, claims, exits and Outbox withdrawals on the local network. |
+| P2.15: triggers | Trigger trees per market; ticks flag due triggers and block new orders; `seg_trigger` fires them in price-time order, reduce-only, keeping a remainder only when its matching steps run out. |
+| P2.15: tests | Native batch 9 fires a stop, removes a void stop and partly fills a take-profit; 8 more adversarial witnesses (87 in all). |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats

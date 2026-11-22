@@ -433,12 +433,72 @@ async function main() {
   const b8 = await settle(w8);
   assert(b8.header[0] === b7.header[1], 'batch 8 does not chain from batch 7');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the eight
+  // Batch 9 (P2.15): stop and take-profit triggers in market 0 (SPEC.md §6.5).
+  // - Alice (long 40) sets a stop-loss (sell 25 once the mark falls to 1700, no worse than 1690)
+  //   and a take-profit (sell 10 once it rises to 1800, no worse than 1790). Bob (short 30) sets a
+  //   stop, then cancels all, which voids it. Carol places a trigger and cancels it. A trigger
+  //   already due at the mark is refused.
+  // - The index falls to 1695: Alice's stop is due, so the market takes no new orders until it
+  //   fires, and Bob's order is refused. It fires against Dave's bid.
+  // - The index rises to 1780: Bob's void stop is due and is removed without effect. Carol bids 4
+  //   at 1795; at 1800 Alice's take-profit fires, fills Carol's 4 and drops the rest, as no other
+  //   bid lies within its limit.
+  await engine.beginBatch(9n, b8.end.priorityHead, b8.end.priorityCursor, b8.end.time);
+  const t9 = t8 + 100n;
+  const nx = (i: bigint) => engine.actv.get(i)!.nonce + 1n;
+  const triggersIn0 = () => engine.triggers[0].size;
+  const { PLACE_TRIGGER, CANCEL_TRIGGER } = X.KIND_ACT;
+  const { UP, DOWN } = X.DIR;
+  await engine.block(t9, [await update(0n, 1750n, 1750n, t9 - 1n)]);
+  const seq9 = engine.markets[0].nextSeq;
+  await engine.trade([
+    await act(alice, A, nx(A), PLACE_TRIGGER, [0n, ASK, 1690n, 25n, DOWN, 1700n]),
+    await act(alice, A, nx(A) + 1n, PLACE_TRIGGER, [0n, ASK, 1790n, 10n, UP, 1800n]),
+  ]);
+  await engine.trade([
+    await act(bob, B, nx(B), PLACE_TRIGGER, [0n, BID, 1820n, 30n, UP, 1780n]),
+    await act(carol, C, nx(C), PLACE_TRIGGER, [0n, ASK, 1700n, 5n, DOWN, 1720n]),
+  ]);
+  const rejected9 = engine.rejected.length;
+  await engine.trade([
+    await act(carol, C, nx(C), CANCEL_TRIGGER, [0n, DOWN, 1720n, seq9 + 3n]),
+    await act(alice, A, nx(A), PLACE_TRIGGER, [0n, ASK, 1700n, 5n, UP, 1740n]), // already due at 1750
+  ]);
+  assert(engine.rejected.length === rejected9 + 1 && engine.rejected.at(-1)!.reason === 'trigger already due', 'a due trigger was placed');
+  await engine.trade([await act(bob, B, nx(B), CANCEL_ALL, []), await act(dave, D, nx(D), PLACE, [0n, BID, 1695n, 30n, GTC, 0n])]);
+  assert(triggersIn0() === 3, 'three triggers rest in market 0');
+
+  await engine.block(t9 + 10n, [await update(0n, 1695n, 1695n, t9 + 9n)]);
+  assert(engine.markets[0].triggerPending, "alice's stop was not flagged");
+  await engine.trade([await act(bob, B, nx(B), PLACE, [0n, ASK, 1700n, 1n, IOC, 0n])]);
+  assert(engine.rejected.at(-1)!.reason === 'triggers are due in this market', 'an order traded past a due trigger');
+  await engine.fireTriggers([0]);
+  assert(!engine.markets[0].triggerPending && engine.accts.get(A)!.priv.positions[0].size === 15n, "alice's stop did not fire");
+
+  await engine.block(t9 + 20n, [await update(0n, 1780n, 1780n, t9 + 19n)]);
+  assert(engine.markets[0].triggerPending, "bob's void stop was not flagged");
+  const bob9 = show(engine.accts.get(B)!.priv);
+  await engine.fireTriggers([0]);
+  assert(show(engine.accts.get(B)!.priv) === bob9 && triggersIn0() === 1, "bob's void stop was not removed without effect");
+  await engine.trade([await act(carol, C, nx(C), PLACE, [0n, BID, 1795n, 4n, GTC, 0n])]);
+  await engine.block(t9 + 30n, [await update(0n, 1800n, 1800n, t9 + 29n)]);
+  await engine.fireTriggers([0]);
+  assert(triggersIn0() === 0 && !engine.markets[0].triggerPending, 'triggers left in market 0');
+  assert(engine.accts.get(A)!.priv.positions[0].size === 11n, "alice's take-profit filled more than the bids within its limit");
+  assert(Number(engine.rejected.length) === rejected9 + 2, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 9');
+  const w9 = await engine.endBatch();
+  log(`batch 9: ${w9.segments.map((s) => s.label).join(' | ')}; ${w9.daPayload.length} DA fields`);
+  const b9 = await settle(w9);
+  assert(b9.header[0] === b8.header[1], 'batch 9 does not chain from batch 8');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the nine
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7, b8].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b8.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b9.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
@@ -453,16 +513,16 @@ async function main() {
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 30n && pos(G).positions[0].size === 20n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 11n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 8 ${hex(b8.headerHash)}`);
+  log(`header of batch 9 ${hex(b9.headerHash)}`);
   await api.destroy();
 }
 

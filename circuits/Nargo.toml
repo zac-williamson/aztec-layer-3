@@ -16,6 +16,7 @@ members = [
     "seg_refresh",
     "seg_liquidate",
     "seg_forced",
+    "seg_trigger",
     "padding",
     "merge",
     "root",

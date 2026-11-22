@@ -2,7 +2,7 @@
 // margin, mark ticks and the book index.
 import * as M from './model.ts';
 
-export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n, MODIFY: 6n, TRANSFER: 7n, CANCEL_ALL: 8n } as const;
+export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n, MODIFY: 6n, TRANSFER: 7n, CANCEL_ALL: 8n, PLACE_TRIGGER: 9n, CANCEL_TRIGGER: 10n } as const;
 export const TIF = { GTC: 0n, IOC: 1n, FOK: 2n, POST_ONLY: 3n, GTT: 4n } as const;
 export const ACTION_PAYLOAD = 8;
 export const PPM = 1_000_000n;
@@ -211,3 +211,15 @@ export function takeover(a: M.AccountPriv, ins: M.AccountPriv, market: M.Market,
   if (abs(a2.collateral) >= MAX_COLLATERAL || abs(i2.collateral) >= MAX_COLLATERAL) throw new Error('collateral out of range');
   return { a: a2, ins: i2, sizes: { a: [apos.size, as] as const, ins: [ipos.size, is] as const }, dust: d1 + d2 };
 }
+
+// ---- Triggers (SPEC.md §6.5), mirroring l3x_exchange::trigger ----
+
+/** An UP trigger fires once the mark rises to its price, a DOWN trigger once it falls to it. */
+export const DIR = { DOWN: 0n, UP: 1n } as const;
+/** A resting trigger; `price` and `seq` locate it in the market's trigger tree. */
+export type Trigger = { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint; price: bigint; seq: bigint };
+export const triggerLeaf = (h: M.H, t: Pick<Trigger, 'dir' | 'side' | 'account' | 'lots' | 'limit' | 'epoch'>) =>
+  t.lots === 0n ? Promise.resolve(0n) : h([M.DS.TRIGGER, t.dir, t.side, t.account, t.lots, t.limit, t.epoch]);
+export const triggerIndex = (dir: bigint, price: bigint, seq: bigint) => orderIndex(dir === DIR.UP ? M.SIDE.ASK : M.SIDE.BID, price, seq);
+/** Whether a trigger is due at `mark`, given the lowest UP and highest DOWN trigger prices (0: none). */
+export const due = (up: bigint, down: bigint, mark: bigint) => (up > 0n && up <= mark) || (down > 0n && down >= mark);

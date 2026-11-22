@@ -42,7 +42,7 @@ async function main() {
   writeJson(join(OUT, 'batch-1.json'), { shape: batch.shape, header: batch.header, headerHash: batch.headerHash, daPayload: batch.daPayload });
   const R = 'noir-rollup-no-zk';
   const gates = Object.fromEntries(
-    ['seg_block', 'seg_priority', 'seg_trade', 'seg_refresh', 'seg_liquidate', 'padding', 'merge', 'tube'].map((p) => [p, ultraGates(p, R)]).concat([['root', ultraGates('root', 'noir-recursive')]]),
+    ['seg_block', 'seg_priority', 'seg_trade', 'seg_refresh', 'seg_liquidate', 'seg_forced', 'seg_trigger', 'padding', 'merge', 'tube'].map((p) => [p, ultraGates(p, R)]).concat([['root', ultraGates('root', 'noir-recursive')]]),
   );
   const measurements = {
     threads: cpus().length,

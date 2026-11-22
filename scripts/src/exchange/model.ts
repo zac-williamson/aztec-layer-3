@@ -42,6 +42,8 @@ export const DS = {
   CLEAN: 53n,
   DEPAMT: 54n,
   DEP: 55n,
+  TRIGGER: 56n,
+  FIRE: 57n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -55,7 +57,7 @@ export const KEY_SLOTS = 256;
 /** The key id of actions the master key signs. */
 export const MASTER_KEY = 256n;
 export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n } as const;
-export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n } as const;
+export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n, TRIGGER: 7n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
 export const CHANGE_ENTRY_LEN = 3 + PLAINTEXT_LEN;
@@ -87,6 +89,9 @@ export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; op
 export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint };
 export type Market = {
   bookRoot: bigint;
+  /** The market's trigger tree, and whether a trigger is due at the mark (SPEC.md §6.5). */
+  triggerRoot: bigint;
+  triggerPending: boolean;
   nextSeq: bigint;
   indexPrice: bigint;
   indexTime: bigint;
@@ -161,8 +166,10 @@ export const keyLeaf = (h: H, k: Key) =>
   k.pkX === 0n && k.pkY === 0n && k.nonce === 0n ? Promise.resolve(0n) : h([DS.KEY, k.pkX, k.pkY, k.marketMask, k.maxNotional, k.expiry, k.nonce]);
 export const copyPriv = (q: AccountPriv): AccountPriv => ({ ...q, positions: q.positions.map((p) => ({ ...p })) });
 export const copyActivity = (a: Activity): Activity => ({ ...a, openBid: [...a.openBid], openAsk: [...a.openAsk] });
-export const genesisMarket = (bookRoot: bigint): Market => ({
-  bookRoot,
+export const genesisMarket = (emptyRoot: bigint): Market => ({
+  bookRoot: emptyRoot,
+  triggerRoot: emptyRoot,
+  triggerPending: false,
   nextSeq: 0n,
   indexPrice: 0n,
   indexTime: 0n,
@@ -219,6 +226,8 @@ export const marketHash = (h: H, m: Market) =>
   h([
     DS.MKT,
     m.bookRoot,
+    m.triggerRoot,
+    m.triggerPending ? 1n : 0n,
     m.nextSeq,
     m.indexPrice,
     m.indexTime,
@@ -324,6 +333,8 @@ export const activityToNoir = (a: Activity) => ({
 });
 export const marketToNoir = (m: Market) => ({
   book_root: hex(m.bookRoot),
+  trigger_root: hex(m.triggerRoot),
+  trigger_pending: m.triggerPending,
   next_seq: m.nextSeq.toString(),
   index_price: m.indexPrice.toString(),
   index_time: m.indexTime.toString(),
