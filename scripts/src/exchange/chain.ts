@@ -11,7 +11,7 @@ import { ROOT } from '../lib.ts';
 
 export const DA_LOG_TAG = 0x6c33782e64612e7631n;
 
-export type ArtifactName = 'l3x_bridge-L3XBridge' | 'ctoken-ConfidentialToken';
+export type ArtifactName = 'l3x_bridge-L3XBridge' | 'ctoken-ConfidentialToken' | 'ctbridge-ConfidentialTokenBridge';
 
 export function rawArtifact(name: ArtifactName): any {
   return JSON.parse(readFileSync(join(ROOT, 'contracts', 'target', `${name}.json`), 'utf8'));

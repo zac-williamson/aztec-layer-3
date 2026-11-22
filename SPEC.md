@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.11, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), and C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.12, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), and the token's bridge to L1 (P2.14), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -572,7 +572,7 @@ If a record is unpaid `T_payout` (default 24 h) after its batch settled, anyone 
 
 ### 10.5 Collateral token [D7]
 
-The collateral is a token built for L3X: **amounts hidden, addresses public**. It is confidential in the same sense as the exchange (§1): who pays whom is public, how much is not. The Shield bridge, which makes holdings private, does not fit. The token's L1 bridges are not built yet; the token's `minter` stands in for them.
+The collateral is a token built for L3X: **amounts hidden, addresses public**. It is confidential in the same sense as the exchange (§1): who pays whom is public, how much is not. The Shield bridge, which makes holdings private, does not fit. The token's `minter` is its bridge (§10.6); tests that need no L1 use an operator as the minter instead.
 
 **Balances.** An address holds a public balance, a plain amount as in an ERC-20, and a confidential balance, a set of credits.
 
@@ -604,6 +604,29 @@ spent(c)     = H(DS_SPENT, c)                            nullifier, emitted when
 **Parties.** Every confidential payment emits a plaintext log `(tag = "ct.parties", from, to)`. Public balance changes emit `PublicTransfer(from, to, amount)`, with the token itself standing for the confidential side of `shield`, `unshield` and `settle`.
 
 **Limits.** A private call may emit 16 nullifiers. Each input emits one (`spent`) and each output three (`created`, its delivered event's commitment and its constrained-delivery sequence nullifier), so `settle` with 4 inputs and 4 outputs emits exactly 16. That caps one custody transaction at 4 deposits and 4 payouts.
+
+### 10.6 Token bridge [D7]
+
+The token's bridge to L1 has two halves.
+
+- **L1: an escrow portal**, Aztec's standard `TokenPortal`. It holds the underlying ERC-20.
+  - `depositToAztecPublic(to, amount, secret_hash)` locks the amount and sends an L1-to-L2 message with content `sha256ToField(mint_to_public(to, amount))`.
+  - `depositToAztecPrivate(amount, secret_hash)` does the same without naming a recipient: `sha256ToField(mint_to_private(amount))`.
+  - `withdraw(recipient, amount, with_caller, epoch, n_checkpoints, leaf, path)` consumes the L2-to-L1 message `sha256ToField(withdraw(recipient, amount, caller))` from the Outbox and releases the amount.
+- **L2: `ConfidentialTokenBridge`**, the token's minter.
+
+| Function | Context | Effect |
+| --- | --- | --- |
+| `claim_public(to, amount, secret, leaf)` | public | consumes `mint_to_public(to, amount)` and mints into the public balance of `to` |
+| `claim_confidential(to, amount, blind, secret, leaf)` | private | consumes `mint_to_private(amount)` and mints a credit of `to`, delivered by constrained delivery |
+| `exit_public(recipient, amount, caller_on_l1)` | public | burns from the caller's public balance and sends `withdraw(recipient, amount, caller_on_l1)` |
+| `exit_confidential(recipient, amount, credits, change_blind, caller_on_l1)` | private | burns from the caller's credits, returning change, and sends the same message |
+
+- A claim needs the message's secret, so only whoever holds it claims; a public claim pays only the `to` the deposit named.
+- The token trusts its minter in three functions: `burn_public(from, ·)`, `mint_confidential` and `burn_confidential(from, ·)`. The bridge always passes its own caller as `from`, so it burns only its caller's funds.
+- **Deployment.** Each contract needs the other's address. The bridge is deployed with the portal's address; the token with the bridge as its minter; the bridge's deployer then binds the token, once; and the portal is initialized with the L2 bridge.
+- **Privacy.** Amounts are public on L1 in both directions, so the bridge hides no amount. A deposit claimed into a credit saves a separate shield. `depositToAztecPrivate` leaves the recipient unnamed on L1, but the token's parties log publishes it at the claim.
+- **Why the standard portal.** It is a plain escrow with fixed message formats, so the token-specific rules all live on L2 and the L1 contract needs no audit beyond Aztec's. The Shield bridge, which makes holdings private, is out of scope [D7].
 
 ## 11. Sequencing and receipts
 
@@ -869,6 +892,7 @@ P2 is built in increments, each leaving every test green.
 - P2.11: the risk sweep (§8.7), checked at refresh.
 - P2.12: a WebAuthn passkey client circuit.
 - P2.13: C1 custody over the D7 collateral token.
+- P2.14: the collateral token's bridge to L1.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1269,6 +1293,20 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Claims.** `claim_withdrawal` waits `T_payout` outside desert mode and pays into the recipient's public balance. It and `desert_refund` fold their hashes in the private phase.
 - **Deployment size.** The Bridge's public bytecode grew to 1,664 fields, past the local network's per-transaction DA admission limit (the deployment needed 56,768 of 55,836 DA gas). Moving the claim's path, the refund's entry and the custody event out of public code brought it to 1,598 fields.
 
+**Token bridge** (P2.14, §10.6):
+
+- **Contracts.** `ConfidentialTokenBridge` (`contracts/ctbridge`) is the token's minter, and Aztec's prebuilt `TokenPortal` and `TestERC20` serve as the L1 half in tests. The token gains `mint_confidential`, `burn_public` and `burn_confidential`, all minter-only.
+- **Messages.** The bridge rebuilds the portal's message contents in the circuit: the ABI encoding of each pseudo-call with its 4-byte selector, then SHA-256 truncated to a field.
+
+**Tests** (P2.14):
+
+- **Bridge TXE:** 15 tests, with TXE injecting the portal's messages: public claims pay only the named recipient, once, and only for the deposited amount from the portal; confidential claims mint a credit, once; exits burn only the caller's balance or credits and return change; only the bridge mints credits or burns; the deployer binds the token once.
+- **L1 round trip** (`npm run l1bridge`), on the local network with its anvil L1 and real client proofs:
+  - Alice deposits 1,000 on L1 to her L2 public balance and claims it, and 600 without a recipient, which she claims as a credit.
+  - She exits 400 of her public balance and 250 of her credit; each exit's message reaches an Outbox root and the portal releases the ERC-20 on L1. The credit's 350 of change stays on L2.
+  - The portal ends holding 950, exactly the supply on L2.
+  - Claims take 5.9 s (public) and 7.5 s (confidential) with client proving.
+
 **Tests** (P2.13):
 
 - **Token TXE:** 18 tests: shielding, payment with change, unshielding, settlement against a public balance (four payees, the 16-nullifier limit), conservation, double spends, another owner's credit, an invented credit, payment beyond the inputs, and authorization for exactly one call.
@@ -1338,8 +1376,9 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments:**
 
-1. The collateral token's L1 bridges (D7): a portal that mints into public balances on an L1 deposit and burns on withdrawal.
-2. From P3: the ranking of ADL counterparties (§8.5).
+1. From P3: the ranking of ADL counterparties (§8.5).
+
+P2's remaining exit criteria are outside this repository: a load test at the §14 targets on a testnet, and an external audit.
 
 ## 16. Decisions
 
@@ -1353,7 +1392,7 @@ All resolved on 2026-11-20. The draft default was adopted for every decision exc
 | D4 | Operator | One bonded operator that sees plaintext | Committee with threshold-encrypted order flow |
 | D5 | Matching | Continuous | Frequent batch auctions per L3 block |
 | D6 | Oracle | k-of-n signed updates from an external provider (provider not yet named) | An Aztec-native feed |
-| D7 | Collateral | A new token type with purpose-built bridges, built for this system: amounts hidden, addresses public (confirmed 2026-11-22). The token is specified in §10.5 and built (P2.13); its L1 bridges are not built yet. The Shield bridge is out of scope. | Existing Aztec stablecoins |
+| D7 | Collateral | A new token type with purpose-built bridges, built for this system: amounts hidden, addresses public (confirmed 2026-11-22). The token (§10.5) and its bridge (§10.6: Aztec's standard escrow portal on L1, a purpose-built minter on L2) are built (P2.13, P2.14). The Shield bridge is out of scope. | Existing Aztec stablecoins |
 | D8 | v1 scope | Perpetuals only | Perpetuals and spot |
 | D9 | Client-proof lane | Master authorization, key grants, withdrawals, credentials | Per-order proofs |
 | D10 | Settlement cadence | One batch per Aztec slot | One per L2 block |

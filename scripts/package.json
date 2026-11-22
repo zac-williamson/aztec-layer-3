@@ -12,6 +12,7 @@
     "m1": "node src/m1.ts",
     "native": "node src/exchange/native.ts",
     "e2e": "node src/exchange/e2e.ts",
+    "l1bridge": "node src/exchange/l1bridge.ts",
     "adversarial": "node src/exchange/adversarial.ts"
   },
   "dependencies": {

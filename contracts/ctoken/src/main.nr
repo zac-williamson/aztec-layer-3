@@ -87,6 +87,15 @@ pub contract ConfidentialToken {
         self.emit(PublicTransfer { from, to: AztecAddress::zero(), amount });
     }
 
+    /// The minter burns from the public balance of `from`, the account its own caller is (SPEC.md
+    /// §10.6): the token trusts its bridge, whose code fixes `from`.
+    #[external("public")]
+    fn burn_public(from: AztecAddress, amount: u128) {
+        assert(self.msg_sender() == self.storage.minter.read(), "not minter");
+        self.internal.sub_public(from, amount);
+        self.emit(PublicTransfer { from, to: AztecAddress::zero(), amount });
+    }
+
     #[external("public")]
     fn transfer_public(to: AztecAddress, amount: u128) {
         let from = self.msg_sender();
@@ -164,6 +173,43 @@ pub contract ConfidentialToken {
         }
         emit_parties(self.context, from, to);
         credit
+    }
+
+    /// The minter (the token's bridge) mints a claimed deposit straight into a credit of `to`, with
+    /// blind `blind`, delivered to `to` by constrained delivery. The amount is public on L1 anyway;
+    /// minting into a credit saves the owner a separate shield.
+    #[external("private")]
+    fn mint_confidential(to: AztecAddress, amount: u128, blind: Field) -> Field {
+        let minter = self.storage.minter.read();
+        assert(self.msg_sender() == minter, "not minter");
+        assert(amount > 0, "zero amount");
+        let credit = create(self.context, to, amount, blind);
+        self.emit(CreditReceived { from: minter, amount, blind }).deliver_to(
+            to,
+            MessageDelivery::onchain_constrained(),
+        );
+        emit_parties(self.context, minter, to);
+        credit
+    }
+
+    /// The minter burns `amount` from credits of `from`, the account its own caller is (SPEC.md
+    /// §10.6), and returns the rest to `from` as change.
+    #[external("private")]
+    fn burn_confidential(from: AztecAddress, amount: u128, credits: [Credit; TRANSFER_INPUTS], change_blind: Field) {
+        let minter = self.storage.minter.read();
+        assert(self.msg_sender() == minter, "not minter");
+        assert(amount > 0, "zero amount");
+        let total = spend(self.context, self.address, from, credits);
+        assert(total >= amount, "insufficient credits");
+        let change = total - amount;
+        if change > 0 {
+            let _ = create(self.context, from, change, change_blind);
+            self.emit(CreditReceived { from, amount: change, blind: change_blind }).deliver_to(
+                from,
+                MessageDelivery::onchain_unconstrained(),
+            );
+        }
+        emit_parties(self.context, from, minter);
     }
 
     /// Pays `amount` from the caller's credits into the public balance of `to`; the amount becomes

@@ -33,6 +33,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - The token keeps public balances and credits: hidden-amount commitments that appear on chain only as a created and a spent nullifier, spendable only by a call from their owner, so contracts hold them without keys.
   - A deposit moves a hidden amount into a credit the Bridge holds and delivers its opening to the operator. The operator's custody transaction sweeps deposits into the public vault and pays settled withdrawals as credits, so only its net is public; the queue holds deposits' amounts as commitments.
   - Unswept deposits return to their refund address after `t_dep`; records custody leaves unpaid are claimable from the vault after `t_payout`.
+- **P2.14**: the token's bridge to L1. Aztec's standard escrow portal holds the ERC-20 on L1; the L2 bridge, the token's minter, claims deposits into public balances or straight into credits and burns exits from either.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -62,6 +63,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/vendor/bb_proof_verification` | Vendored from aztec-packages v6.0.0 (Apache-2.0) |
 | `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C1 deposits, custody and reclaim, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
 | `contracts/ctoken` | `ConfidentialToken`, the D7 collateral token: public balances and hidden-amount credits, with every payment's parties public; TXE tests |
+| `contracts/ctbridge` | `ConfidentialTokenBridge`, the token's minter and the L2 half of its bridge to L1 (Aztec's `TokenPortal` is the L1 half); TXE tests |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
 | `scripts/src/exchange` | Engine (mirrors the circuits and builds witnesses), trees, Grumpkin Schnorr, DA decoding, exit client, and the exchange tests |
 | `scripts/out` | Generated: VK manifest, batch, measurements and settlement reports (git-ignored) |
@@ -138,10 +140,16 @@ This runs the exit test on an in-process 6.0.0 local network, with real client-s
 It writes `scripts/out/e2e.json`.
 
 ```bash
+npm run l1bridge
+```
+
+This runs the token's bridge round trip on a local network with its anvil L1: public and confidential deposits from L1 claimed on L2, and public and confidential exits released by the portal on L1. It writes `scripts/out/l1bridge.json`.
+
+```bash
 cd contracts && aztec compile && aztec test
 ```
 
-This compiles the token and the Bridge and runs their TXE tests.
+This compiles the token, its bridge and the exchange Bridge and runs their TXE tests.
 
 ## Status
 
@@ -184,7 +192,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.12: tests | Native batch 8 grants a session key by passkey; 4 more adversarial witnesses (78 in all); the simulated authenticator agrees with Node's ECDSA verifier. |
 | P2.13: custody | The D7 token (credits as nullifier pairs, constrained delivery of openings, plaintext parties); deposits into Bridge-held credits; custody netting up to four deposits and four payouts against the vault; reclaim after `t_dep`; claims after `t_payout`; deposit amounts committed in the queue; no withdrawal total in the header. |
 | P2.13: tests | 18 token TXE tests; 82 Bridge TXE tests; 1 more adversarial witness (79 in all); the exit test deposits through custody, receives payouts as credits, and refunds and reclaims deposits in desert mode. |
-| P2: next | The collateral token's L1 bridges; from P3, ADL ranking. |
+| P2.14: token bridge | `ConfidentialTokenBridge` mints claimed L1 deposits into public balances or credits and burns exits; Aztec's `TokenPortal` escrows the ERC-20 on L1. |
+| P2.14: tests | 15 bridge TXE tests; an L1 round trip through deposits, claims, exits and Outbox withdrawals on the local network. |
+| P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats
 
