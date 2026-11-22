@@ -263,10 +263,10 @@ async function main() {
 
   // Batch 6: client-proof actions (SPEC.md §7.1, §7.4). Grace registers in lane P: her master
   // authorization is the client circuit with her auth binding, so no Schnorr key controls her
-  // account. A client proof grants a session key for market 0, which buys from Bob; a second
-  // proof, in a later P-segment, revokes it. The engine refuses a proof applied to Alice's account
-  // (lane S), a replayed nonce, a withdrawal any Schnorr key signs for Grace's account, and the
-  // revoked key's next order.
+  // account. A client proof grants a session key for market 0, which buys from Bob; in a later
+  // P-segment, one proof revokes it and another withdraws 100,000. The engine refuses a proof
+  // applied to Alice's account (lane S), a replayed nonce, a withdrawal any Schnorr key signs for
+  // Grace's account, a proven withdrawal beyond her collateral, and the revoked key's next order.
   const grace = { secret: randomField(), addr: randomField(), keys: await keysFromSeed(h, 707n) };
   const G = 8n;
   const graceAuth = await M.masterAuthP(h, prover.clientVkHash, await M.authBinding(h, grace.secret));
@@ -295,15 +295,22 @@ async function main() {
     await bySessG(1n, PLACE, [0n, BID, 1755n, 20n, IOC, 0n]), // buys Bob's 20
     await act(grace.keys, G, 2n, WITHDRAW, [100n, grace.addr]), // no Schnorr key is Grace's master key
   ]);
-  await engine.proven([await byProof(G, 2n, REVOKE_KEY, [0n])]);
+  await engine.proven([
+    await byProof(G, 2n, REVOKE_KEY, [0n]),
+    await byProof(G, 3n, WITHDRAW, [100_000n, grace.addr]),
+    await byProof(G, 4n, WITHDRAW, [10_000_000n, grace.addr]), // more than her collateral
+  ]);
+  netDeposits -= 100_000n;
   await engine.trade([await bySessG(2n, PLACE, [0n, BID, 1700n, 1n, GTC, 0n])]); // revoked
   const reasons6 = engine.rejected.slice(9).map((r) => r.reason);
   log(`engine refused: ${reasons6.join('; ')}`);
   assert(
-    reasons6.join('|') === "client proof does not control the account|nonce|signing key is not the account's|signing key is not the slot's",
+    reasons6.join('|') ===
+      "client proof does not control the account|nonce|signing key is not the account's|collateral below the amount|signing key is not the slot's",
     'unexpected batch 6 rejections',
   );
-  assert(engine.accts.get(G)!.priv.positions[0].size === 20n && engine.keyOf(G, 0).pkX === 0n && engine.actv.get(G)!.nonce === 2n, 'lane-P key grant, trade and revocation');
+  assert(engine.accts.get(G)!.priv.positions[0].size === 20n && engine.keyOf(G, 0).pkX === 0n && engine.actv.get(G)!.nonce === 3n, 'lane-P key grant, trade, revocation and withdrawal');
+  assert(engine.wdRecords.length === 1, 'the proven withdrawal is the batch\'s only record');
   await engine.maintenance({ sweep: true, refresh: 4 });
   checkConservation(engine, netDeposits, 'batch 6');
   const w6 = await engine.endBatch();

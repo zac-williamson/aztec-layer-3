@@ -2,11 +2,11 @@ use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Key, master_auth_of},
     book::{Order, order_index, replace, Sibling, SIDE_ASK, SIDE_BID, walk},
     consts::{
-        ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, DS_KEY_NODE, DS_WD_CHAIN, DS_WDSALT, KEY_SLOTS,
-        KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_COLLATERAL, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
-        MAX_PRICE, PPM, TAG_WD,
+        ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, DS_KEY_NODE, KEY_SLOTS,
+        KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
+        MAX_PRICE, PPM,
     },
-    da::{absorb, emit_change, open_segment, segment_nonce},
+    da::{emit_change, open_segment, segment_nonce},
     matching::{assert_no_crossing, Fill, match_order, Taker},
     params::Params,
     sig::{assert_signed, Signature},
@@ -14,10 +14,9 @@ use l3x_exchange::{
     trade::{
         abs, ACTION_PAYLOAD, action_msg, covers, equity, exposure_fresh, initial_margin, KIND_ADD_KEY,
         KIND_CANCEL, KIND_PLACE, KIND_REVOKE_KEY, KIND_WITHDRAW, TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC,
-        TIF_POST_ONLY, worst, write_key_slot,
+        TIF_POST_ONLY, withdraw as withdraw_collateral, worst, write_key_slot,
     },
     tree::{merkle_root, update},
-    withdrawal_record,
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, receipt_leaf, receipt_node, Running};
 
@@ -172,39 +171,27 @@ fn set_key(state: State, a: Action, act_auth: Activity) -> State {
 /// record the vault pays to `recipient` once the batch settles.
 fn withdraw(state: State, running: Running, a: Action, act: Activity, da_nonce: Field, params: Params) -> (State, Running) {
     let mut st = state;
-    let mut r = running;
     let idx = a.account_index;
-    let amount = a.p[0] as u64;
-    let recipient = a.p[1];
-    assert((amount as Field == a.p[0]) & (amount > 0) & (amount < MAX_COLLATERAL), "withdrawal amount out of range");
-    let old = a.taker_priv;
-    assert(old.collateral >= amount as i64, "collateral below the amount");
-    assert(
-        exposure_fresh(old, a.taker_actv, st.markets, params.max_age, r.time),
-        "index too old for a withdrawal",
+    let (new_leaf, r) = withdraw_collateral(
+        running,
+        st.markets,
+        params,
+        idx,
+        a.taker_pub,
+        a.taker_priv,
+        a.taker_actv,
+        a.taker_k_enc,
+        a.p,
+        da_nonce,
     );
-    let after = equity(old, st.markets) - amount as i64;
-    assert(covers(after, initial_margin(old, a.taker_actv, st.markets, params)), "insufficient margin");
-
-    assert(enc_commitment(a.taker_k_enc) == a.taker_pub.enc_commitment, "taker k_enc");
-    let mut p = old;
-    p.collateral = old.collateral - amount as i64;
-    p.blind = blind(a.taker_k_enc, idx, da_nonce, r.da_len);
-    let new_leaf = account_leaf(a.taker_pub, p);
-    st.accounts_root =
-        update(DS_ACCT_NODE, st.accounts_root, idx, account_leaf(a.taker_pub, old), new_leaf, a.taker_acct_path);
-    r = emit_change(r, idx, new_leaf, p, a.taker_k_enc, da_nonce);
-
-    // The salt makes the record unguessable from public data (SPEC.md §10.4); the owner can
-    // rebuild it from its key.
-    let index = r.withdrawals_count;
-    let salt = hash([DS_WDSALT, a.taker_k_enc, r.batch as Field, index as Field]);
-    let record = withdrawal_record(recipient, amount, salt, r.batch, index);
-    r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
-    r.withdrawals_count = index + 1;
-    r.withdrawals_amount += amount;
-    r = absorb(absorb(r, TAG_WD), record);
-
+    st.accounts_root = update(
+        DS_ACCT_NODE,
+        st.accounts_root,
+        idx,
+        account_leaf(a.taker_pub, a.taker_priv),
+        new_leaf,
+        a.taker_acct_path,
+    );
     st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     (st, r)
 }

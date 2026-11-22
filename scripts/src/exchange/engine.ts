@@ -803,8 +803,9 @@ export class Engine {
   /**
    * Executes master actions authorized by client proofs, CLIENT_PER_SEGMENT per P-segment. An
    * action the rules refuse (its proof does not control the account or authorizes another action,
-   * a stale nonce, a kind other than AddKey and RevokeKey, a bad key slot) is dropped and recorded
-   * in `rejected`, as the operator would refuse it before aggregating its proof.
+   * a stale nonce, a kind other than AddKey, RevokeKey and Withdraw, a bad key slot, a withdrawal
+   * the margin does not cover) is dropped and recorded in `rejected`, as the operator would refuse
+   * it before aggregating its proof.
    */
   async proven(actions: ProvenAction[]) {
     const queue = [...actions];
@@ -813,34 +814,45 @@ export class Engine {
 
   /**
    * One P-segment: takes actions from the front of `queue` until CLIENT_PER_SEGMENT apply. The
-   * segment's aggregation folds the applied proofs' public inputs, as agg_app does; the action log
-   * records the aggregation. A segment with nothing to apply is dropped unless `emitEmpty`.
+   * segment's aggregation folds the applied proofs' public inputs, as agg_app does, and the action
+   * log records it; the segment nonce, and so every withdrawal's blind, depends on that log. So a
+   * dry run first decides which actions apply (none depends on where the DA segment sits), then
+   * the segment is logged, opened and executed. A segment with nothing to apply is dropped unless
+   * `emitEmpty`.
    */
   async provenSegment(queue: ProvenAction[], emitEmpty = false) {
     assert(this.clientVkHash !== 0n, 'client-proof actions need the client VK hash (Engine.create)');
     const start = copyRunning(this.running);
     const before = this.state();
-    const items: unknown[] = [];
+    const dry = this.snapshot();
     const applied: ProvenAction[] = [];
     while (queue.length && applied.length < CLIENT_PER_SEGMENT) {
       const a = queue.shift()!;
       const snap = this.snapshot();
       try {
-        items.push(await this.execProven(a));
+        await this.execProven(a, 0n);
         applied.push(a);
       } catch (e: any) {
         this.restore(snap);
         this.rejected.push({ action: a, reason: String(e.message ?? e) });
       }
     }
+    this.restore(dry);
     if (!applied.length && !emitEmpty) return;
     let acc = 0n;
     for (const a of applied) acc = await this.h([DS0.AGG, acc, this.clientVkHash, ...a.proof.publicInputs.map((x) => BigInt(x))]);
-    this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, acc, BigInt(applied.length));
-    const names = (a: ProvenAction) => `${a.kind === X.KIND_ACT.ADD_KEY ? 'add' : 'revoke'} key ${a.account}/${a.p[0]}`;
+    const r = this.running;
+    r.actionLog = await M.logAppend(this.h, r.actionLog, acc, BigInt(applied.length));
+    const daNonce = await M.segmentNonce(this.h, start.batch, r.actionLog, start.daLen);
+    await this.absorb(M.TAG.SEG);
+    await this.absorb(daNonce);
+    const items: unknown[] = [];
+    for (const a of applied) items.push(await this.execProven(a, daNonce));
+    const name = (a: ProvenAction) =>
+      a.kind === X.KIND_ACT.WITHDRAW ? `withdraw ${a.account}` : `${a.kind === X.KIND_ACT.ADD_KEY ? 'add' : 'revoke'} key ${a.account}/${a.p[0]}`;
     await this.finishSegment(
       'tube',
-      `proven [${applied.map(names).join(', ')}]`,
+      `proven [${applied.map(name).join(', ')}]`,
       {
         ...this.base(start, before),
         agg: { actions_hash: hex(acc), count: applied.length },
@@ -851,8 +863,8 @@ export class Engine {
     );
   }
 
-  /** The tube's checks, in its order, then the key slot write (shared with seg_trade's set_key). */
-  private async execProven(a: ProvenAction) {
+  /** The tube's checks, in its order, then the key slot write or the withdrawal (shared with seg_trade). */
+  private async execProven(a: ProvenAction, daNonce: bigint) {
     const [msg, account, binding] = a.proof.publicInputs.map((x) => BigInt(x));
     if (account !== a.account) throw new Error('the proof is for another account');
     const rec = this.accts.get(account);
@@ -863,10 +875,15 @@ export class Engine {
     }
     if (msg !== (await X.actionMsg(this.h, this.domain, a.kind, account, M.MASTER_KEY, a.nonce, a.p))) throw new Error('proof authorizes another action');
     if (oldAct.nonce + 1n !== a.nonce) throw new Error('nonce');
-    if (a.kind !== X.KIND_ACT.ADD_KEY && a.kind !== X.KIND_ACT.REVOKE_KEY) throw new Error('client proofs grant and revoke session keys');
+    const { ADD_KEY, REVOKE_KEY, WITHDRAW } = X.KIND_ACT;
+    if (a.kind !== ADD_KEY && a.kind !== REVOKE_KEY && a.kind !== WITHDRAW) throw new Error('client proofs only manage session keys and withdraw');
     const act = M.copyActivity(oldAct);
     act.nonce = a.nonce;
-    const w = await this.execSetKey(a, act);
+    const priv = M.privToNoir(rec.priv);
+    const w =
+      a.kind === WITHDRAW
+        ? { key: M.keyToNoir(M.emptyKey()), key_path: zeros(M.KEYS_HEIGHT), ...(await this.execWithdraw(a, rec, act, daNonce)) }
+        : await this.execSetKey(a, act);
     return {
       msg: hex(msg),
       account_index: hex(account),
@@ -875,8 +892,9 @@ export class Engine {
       nonce: a.nonce.toString(),
       p: a.p.map(hex),
       acct_pub: M.pubToNoir(rec.pub),
-      acct_priv: M.privToNoir(rec.priv),
+      acct_priv: priv,
       acct_path: w.taker_acct_path,
+      k_enc: hex(rec.kEnc),
       actv: M.activityToNoir(oldAct),
       actv_path: w.taker_actv_path,
       key: w.key,
@@ -895,6 +913,7 @@ export class Engine {
       acct_pub: M.pubToNoir(M.zeroPub()),
       acct_priv: M.privToNoir(M.emptyPriv()),
       acct_path: zeros(M.ACCOUNTS_HEIGHT),
+      k_enc: hex(0n),
       actv: M.activityToNoir(M.newActivity()),
       actv_path: zeros(M.ACCOUNTS_HEIGHT),
       key: M.keyToNoir(M.emptyKey()),
@@ -1221,7 +1240,7 @@ export class Engine {
     return { taker_acct_path: acctPath, taker_actv_path: actvPath, rest_path: restPath, cancel_lots: o.lots.toString(), cancel_expiry: o.expiry.toString() };
   }
 
-  private async execWithdraw(a: SignedAction, rec: AccountRecord, act: M.Activity, daNonce: bigint) {
+  private async execWithdraw(a: Pick<SignedAction, 'account' | 'p'>, rec: AccountRecord, act: M.Activity, daNonce: bigint) {
     const [amount, recipient] = a.p;
     if (amount <= 0n || amount >= X.MAX_COLLATERAL) throw new Error('withdrawal amount out of range');
     const old = M.copyPriv(rec.priv);

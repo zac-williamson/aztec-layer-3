@@ -368,8 +368,8 @@ async function main() {
   await expectFail('forced cancel-all leaves cancellable orders', 'seg_forced', t, 'forced cancel-all must cancel every order it can');
 
   // Client-proof actions (SPEC.md §7.4). S is a lane-P account, U a lane-S one. An honest P-segment
-  // grants S two session keys; the tampered tube witnesses are what an operator would need to apply
-  // actions no client proof authorized. The tube runs without its Chonk proof here (witness
+  // grants S two session keys and withdraws 1,000 of its collateral; the tampered tube witnesses are
+  // what an operator would need to apply actions no client proof authorized. The tube runs without its Chonk proof here (witness
   // generation does not check it), so each case shows the check the tube itself makes.
   const PE = await Engine.create(api, params, prover.vkTreeRoot, protocol, prover.clientVkHash);
   const pSecret = randomField();
@@ -380,7 +380,9 @@ async function main() {
   for (const [i, k] of pu.entries()) {
     const encC = await M.encCommitment(h, k.kEnc);
     PE.keyring.set(encC, k.kEnc);
-    preqs.push({ kind: M.KIND.REGISTER, a: pAuth[i], b: encC, sender: randomField(), time: now });
+    const sender = randomField();
+    preqs.push({ kind: M.KIND.REGISTER, a: pAuth[i], b: encC, sender, time: now });
+    preqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: 50_000n, sender, time: now });
   }
   await PE.beginBatch(1n, 0n, 0n, 0n);
   await PE.block(now);
@@ -392,6 +394,7 @@ async function main() {
   await PE.proven([
     await byClient(S, 1n, ADD_KEY, [0n, pSess.pk.x, pSess.pk.y, 0b01n, 100_000n, now + 1000n]),
     await byClient(S, 2n, ADD_KEY, [1n, pSess.pk.x, pSess.pk.y, 0b10n, 100_000n, now + 1000n]),
+    await byClient(S, 3n, WITHDRAW, [1000n, 77n]),
   ]);
   assert(PE.rejected.length === 0, `client-proof setup rejected: ${PE.rejected.map((r) => r.reason)}`);
   const tube = clone(PE.segments[ps].inputs) as any;
@@ -425,9 +428,18 @@ async function main() {
   t.actions[1] = { ...t.actions[1], msg: t.actions[0].msg, kind: t.actions[0].kind, nonce: t.actions[0].nonce, p: t.actions[0].p };
   await expectFail('client proof replayed', 'tube', runTube(await reaggregate(t)), 'nonce');
   t = clone(tube);
-  t.actions[0].kind = hex(WITHDRAW);
-  t.actions[0].p = [1000n, 77n, 0n, 0n, 0n, 0n, 0n, 0n].map(hex);
-  await expectFail('client proof withdrawing', 'tube', runTube(await reaggregate(await remsg(t, 0))), 'client proofs grant and revoke session keys');
+  t.actions[0].kind = hex(PLACE);
+  t.actions[0].p = [0n, BID, 2000n, 1n, GTC, 0n, 0n, 0n].map(hex);
+  await expectFail('client proof placing an order', 'tube', runTube(await reaggregate(await remsg(t, 0))), 'client proofs only manage session keys and withdraw');
+  t = clone(tube);
+  t.actions[2].p[1] = hex(78n);
+  await expectFail('client-proof withdrawal to another recipient', 'tube', runTube(t), 'proof authorizes another action');
+  t = clone(tube);
+  t.actions[2].p[0] = hex(60_000n);
+  await expectFail('client-proof withdrawal above the collateral', 'tube', runTube(await reaggregate(await remsg(t, 2))), 'collateral below the amount');
+  t = clone(tube);
+  t.actions[2].k_enc = hex(5n);
+  await expectFail('client-proof withdrawal under another key', 'tube', runTube(t), 'k_enc does not open the commitment');
   t = clone(tube);
   t.agg.count = 11;
   await expectFail('more client actions than proof slots', 'tube', runTube(t), 'too many client proofs');

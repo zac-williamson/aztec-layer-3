@@ -1,15 +1,17 @@
 //! Trading rules (SPEC.md §7–§8): signed actions, fills, funding settlement, fees, margin.
 use crate::{
-    account::{AccountPriv, Activity, Key, Position},
+    account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Key, Position},
     consts::{
-        DS_ACTION, DS_KEY_NODE, KEY_SLOTS, KEYS_HEIGHT, MARKETS, MAX_COLLATERAL, MAX_CUM_FUNDING, MAX_FUNDING_CREDIT,
-        MAX_SIZE, MICRO, PPM,
+        DS_ACTION, DS_KEY_NODE, DS_WD_CHAIN, DS_WDSALT, KEY_SLOTS, KEYS_HEIGHT, MARKETS, MAX_COLLATERAL,
+        MAX_CUM_FUNDING, MAX_FUNDING_CREDIT, MAX_SIZE, MICRO, PPM, TAG_WD,
     },
+    da::{absorb, emit_change},
     params::Params,
     state::Market,
     tree::merkle_root,
+    withdrawal_record,
 };
-use l3x_types::hash::hash;
+use l3x_types::{hash::hash, Running};
 
 pub global KIND_PLACE: Field = 1;
 pub global KIND_CANCEL: Field = 2;
@@ -61,6 +63,52 @@ pub fn write_key_slot(keys_root: Field, old: Key, path: [Field; KEYS_HEIGHT], ad
         Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: old.nonce }
     };
     merkle_root(DS_KEY_NODE, new_key.leaf(), slot, path)
+}
+
+/// Withdraw (SPEC.md §8.3, §10.4), p = (amount, recipient, …), authorized by the master key or a
+/// client proof: `amount` of the account's collateral to an Aztec `recipient`. Requires the
+/// collateral, fresh indices wherever the account is exposed, and IM after the withdrawal. Writes
+/// the account's new private part under a fresh blind, publishes it, and appends the withdrawal
+/// record to the batch's withdrawals chain and the DA. Returns the new account leaf; the caller
+/// writes it, and the activity, to the trees.
+pub fn withdraw(
+    running: Running,
+    markets: [Market; MARKETS],
+    params: Params,
+    idx: u32,
+    acct_pub: AccountPub,
+    old: AccountPriv,
+    act: Activity,
+    k_enc: Field,
+    p: [Field; ACTION_PAYLOAD],
+    da_nonce: Field,
+) -> (Field, Running) {
+    let mut r = running;
+    let amount = p[0] as u64;
+    let recipient = p[1];
+    assert((amount as Field == p[0]) & (amount > 0) & (amount < MAX_COLLATERAL), "withdrawal amount out of range");
+    assert(old.collateral >= amount as i64, "collateral below the amount");
+    assert(exposure_fresh(old, act, markets, params.max_age, r.time), "index too old for a withdrawal");
+    let after = equity(old, markets) - amount as i64;
+    assert(covers(after, initial_margin(old, act, markets, params)), "insufficient margin");
+
+    assert(enc_commitment(k_enc) == acct_pub.enc_commitment, "k_enc does not open the commitment");
+    let mut np = old;
+    np.collateral = old.collateral - amount as i64;
+    np.blind = blind(k_enc, idx, da_nonce, r.da_len);
+    let new_leaf = account_leaf(acct_pub, np);
+    r = emit_change(r, idx, new_leaf, np, k_enc, da_nonce);
+
+    // The salt makes the record unguessable from public data (SPEC.md §10.4); the owner can
+    // rebuild it from its key.
+    let index = r.withdrawals_count;
+    let salt = hash([DS_WDSALT, k_enc, r.batch as Field, index as Field]);
+    let record = withdrawal_record(recipient, amount, salt, r.batch, index);
+    r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
+    r.withdrawals_count = index + 1;
+    r.withdrawals_amount += amount;
+    r = absorb(absorb(r, TAG_WD), record);
+    (new_leaf, r)
 }
 
 pub fn abs(x: i64) -> u64 {

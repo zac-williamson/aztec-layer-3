@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), and receipts with accountability and client-proof actions (P2.5), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), and client-proof withdrawals (P2.6), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -823,6 +823,7 @@ P2 is built in increments, each leaving every test green.
 - P2.3: session keys, GTT orders and forced priority requests.
 - P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
 - P2.5: receipts and accountability (first part), then client-proof actions (second part).
+- P2.6: client-proof withdrawals.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1073,7 +1074,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **TXE:** 50 tests. New ones cover the request fee and queueing, the kind check, and an unprocessed forced request blocking settlement after `T_force`.
 - **Exit test:** Bob forces a withdrawal through the Bridge on the local network. Batch 3 processes it, and he claims the record from the DA.
 
-**Client-proof actions** (P2.5, §7.1, §7.4):
+**Client-proof actions** (P2.5 and P2.6, §7.1, §7.4):
 
 - **P-segment.** A P-segment's leaf is the tube. It verifies the segment's Chonk proof against the pinned Chonk VK. Inside the IVC, `agg_app` verified ten client proofs of the pinned client circuit and folded the first `count` proofs' public inputs: `acc = H(DS_AGG, acc, client_vk_hash, msg, account_index, auth_binding)`.
 - **Binding actions to proofs.** The tube takes the actions as witnesses, recomputes that fold from them and requires it to equal the IVC's output. So it applies exactly the actions client proofs authorized, in the order they were aggregated, and drops none.
@@ -1082,18 +1083,25 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - `master_auth == H(DS_MAUTH_P, client_vk_hash, auth_binding)`;
   - `msg == H(DS_ACTION, domain, kind, account, MASTER_KEY, nonce, p[8])`, the master-key message of §7.1;
   - `nonce` is the account's master nonce plus one;
-  - the kind is `AddKey` or `RevokeKey`.
+  - the kind is `AddKey`, `RevokeKey` or `Withdraw` (P2.6).
 
-  The tube then writes the key slot with the routine `seg_trade` uses for master-key `AddKey` and `RevokeKey`.
-- **Records.** The action log records each P-segment once, as `(actions_hash, count)`. The tube publishes nothing: keys live in the activity tree, which is never published. Its `receipts_root` is 0, because receipts number the operator's sequenced signed actions (§11).
+  The tube then applies the action with the routine `seg_trade` uses for the same master-key action: `write_key_slot` for a key change, and `withdraw` for a withdrawal, under the same amount, collateral, freshness and margin rules.
+- **Records.** The action log records each P-segment once, as `(actions_hash, count)`. Since P2.6 each P-segment opens a DA segment, whose nonce depends on that log entry.
+  - A key change publishes nothing: keys live in the activity tree, which is never published.
+  - A withdrawal publishes the account's change entry under a fresh blind and appends its record to the batch's withdrawals chain and the DA, as a master-key withdrawal does. Its record is claimed from the Bridge in the same way.
+  - The tube's `receipts_root` is 0, because receipts number the operator's sequenced signed actions (§11).
+  - The engine builds a P-segment in two passes. The segment nonce, and so every withdrawal's blind, depends on which actions apply. So a dry run first decides which actions apply, and only then is the segment logged, opened and executed.
 - **Lane-P accounts.** An account registers with `master_auth = H(DS_MAUTH_P, client_vk_hash, H(DS_AUTH, secret))`.
   - No Schnorr key can sign as its master key, so its master actions travel as client proofs.
   - It trades through session keys that a client proof grants. One proof authorizes many fast signed actions (§7.4).
-  - It withdraws through `ForcedWithdraw` from its owner's Aztec account. Client-proof withdrawals are deferred: the tube would also have to publish the account change and append a withdrawal record.
+  - It withdraws by client proof (P2.6), or through `ForcedWithdraw` from its owner's Aztec account.
 - **Narrowing.**
   - There is one client circuit: the P0 circuit, which proves knowledge of the secret behind `auth_binding`. Its VK hash is a constant in `agg_app` and the tube, not a member of a client subtree as §7.4 describes.
-  - Of §7.4's default uses, only session-key grants and revocations are built.
-- **Cost.** The tube applies ten actions, each with a 32-level account path, a 32-level activity update and an 8-level key-slot update. This takes it from 1,473,742 gates to 1,592,466 (+8%), still within 2^21. The IVC is unchanged. A P-segment with any number of actions costs one IVC and one tube proof.
+  - Of §7.4's default uses, session-key grants and revocations and withdrawals are built. Credentials, and changes of master authorization or `k_enc`, are not.
+- **Cost.** The tube applies ten actions. Each has a 32-level account update, a 32-level activity update, an 8-level key-slot update and, for a withdrawal, the margin check, the change entry and the withdrawal record.
+  - Key changes (P2.5) took the tube from 1,473,742 gates to 1,592,466 (+8%).
+  - Withdrawals (P2.6) take it to 1,673,299 (+5%), still within 2^21.
+  - The IVC is unchanged. A P-segment with any number of actions costs one IVC and one tube proof.
 
 **Tests** (P2.5, second part):
 
@@ -1115,10 +1123,16 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - a proof applied to a lane-S account.
 - `EXECUTE_ONLY=1 npm run native` executes the tube without its Chonk proof, since witness generation does not check recursive proofs.
 
+**Tests** (P2.6):
+
+- **Native**, batch 6: Grace's second P-segment revokes her session key and withdraws 100,000 by client proof. The engine refuses a third proof, for a withdrawal beyond her collateral. Conservation holds with the withdrawal, and the DA reopens her account after it.
+- **Adversarial:** 3 more tube witnesses, 60 in all: a withdrawal sent to another recipient, a withdrawal above the collateral, and a withdrawal published under another key. The case of a proof whose action kind is not allowed now uses an order.
+
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. Client-proof withdrawals, and the client subtree of §7.4 in place of the single pinned client circuit.
+2. The client subtree of §7.4 in place of the single pinned client circuit.
+3. The remaining kinds of §7.3: `CancelAll`, `ModifyOrder`, `Transfer`.
 
 ## 16. Decisions
 
