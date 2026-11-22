@@ -3,8 +3,8 @@
 // inputs (witness) and the transition the circuit must prove. Divergence between engine and
 // circuit makes a batch unprovable, so proveBatch compares them segment by segment.
 import type { Barretenberg } from '@aztec-foundation/bb.js';
-import { DS as DS0, R, daAbsorb, hex } from '../lib.ts';
-import { type BatchWitness, type Running, type SegmentWitness, assert, batchStart, copyRunning, runningToNoir } from '../pipeline.ts';
+import { DS as DS0, R, SHAPE, daAbsorb, hex } from '../lib.ts';
+import { type BatchWitness, type ClientProof, type Prover, type Running, type SegmentWitness, assert, batchStart, copyRunning, runningToNoir } from '../pipeline.ts';
 import { type Point, type Sig, sigToNoir, verify, zeroSig } from './grumpkin.ts';
 import * as M from './model.ts';
 import type { ProtocolAccount } from './params.ts';
@@ -21,7 +21,13 @@ export type OracleUpdate = { market: bigint; price: bigint; external: bigint; ti
 export type SignedAction = { kind: bigint; account: bigint; keyId: bigint; nonce: bigint; p: bigint[]; sig: Sig; pk: { x: bigint; y: bigint }; seq?: bigint };
 /** A receipt (SPEC.md §11): an action's message and sequence number, where its leaf sits in the batch. */
 export type Receipt = { msg: bigint; seq: bigint; segment: number; slot: number };
-export type Rejection = { action: SignedAction; reason: string };
+/**
+ * A master action a client proof authorizes (SPEC.md §7.4), as the client hands it to the
+ * operator: the action's opening and the proof, whose public inputs are the action's message, the
+ * account and the account's auth binding. Lane-P accounts grant and revoke session keys this way.
+ */
+export type ProvenAction = { kind: bigint; account: bigint; nonce: bigint; p: bigint[]; proof: ClientProof };
+export type Rejection = { action: SignedAction | ProvenAction; reason: string };
 /** A liquidation step (SPEC.md §8.5), as the operator chooses it. A close's size defaults to what
  * the book can absorb within the limit in one step budget. */
 export type LiqStep =
@@ -40,6 +46,7 @@ const REFRESH_PER_SEGMENT = 4;
 const LIQ_PER_SEGMENT = 2;
 const FORCED_CANCELS = 4;
 const FILLS = 2;
+const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
 const zeros = (n: number) => Array<string>(n).fill(hex(0n));
 const siblingsToNoir = (path: BookSibling[]) => path.map((s) => ({ hash: hex(s.hash), ask: s.ask.toString(), bid: s.bid.toString() }));
 const emptyBookPath = () => siblingsToNoir(Array.from({ length: M.BOOK_HEIGHT }, () => ({ hash: 0n, ask: 0n, bid: 0n })));
@@ -57,6 +64,8 @@ export class Engine {
   readonly h: M.H;
   readonly params: M.Params;
   readonly vkTreeRoot: bigint;
+  /** The pinned client circuit's VK hash, which lane-P master authorizations commit to (SPEC.md §7.1). */
+  readonly clientVkHash: bigint;
   domain = 0n;
   accounts!: MerkleTree;
   activity!: MerkleTree;
@@ -88,7 +97,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth'>();
 
   // The batch being built.
   running!: Running;
@@ -97,16 +106,20 @@ export class Engine {
   wdRecords: bigint[] = [];
   segments: SegmentWitness[] = [];
 
-  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint) {
+  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, clientVkHash: bigint) {
     this.api = api;
     this.h = M.hasher(api);
     this.params = params;
     this.vkTreeRoot = vkTreeRoot;
+    this.clientVkHash = clientVkHash;
   }
 
-  /** An engine at genesis, holding the protocol accounts (insurance at 0, fee at 1). */
-  static async create(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, protocol: ProtocolAccount[]): Promise<Engine> {
-    const e = new Engine(api, params, vkTreeRoot);
+  /**
+   * An engine at genesis, holding the protocol accounts (insurance at 0, fee at 1). Client-proof
+   * actions need the build's client VK hash (Prover.clientVkHash).
+   */
+  static async create(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, protocol: ProtocolAccount[], clientVkHash = 0n): Promise<Engine> {
+    const e = new Engine(api, params, vkTreeRoot, clientVkHash);
     await M.initModel(e.h);
     e.accounts = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACCT_NODE).init();
     e.activity = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACTV_NODE).init();
@@ -235,10 +248,10 @@ export class Engine {
     return record;
   }
 
-  private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>, receiptLeaves?: bigint[]) {
+  private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>, receiptLeaves?: bigint[], clientProofs?: ClientProof[]) {
     this.running.state = await this.trees();
     const receiptsRoot = receiptLeaves ? await this.h([DS0.RECEIPT_NODE, receiptLeaves[0], receiptLeaves[1]]) : 0n;
-    this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running), receiptsRoot, receiptLeaves });
+    this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running), receiptsRoot, receiptLeaves, clientProofs });
   }
 
   private base(start: Running, state: M.State) {
@@ -785,6 +798,110 @@ export class Engine {
     };
   }
 
+  // ---- Client-proof actions (tube, SPEC.md §7.4) ----
+
+  /**
+   * Executes master actions authorized by client proofs, CLIENT_PER_SEGMENT per P-segment. An
+   * action the rules refuse (its proof does not control the account or authorizes another action,
+   * a stale nonce, a kind other than AddKey and RevokeKey, a bad key slot) is dropped and recorded
+   * in `rejected`, as the operator would refuse it before aggregating its proof.
+   */
+  async proven(actions: ProvenAction[]) {
+    const queue = [...actions];
+    while (queue.length) await this.provenSegment(queue);
+  }
+
+  /**
+   * One P-segment: takes actions from the front of `queue` until CLIENT_PER_SEGMENT apply. The
+   * segment's aggregation folds the applied proofs' public inputs, as agg_app does; the action log
+   * records the aggregation. A segment with nothing to apply is dropped unless `emitEmpty`.
+   */
+  async provenSegment(queue: ProvenAction[], emitEmpty = false) {
+    assert(this.clientVkHash !== 0n, 'client-proof actions need the client VK hash (Engine.create)');
+    const start = copyRunning(this.running);
+    const before = this.state();
+    const items: unknown[] = [];
+    const applied: ProvenAction[] = [];
+    while (queue.length && applied.length < CLIENT_PER_SEGMENT) {
+      const a = queue.shift()!;
+      const snap = this.snapshot();
+      try {
+        items.push(await this.execProven(a));
+        applied.push(a);
+      } catch (e: any) {
+        this.restore(snap);
+        this.rejected.push({ action: a, reason: String(e.message ?? e) });
+      }
+    }
+    if (!applied.length && !emitEmpty) return;
+    let acc = 0n;
+    for (const a of applied) acc = await this.h([DS0.AGG, acc, this.clientVkHash, ...a.proof.publicInputs.map((x) => BigInt(x))]);
+    this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, acc, BigInt(applied.length));
+    const names = (a: ProvenAction) => `${a.kind === X.KIND_ACT.ADD_KEY ? 'add' : 'revoke'} key ${a.account}/${a.p[0]}`;
+    await this.finishSegment(
+      'tube',
+      `proven [${applied.map(names).join(', ')}]`,
+      {
+        ...this.base(start, before),
+        agg: { actions_hash: hex(acc), count: applied.length },
+        actions: pad(items, CLIENT_PER_SEGMENT, () => this.emptyClientAction()),
+      },
+      undefined,
+      applied.map((a) => a.proof),
+    );
+  }
+
+  /** The tube's checks, in its order, then the key slot write (shared with seg_trade's set_key). */
+  private async execProven(a: ProvenAction) {
+    const [msg, account, binding] = a.proof.publicInputs.map((x) => BigInt(x));
+    if (account !== a.account) throw new Error('the proof is for another account');
+    const rec = this.accts.get(account);
+    const oldAct = this.actv.get(account);
+    if (!rec || !oldAct) throw new Error('account');
+    if (!this.relax.has('client-auth') && (await M.masterAuthP(this.h, this.clientVkHash, binding)) !== rec.pub.masterAuth) {
+      throw new Error('client proof does not control the account');
+    }
+    if (msg !== (await X.actionMsg(this.h, this.domain, a.kind, account, M.MASTER_KEY, a.nonce, a.p))) throw new Error('proof authorizes another action');
+    if (oldAct.nonce + 1n !== a.nonce) throw new Error('nonce');
+    if (a.kind !== X.KIND_ACT.ADD_KEY && a.kind !== X.KIND_ACT.REVOKE_KEY) throw new Error('client proofs grant and revoke session keys');
+    const act = M.copyActivity(oldAct);
+    act.nonce = a.nonce;
+    const w = await this.execSetKey(a, act);
+    return {
+      msg: hex(msg),
+      account_index: hex(account),
+      auth_binding: hex(binding),
+      kind: hex(a.kind),
+      nonce: a.nonce.toString(),
+      p: a.p.map(hex),
+      acct_pub: M.pubToNoir(rec.pub),
+      acct_priv: M.privToNoir(rec.priv),
+      acct_path: w.taker_acct_path,
+      actv: M.activityToNoir(oldAct),
+      actv_path: w.taker_actv_path,
+      key: w.key,
+      key_path: w.key_path,
+    };
+  }
+
+  private emptyClientAction() {
+    return {
+      msg: hex(0n),
+      account_index: hex(0n),
+      auth_binding: hex(0n),
+      kind: hex(0n),
+      nonce: '0',
+      p: zeros(X.ACTION_PAYLOAD),
+      acct_pub: M.pubToNoir(M.zeroPub()),
+      acct_priv: M.privToNoir(M.emptyPriv()),
+      acct_path: zeros(M.ACCOUNTS_HEIGHT),
+      actv: M.activityToNoir(M.newActivity()),
+      actv_path: zeros(M.ACCOUNTS_HEIGHT),
+      key: M.keyToNoir(M.emptyKey()),
+      key_path: zeros(M.KEYS_HEIGHT),
+    };
+  }
+
   /** The best resting order on `side` of market m: the lowest ask or the highest bid (SPEC.md §6.5). */
   private best(m: number, side: bigint): BookOrder | undefined {
     let best: [bigint, BookOrder] | undefined;
@@ -873,13 +990,14 @@ export class Engine {
   }
 
   /** AddKey and RevokeKey (seg_trade `set_key`): master only; the slot keeps its nonce. */
-  private async execSetKey(a: SignedAction, act: M.Activity) {
+  private async execSetKey(a: Pick<SignedAction, 'kind' | 'account' | 'p'>, act: M.Activity) {
     const slot = Number(a.p[0]);
     if (a.p[0] < 0n || slot >= M.KEY_SLOTS) throw new Error('key slot');
     const old = this.keyOf(a.account, slot);
     const keyPath = this.keyTrees.get(a.account)!.path(BigInt(slot)).map(hex);
     let k: M.Key;
     if (a.kind === X.KIND_ACT.ADD_KEY) {
+      if (a.p[3] >= 1n << 32n || a.p[4] >= 1n << 64n || a.p[5] >= 1n << 64n) throw new Error('key parameters out of range');
       if (a.p[1] === 0n && a.p[2] === 0n) throw new Error('empty key');
       k = { pkX: a.p[1], pkY: a.p[2], marketMask: a.p[3], maxNotional: a.p[4], expiry: a.p[5], nonce: old.nonce };
     } else {
@@ -1464,6 +1582,19 @@ export async function signAction(h: M.H, domain: bigint, keys: { sk: bigint; pk:
   const payload = [...p, ...Array(X.ACTION_PAYLOAD - p.length).fill(0n)];
   const msg = await X.actionMsg(h, domain, kind, account, keyId, nonce, payload);
   return { kind, account, keyId, nonce, p: payload, sig: await sign(h, keys.sk, msg), pk: { x: keys.pk!.x, y: keys.pk!.y } };
+}
+
+/**
+ * A client's proof of a master action (SPEC.md §7.4): the client circuit authorizes the action's
+ * message under the master key id, for an account whose auth binding is hash(DS_AUTH, secret).
+ * With a prover the client circuit is proved; without one the action carries only the proof's
+ * public inputs, which is enough to execute (not prove) a batch.
+ */
+export async function proveAction(h: M.H, domain: bigint, secret: bigint, kind: bigint, account: bigint, nonce: bigint, p: bigint[], prover?: Prover): Promise<ProvenAction> {
+  const payload = [...p, ...Array<bigint>(X.ACTION_PAYLOAD - p.length).fill(0n)];
+  const msg = await X.actionMsg(h, domain, kind, account, M.MASTER_KEY, nonce, payload);
+  const proof = prover ? await prover.clientProof(secret, msg, account) : { proof: [], publicInputs: [msg, account, await M.authBinding(h, secret)].map(hex) };
+  return { kind, account, nonce, p: payload, proof: { proof: proof.proof, publicInputs: proof.publicInputs } };
 }
 
 /** Oracle side: the publishers with the given indices sign an index update (SPEC.md §8.4). */

@@ -42,7 +42,7 @@ const STEPS: Step[] = [
   { pkg: 'init_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['AGG_APP_VK_HASH'] },
   { pkg: 'tail_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['INIT_KERNEL_VK_HASH'] },
   { pkg: 'hiding_kernel', vk: { scheme: 'chonk', kind: 'hiding' }, pinned: ['TAIL_KERNEL_VK_HASH'] },
-  { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH'] },
+  { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH', 'CLIENT_VK_HASH'] },
   { pkg: 'padding', vk: ROLLUP },
   { pkg: 'seg_block', vk: ROLLUP },
   { pkg: 'seg_priority', vk: ROLLUP },

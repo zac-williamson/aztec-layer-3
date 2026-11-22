@@ -7,17 +7,27 @@ import { cpus } from 'node:os';
 import { join } from 'node:path';
 import { UltraHonkBackend } from '@aztec-foundation/bb.js';
 import { Noir } from '@aztec-foundation/noir-noir_js';
+import { Engine } from './exchange/engine.ts';
+import * as M from './exchange/model.ts';
+import { protocolAccounts, testParams } from './exchange/params.ts';
 import { OUT, SHAPE, readCircuit, readJson, readVkJson, timed, writeJson } from './lib.ts';
-import { Prover, assert, batchStart, newApi, ultraGates } from './pipeline.ts';
+import { Prover, assert, newApi, ultraGates } from './pipeline.ts';
 
 async function main() {
   const manifest = readJson(join(OUT, 'manifest.json'));
   const api = await newApi();
-  const prover = await Prover.create(api, manifest);
+  const h = M.hasher(api);
+  const { params } = await testParams(h);
+  const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
   const n = SHAPE.MAX_CLIENT_PROOFS;
 
-  // Chonk path: client proofs, IVC, tube.
-  const tube = await prover.tube(batchStart(BigInt(manifest.genesisTrees), 0n, 0n, 0n, 1n), n);
+  // Chonk path: IVC over n client proofs, then the tube, for a P-segment at genesis. agg_app
+  // verifies all n proof slots and the tube's circuit is fixed, so the cost does not depend on how
+  // many of the proofs carry actions; this segment applies none.
+  const engine = await Engine.create(api, params, prover.vkTreeRoot, await protocolAccounts(h), prover.clientVkHash);
+  await engine.beginBatch(1n, 0n, 0n, 0n);
+  await engine.provenSegment([], true);
+  const tube = await prover.proveTube(engine.segments[0].inputs, []);
   const chonk = {
     agg_app_mega_gates: tube.chonk.sizes.agg_app_mega_gates,
     kernel_mega_gates: ['init_kernel', 'tail_kernel', 'hiding_kernel'].map((k) => tube.chonk.sizes[`${k}_mega_gates`]),
@@ -29,7 +39,7 @@ async function main() {
   console.log(`chonk path: IVC ${chonk.ivc_ms} ms + tube ${chonk.tube_ms} ms = ${chonk.total_ms} ms`);
 
   // UltraHonk path: the same verification in one circuit.
-  const { proofs, publicInputs } = await prover.clientProofs();
+  const { proofs, publicInputs } = await prover.randomClientProofs();
   const c = readCircuit('agg_ultra');
   const { witness } = await new Noir(c as any).execute({
     client_vk: readVkJson('client_auth').vk,

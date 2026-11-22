@@ -37,6 +37,8 @@ export const DS = {
   LIQ: 48n,
   KEY: 49n,
   KEY_NODE: 50n,
+  RECEIPT_SIG: 51n,
+  MAUTH_P: 52n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -183,6 +185,10 @@ export const pubHash = (h: H, p: AccountPub) => h([DS.ACCT_PUB, p.owner, p.maste
 export const privHash = (h: H, q: AccountPriv) => h([DS.ACCT_PRIV, ...plaintext(q)]);
 export const accountLeaf = async (h: H, p: AccountPub, q: AccountPriv) => h([DS.ACCT, await pubHash(h, p), await privHash(h, q)]);
 export const masterAuthOf = (h: H, x: bigint, y: bigint) => h([DS.MAUTH, x, y]);
+/** A client's auth binding: the client circuit proves knowledge of `secret` behind it (SPEC.md §7.4). */
+export const authBinding = (h: H, secret: bigint) => h([DS.AUTH, secret]);
+/** Lane-P master authorization (SPEC.md §7.1): the client circuit, with the account's auth binding. */
+export const masterAuthP = (h: H, clientVkHash: bigint, binding: bigint) => h([DS.MAUTH_P, clientVkHash, binding]);
 export const encCommitment = (h: H, k: bigint) => h([DS.ENC, k]);
 export const blindOf = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number) => h([DS.BLIND, k, idx, nonce, BigInt(pos)]);
 export const keystream = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number, i: number) =>

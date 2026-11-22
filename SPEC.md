@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.9, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), and receipts with accountability (P2.5), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), and receipts with accountability and client-proof actions (P2.5), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -235,7 +235,7 @@ msg    = H(DS_ACTION, chain_id, bridge_address, auth_id, Action)
 `chain_id` and `bridge_address` come from the configuration. `auth_id` is the signing public key for lane S or the client circuit's VK hash for lane P, so a signature or proof cannot be replayed under a different key or circuit. An action carries exactly one authorization:
 
 - **S**: a Schnorr signature over Grumpkin, with a Poseidon2 challenge, on `msg` by the key in slot `key_id`. Verification costs one two-point embedded-curve MSM and one Poseidon2 hash.
-- **P**: a client proof (§7.4) whose public inputs are `(msg, account_index, auth_binding)`. The segment requires `master_auth == H(DS_MAUTH, vk_hash, auth_binding)`, and requires that the configuration permits that circuit to authorize this action kind.
+- **P**: a client proof (§7.4) whose public inputs are `(msg, account_index, auth_binding)`. The segment requires `master_auth == H(DS_MAUTH_P, vk_hash, auth_binding)`, and requires that the configuration permits that circuit to authorize this action kind. `DS_MAUTH_P` differs from the separator of a lane-S master key's `H(DS_MAUTH, pk)`, so neither lane's authorization can be read as the other's.
 
 `nonce` MUST equal the slot's stored nonce plus one. Parallelism comes from multiple keys, not nonce gaps. Actions reach the gateway under transport encryption plus envelope encryption to the operator key, and are never published.
 
@@ -822,7 +822,7 @@ P2 is built in increments, each leaving every test green.
 - P2.2: liquidation and the insurance backstop.
 - P2.3: session keys, GTT orders and forced priority requests.
 - P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
-- P2.5 (first part): receipts and accountability.
+- P2.5: receipts and accountability (first part), then client-proof actions (second part).
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1033,7 +1033,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Tests** (P2.5):
 
 - **TXE**, 65 tests. They cover an answered challenge and a wrong path, a slash and its deadline, a forged receipt, a receipt too recent to challenge, a receipt challenged twice, and desert payouts that leave out the bond.
-- **Native:** every one of the 21 receipts across five batches has a path to its batch's receipts root. The batch prover checks its own receipts tree against the root circuit's.
+- **Native:** every receipt has a path to its batch's receipts root: 21 across the five batches of P2.5's first part, 23 since batch 6 was added. The batch prover checks its own receipts tree against the root circuit's.
 - **Adversarial:** an action out of sequence order, and padding that claims a receipts root.
 - **Exit test**, on the local network, after the operator posts a bond:
   - Bob challenges the receipt of his withdrawal, and the operator answers with the action's path in batch 2.
@@ -1073,10 +1073,52 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **TXE:** 50 tests. New ones cover the request fee and queueing, the kind check, and an unprocessed forced request blocking settlement after `T_force`.
 - **Exit test:** Bob forces a withdrawal through the Bridge on the local network. Batch 3 processes it, and he claims the record from the DA.
 
+**Client-proof actions** (P2.5, §7.1, §7.4):
+
+- **P-segment.** A P-segment's leaf is the tube. It verifies the segment's Chonk proof against the pinned Chonk VK. Inside the IVC, `agg_app` verified ten client proofs of the pinned client circuit and folded the first `count` proofs' public inputs: `acc = H(DS_AGG, acc, client_vk_hash, msg, account_index, auth_binding)`.
+- **Binding actions to proofs.** The tube takes the actions as witnesses, recomputes that fold from them and requires it to equal the IVC's output. So it applies exactly the actions client proofs authorized, in the order they were aggregated, and drops none.
+- **Checks.** For each action, in order:
+  - the account exists;
+  - `master_auth == H(DS_MAUTH_P, client_vk_hash, auth_binding)`;
+  - `msg == H(DS_ACTION, domain, kind, account, MASTER_KEY, nonce, p[8])`, the master-key message of §7.1;
+  - `nonce` is the account's master nonce plus one;
+  - the kind is `AddKey` or `RevokeKey`.
+
+  The tube then writes the key slot with the routine `seg_trade` uses for master-key `AddKey` and `RevokeKey`.
+- **Records.** The action log records each P-segment once, as `(actions_hash, count)`. The tube publishes nothing: keys live in the activity tree, which is never published. Its `receipts_root` is 0, because receipts number the operator's sequenced signed actions (§11).
+- **Lane-P accounts.** An account registers with `master_auth = H(DS_MAUTH_P, client_vk_hash, H(DS_AUTH, secret))`.
+  - No Schnorr key can sign as its master key, so its master actions travel as client proofs.
+  - It trades through session keys that a client proof grants. One proof authorizes many fast signed actions (§7.4).
+  - It withdraws through `ForcedWithdraw` from its owner's Aztec account. Client-proof withdrawals are deferred: the tube would also have to publish the account change and append a withdrawal record.
+- **Narrowing.**
+  - There is one client circuit: the P0 circuit, which proves knowledge of the secret behind `auth_binding`. Its VK hash is a constant in `agg_app` and the tube, not a member of a client subtree as §7.4 describes.
+  - Of §7.4's default uses, only session-key grants and revocations are built.
+- **Cost.** The tube applies ten actions, each with a 32-level account path, a 32-level activity update and an 8-level key-slot update. This takes it from 1,473,742 gates to 1,592,466 (+8%), still within 2^21. The IVC is unchanged. A P-segment with any number of actions costs one IVC and one tube proof.
+
+**Tests** (P2.5, second part):
+
+- **Native**, batch 6:
+  - Grace registers in lane P.
+  - A client proof grants her a session key for market 0, which buys 20 lots from Bob.
+  - A second proof, in a later P-segment, revokes the key.
+  - The engine refuses a proof applied to Alice's lane-S account, a replayed nonce, a withdrawal any Schnorr key signs for Grace's account, and the revoked key's next order.
+  - Both P-segments are proved: real client proofs, the Chonk IVC (1.5 s each) and the tube (4.9–6.9 s). The batch is `root(merge(merge(block, priority), merge(tube, trade)), merge(tube, refresh))`, so tubes merge with X-segments like any other node.
+  - The DA reopens Grace's account like any other.
+- **Adversarial:** 8 more tube witnesses, 57 in all:
+  - an action no proof authorized;
+  - a proof applied to another action;
+  - an aggregated action dropped;
+  - a replayed proof;
+  - a proof that withdraws;
+  - more actions than proof slots;
+  - a forged key-slot path;
+  - a proof applied to a lane-S account.
+- `EXECUTE_ONLY=1 npm run native` executes the tube without its Chonk proof, since witness generation does not check recursive proofs.
+
 **Next increments:**
 
-1. P2.5 (second part): client-proof actions (§7.4).
-2. C1 custody (§10.3), once the D7 token is specified.
+1. C1 custody (§10.3), once the D7 token is specified.
+2. Client-proof withdrawals, and the client subtree of §7.4 in place of the single pinned client circuit.
 
 ## 16. Decisions
 

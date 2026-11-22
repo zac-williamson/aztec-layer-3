@@ -1,12 +1,12 @@
 // Native test (no network): the engine builds batches of real exchange actions across several
-// markets, every segment is proved and checked against the engine, the root binds the header,
-// conservation is checked exactly after every batch, and every account is then reconstructed and
-// opened from the DA payloads alone.
+// markets, every segment is proved and checked against the engine (client-proof actions through
+// the Chonk IVC and the tube), the root binds the header, conservation is checked exactly after
+// every batch, and every account is then reconstructed and opened from the DA payloads alone.
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
 import { type BatchWitness, type ProvedBatch, Prover, assert, executeBatch, foldReceipt, newApi, proveBatch, receiptLeaf, receiptPath } from '../pipeline.ts';
 import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
-import { Engine, signAction, signUpdate } from './engine.ts';
+import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
 import * as M from './model.ts';
 import { genesisState, protocolAccounts, testParams } from './params.ts';
@@ -55,7 +55,7 @@ async function main() {
     return b;
   };
   const protocol = await protocolAccounts(h);
-  const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol);
+  const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol, prover.clientVkHash);
   // Execute-only runs may use circuits newer than the manifest, so they check genesis directly.
   const genesis = EXECUTE_ONLY ? await genesisState(api, protocol) : { trees: BigInt(manifest.genesisTrees), stateRoot: BigInt(manifest.genesisStateRoot) };
   assert((await engine.trees()) === genesis.trees, 'engine genesis != manifest genesis');
@@ -261,30 +261,82 @@ async function main() {
   const b5 = await settle(w5);
   assert(b5.header[0] === b4.header[1], 'batch 5 does not chain from batch 4');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the five
+  // Batch 6: client-proof actions (SPEC.md §7.1, §7.4). Grace registers in lane P: her master
+  // authorization is the client circuit with her auth binding, so no Schnorr key controls her
+  // account. A client proof grants a session key for market 0, which buys from Bob; a second
+  // proof, in a later P-segment, revokes it. The engine refuses a proof applied to Alice's account
+  // (lane S), a replayed nonce, a withdrawal any Schnorr key signs for Grace's account, and the
+  // revoked key's next order.
+  const grace = { secret: randomField(), addr: randomField(), keys: await keysFromSeed(h, 707n) };
+  const G = 8n;
+  const graceAuth = await M.masterAuthP(h, prover.clientVkHash, await M.authBinding(h, grace.secret));
+  const graceEnc = await M.encCommitment(h, grace.keys.kEnc);
+  engine.keyring.set(graceEnc, grace.keys.kEnc);
+  await engine.beginBatch(6n, b5.end.priorityHead, b5.end.priorityCursor, b5.end.time);
+  const t6 = now + 4000n;
+  await engine.block(t6, [await update(0n, 1750n, 1750n, t6 - 1n)]);
+  await engine.priority([
+    { kind: M.KIND.REGISTER, a: graceAuth, b: graceEnc, sender: grace.addr, time: t6 },
+    { kind: M.KIND.DEPOSIT, a: G, b: 500_000n, sender: grace.addr, time: t6 },
+  ]);
+  netDeposits += 500_000n;
+  // The client proves each action; without proving, the actions carry only the proofs' public inputs.
+  const byProof = (account: bigint, nonce: bigint, kind: bigint, p: bigint[]) =>
+    proveAction(h, engine.domain, grace.secret, kind, account, nonce, p, EXECUTE_ONLY ? undefined : prover);
+  const gSess = await keysFromSeed(h, 7007n);
+  const bySessG = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, gSess, kind, G, nonce, p, 0n);
+  await engine.proven([
+    await byProof(G, 1n, ADD_KEY, [0n, gSess.pk.x, gSess.pk.y, 0b0001n, 400_000n, t6 + 1000n]),
+    await byProof(A, 7n, ADD_KEY, [1n, gSess.pk.x, gSess.pk.y, 0b0001n, 400_000n, t6 + 1000n]), // Alice's account is lane S
+    await byProof(G, 1n, REVOKE_KEY, [0n]), // replayed nonce
+  ]);
+  await engine.trade([
+    await act(bob, B, 6n, PLACE, [0n, ASK, 1755n, 20n, GTC, 0n]),
+    await bySessG(1n, PLACE, [0n, BID, 1755n, 20n, IOC, 0n]), // buys Bob's 20
+    await act(grace.keys, G, 2n, WITHDRAW, [100n, grace.addr]), // no Schnorr key is Grace's master key
+  ]);
+  await engine.proven([await byProof(G, 2n, REVOKE_KEY, [0n])]);
+  await engine.trade([await bySessG(2n, PLACE, [0n, BID, 1700n, 1n, GTC, 0n])]); // revoked
+  const reasons6 = engine.rejected.slice(9).map((r) => r.reason);
+  log(`engine refused: ${reasons6.join('; ')}`);
+  assert(
+    reasons6.join('|') === "client proof does not control the account|nonce|signing key is not the account's|signing key is not the slot's",
+    'unexpected batch 6 rejections',
+  );
+  assert(engine.accts.get(G)!.priv.positions[0].size === 20n && engine.keyOf(G, 0).pkX === 0n && engine.actv.get(G)!.nonce === 2n, 'lane-P key grant, trade and revocation');
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 6');
+  const w6 = await engine.endBatch();
+  log(`batch 6: ${w6.segments.map((s) => s.label).join(' | ')}; ${w6.daPayload.length} DA fields`);
+  const b6 = await settle(w6);
+  assert(b6.header[0] === b5.header[1], 'batch 6 does not chain from batch 5');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the six
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b5.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b6.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
     assert(show(opened.priv) === show(want), `account ${2 + i} opened from DA differs from the engine`);
   }
+  const graceOpened = await openAccount(h, rebuilt, grace.keys.kEnc, graceAuth);
+  assert(graceOpened.index === G && show(graceOpened.priv) === show(engine.accts.get(G)!.priv), 'lane-P account opened from DA differs from the engine');
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
-  log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}`);
+  log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === 0n && pos(C).positions[0].size === 30n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -20n && pos(C).positions[0].size === 30n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 5 ${hex(b5.headerHash)}`);
+  log(`header of batch 6 ${hex(b6.headerHash)}`);
   await api.destroy();
 }
 

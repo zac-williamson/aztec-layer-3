@@ -5,8 +5,8 @@
 import { join } from 'node:path';
 import { Noir } from '@aztec-foundation/noir-noir_js';
 import { OUT, hex, randomField, readCircuit, readJson } from '../lib.ts';
-import { Prover, assert, batchStart, newApi, nodeToNoir } from '../pipeline.ts';
-import { Engine, type SignedAction, signAction, signUpdate } from './engine.ts';
+import { Prover, assert, batchStart, chonkPlaceholder, newApi, nodeToNoir } from '../pipeline.ts';
+import { Engine, type SignedAction, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed, scalarToNoir, sign, sigToNoir } from './grumpkin.ts';
 import * as M from './model.ts';
 import { protocolAccounts, testParams } from './params.ts';
@@ -366,6 +366,81 @@ async function main() {
   t = clone(forcedCancel);
   t.n_cancels = 3;
   await expectFail('forced cancel-all leaves cancellable orders', 'seg_forced', t, 'forced cancel-all must cancel every order it can');
+
+  // Client-proof actions (SPEC.md §7.4). S is a lane-P account, U a lane-S one. An honest P-segment
+  // grants S two session keys; the tampered tube witnesses are what an operator would need to apply
+  // actions no client proof authorized. The tube runs without its Chonk proof here (witness
+  // generation does not check it), so each case shows the check the tube itself makes.
+  const PE = await Engine.create(api, params, prover.vkTreeRoot, protocol, prover.clientVkHash);
+  const pSecret = randomField();
+  const pu = await Promise.all([41n, 42n].map((x) => keysFromSeed(h, x)));
+  const [S, U] = [2n, 3n];
+  const pAuth = [await M.masterAuthP(h, prover.clientVkHash, await M.authBinding(h, pSecret)), await M.masterAuthOf(h, pu[1].pk.x, pu[1].pk.y)];
+  const preqs: M.Request[] = [];
+  for (const [i, k] of pu.entries()) {
+    const encC = await M.encCommitment(h, k.kEnc);
+    PE.keyring.set(encC, k.kEnc);
+    preqs.push({ kind: M.KIND.REGISTER, a: pAuth[i], b: encC, sender: randomField(), time: now });
+  }
+  await PE.beginBatch(1n, 0n, 0n, 0n);
+  await PE.block(now);
+  await PE.priority(preqs);
+  const pSess = await keysFromSeed(h, 4242n);
+  const byClient = (account: bigint, nonce: bigint, kind: bigint, p: bigint[]) => proveAction(h, PE.domain, pSecret, kind, account, nonce, p);
+  const { ADD_KEY } = X.KIND_ACT;
+  const ps = PE.segments.length;
+  await PE.proven([
+    await byClient(S, 1n, ADD_KEY, [0n, pSess.pk.x, pSess.pk.y, 0b01n, 100_000n, now + 1000n]),
+    await byClient(S, 2n, ADD_KEY, [1n, pSess.pk.x, pSess.pk.y, 0b10n, 100_000n, now + 1000n]),
+  ]);
+  assert(PE.rejected.length === 0, `client-proof setup rejected: ${PE.rejected.map((r) => r.reason)}`);
+  const tube = clone(PE.segments[ps].inputs) as any;
+  const runTube = (inputs: any) => ({ ...inputs, ...chonkPlaceholder() });
+  await execute('tube', runTube(tube));
+  const remsg = async (t: any, i: number) => {
+    const a = t.actions[i];
+    a.msg = hex(await X.actionMsg(h, PE.domain, BigInt(a.kind), BigInt(a.account_index), M.MASTER_KEY, BigInt(a.nonce), a.p.map((x: string) => BigInt(x))));
+    return t;
+  };
+  /** The aggregation the IVC would output had client proofs authorized exactly these actions. */
+  const reaggregate = async (t: any) => {
+    let acc = 0n;
+    for (let i = 0; i < Number(t.agg.count); i++) {
+      const a = t.actions[i];
+      acc = await h([M.DS.AGG, acc, prover.clientVkHash, BigInt(a.msg), BigInt(a.account_index), BigInt(a.auth_binding)]);
+    }
+    t.agg.actions_hash = hex(acc);
+    return t;
+  };
+  t = clone(tube);
+  t.actions[0].p[4] = hex(10_000_000n); // a larger notional cap than the client granted
+  await expectFail('client action no proof authorized', 'tube', runTube(await remsg(t, 0)), 'client actions do not match the proofs');
+  t = clone(tube);
+  t.actions[0].p[4] = hex(10_000_000n);
+  await expectFail("client proof applied to another action", 'tube', runTube(t), 'proof authorizes another action');
+  t = clone(tube);
+  t.actions[1] = clone(tube.actions[9]);
+  await expectFail('aggregated client action dropped', 'tube', runTube(t), 'client actions do not match the proofs');
+  t = clone(tube);
+  t.actions[1] = { ...t.actions[1], msg: t.actions[0].msg, kind: t.actions[0].kind, nonce: t.actions[0].nonce, p: t.actions[0].p };
+  await expectFail('client proof replayed', 'tube', runTube(await reaggregate(t)), 'nonce');
+  t = clone(tube);
+  t.actions[0].kind = hex(WITHDRAW);
+  t.actions[0].p = [1000n, 77n, 0n, 0n, 0n, 0n, 0n, 0n].map(hex);
+  await expectFail('client proof withdrawing', 'tube', runTube(await reaggregate(await remsg(t, 0))), 'client proofs grant and revoke session keys');
+  t = clone(tube);
+  t.agg.count = 11;
+  await expectFail('more client actions than proof slots', 'tube', runTube(t), 'too many client proofs');
+  t = clone(tube);
+  t.actions[0].key_path[0] = hex(1n);
+  await expectFail('client action on a forged key slot', 'tube', runTube(t), 'key slot path');
+  // Last, as it leaves PE's state past an action the rules refuse: a proof applied to U, whose
+  // master key is a Schnorr key.
+  PE.relax.add('client-auth');
+  const pt = PE.segments.length;
+  await PE.proven([await byClient(U, 1n, ADD_KEY, [0n, pSess.pk.x, pSess.pk.y, 0b01n, 100_000n, now + 1000n])]);
+  PE.relax.delete('client-auth');
+  await expectFail('client proof for a lane-S account', 'tube', runTube(PE.segments[pt].inputs), 'client proof does not control the account');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

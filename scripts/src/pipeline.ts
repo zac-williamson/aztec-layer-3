@@ -154,6 +154,13 @@ export async function newApi(): Promise<Barretenberg> {
   return Barretenberg.new({ threads: cpus().length });
 }
 
+/**
+ * A client proof (SPEC.md §7.4): an UltraHonk ZK proof of the client circuit, as fields, with its
+ * public inputs (msg, account_index, auth_binding).
+ */
+export type ClientProof = { proof: string[]; publicInputs: string[] };
+const CLIENT_PROOF_FIELDS = 458;
+
 export type ChonkSegment = {
   aggOut: { actions_hash: string; count: string };
   chonkVk: bigint[];
@@ -231,47 +238,76 @@ export class Prover {
     return { pkg, proof: bytesToFields(pd.proof), out, ms };
   }
 
-  /** MAX_CLIENT_PROOFS proofs of the P0 client circuit, each authorizing a random message. */
-  async clientProofs() {
-    const api = this.api;
-    const client = readCircuit('client_auth');
-    const clientNoir = new Noir(client as any);
-    const clientBackend = new UltraHonkBackend(client.bytecode, api);
-    const proofs: string[][] = [];
-    const publicInputs: string[][] = [];
-    const clientMs: number[] = [];
-    for (let i = 0; i < SHAPE.MAX_CLIENT_PROOFS; i++) {
-      const secret = randomField();
-      // client_auth asserts hash(DS_AUTH, secret) == auth_binding, which cross-checks l3xHash.
-      const { witness } = await clientNoir.execute({
-        secret: hex(secret),
-        msg: hex(randomField()),
-        account_index: hex(BigInt(i + 1)),
-        auth_binding: hex(await l3xHash(api, [DS.AUTH, secret])),
-      });
-      const [pd, t] = await timed(() => clientBackend.generateProof(witness, RECURSIVE));
-      clientMs.push(t);
-      proofs.push(bytesToFields(pd.proof).map(hex));
-      publicInputs.push(pd.publicInputs);
-    }
-    assert(proofs[0].length === 458, `client proof has ${proofs[0].length} fields, expected 458`);
-    return { proofs, publicInputs, meanMs: clientMs.reduce((a, b) => a + b, 0) / clientMs.length };
+  private clientCircuit?: { noir: Noir; backend: UltraHonkBackend };
+  private dummy?: ClientProof;
+
+  /** The client VK hash pinned in agg_app and the tube: lane-P master authorizations commit to it. */
+  get clientVkHash(): bigint {
+    return BigInt(this.manifest.hashes.CLIENT_VK_HASH);
   }
 
-  /** Client proofs and the Chonk IVC of a P-segment (agg_app and three kernels). */
-  async chonkSegment(count: number, log = console.log): Promise<ChonkSegment> {
+  /**
+   * A client proof, as the client makes it: it knows `secret` behind the account's auth binding
+   * (hash(DS_AUTH, secret), which client_auth asserts) and authorizes `msg` for `account`.
+   */
+  async clientProof(secret: bigint, msg: bigint, account: bigint): Promise<ClientProof & { ms: number }> {
+    if (!this.clientCircuit) {
+      const c = readCircuit('client_auth');
+      this.clientCircuit = { noir: new Noir(c as any), backend: new UltraHonkBackend(c.bytecode, this.api) };
+    }
+    const { noir, backend } = this.clientCircuit;
+    const { witness } = await noir.execute({
+      secret: hex(secret),
+      msg: hex(msg),
+      account_index: hex(account),
+      auth_binding: hex(await l3xHash(this.api, [DS.AUTH, secret])),
+    });
+    const [pd, ms] = await timed(() => backend.generateProof(witness, RECURSIVE));
+    const proof = bytesToFields(pd.proof).map(hex);
+    assert(proof.length === CLIENT_PROOF_FIELDS, `client proof has ${proof.length} fields, expected ${CLIENT_PROOF_FIELDS}`);
+    return { proof, publicInputs: pd.publicInputs, ms };
+  }
+
+  /** A valid proof of a random message, for the slots of a P-segment beyond its actions (agg_app verifies every slot). */
+  async dummyClientProof(): Promise<ClientProof> {
+    this.dummy ??= await this.clientProof(randomField(), randomField(), 0n);
+    return this.dummy;
+  }
+
+  /** MAX_CLIENT_PROOFS proofs, each authorizing a random message (M1). */
+  async randomClientProofs() {
+    const proofs: string[][] = [];
+    const publicInputs: string[][] = [];
+    const ms: number[] = [];
+    for (let i = 0; i < SHAPE.MAX_CLIENT_PROOFS; i++) {
+      const p = await this.clientProof(randomField(), randomField(), BigInt(i + 1));
+      proofs.push(p.proof);
+      publicInputs.push(p.publicInputs);
+      ms.push(p.ms);
+    }
+    return { proofs, publicInputs, meanMs: ms.reduce((a, b) => a + b, 0) / ms.length };
+  }
+
+  /**
+   * The Chonk IVC of a P-segment (agg_app and three kernels) over its client proofs: agg_app
+   * verifies them and folds their public inputs; the remaining slots carry a dummy proof.
+   */
+  async chonkSegment(clientProofs: ClientProof[], log = console.log): Promise<ChonkSegment> {
     const ms: Record<string, number> = {};
     const sizes: Record<string, number> = {};
     const api = this.api;
-    const { proofs, publicInputs, meanMs } = await this.clientProofs();
-    sizes.client_proof_fields = proofs[0].length;
-    ms.client_proof_mean = meanMs;
+    const count = clientProofs.length;
+    assert(count <= SHAPE.MAX_CLIENT_PROOFS, `${count} client proofs in one P-segment`);
+    for (const p of clientProofs) assert(p.proof.length === CLIENT_PROOF_FIELDS, 'a client action carries no proof (it was built for execution only)');
+    const dummy = await this.dummyClientProof();
+    const slots = [...clientProofs, ...Array<ClientProof>(SHAPE.MAX_CLIENT_PROOFS - count).fill(dummy)];
+    sizes.client_proof_fields = CLIENT_PROOF_FIELDS;
 
     const circuits = Object.fromEntries(IVC.map((p) => [p, readCircuit(p)]));
     const agg = await new Noir(circuits.agg_app as any).execute({
       client_vk: readVkJson('client_auth').vk,
-      proofs,
-      public_inputs: publicInputs,
+      proofs: slots.map((p) => p.proof),
+      public_inputs: slots.map((p) => p.publicInputs),
       count,
     });
     const aggOut = agg.returnValue as { actions_hash: string; count: string };
@@ -304,21 +340,23 @@ export class Prover {
     const chonkVk = bytesToFields(res.vk);
     const hidingVk = readVkJson('hiding_kernel').vk.map((x) => BigInt(x));
     assert(chonkVk.length === hidingVk.length && chonkVk.every((x, i) => x === hidingVk[i]), 'Chonk VK != hiding kernel VK');
-    log(`  chonk: ${proofs.length} client proofs × ${ms.client_proof_mean.toFixed(0)} ms, IVC ${chonkMs.toFixed(0)} ms`);
+    log(`  chonk: ${count} client proof(s) + ${SHAPE.MAX_CLIENT_PROOFS - count} dummies, IVC ${chonkMs.toFixed(0)} ms`);
     return { aggOut, chonkVk, chonkProof: fields.slice(2), ms, sizes };
   }
 
-  /** P-segment leaf. No client-proof actions execute yet (P2.5); the tube only logs the aggregation. */
-  async tube(start: Running, count: number = SHAPE.MAX_CLIENT_PROOFS, log = console.log) {
-    const seg = await this.chonkSegment(count, log);
-    const node = await this.proveNode('tube', {
-      chonk_vk: seg.chonkVk.map(hex),
-      chonk_proof: seg.chonkProof.map(hex),
-      agg: seg.aggOut,
-      config_hash: hex(this.configHash),
-      start: runningToNoir(start),
-    });
-    log(`  tube: ${node.ms.toFixed(0)} ms`);
+  /**
+   * P-segment leaf (SPEC.md §7.4, §9.2): the Chonk IVC over the segment's client proofs, then the
+   * tube, which verifies the Chonk proof, recomputes the aggregation from the actions and applies
+   * them. `inputs` is the engine's tube witness; its aggregation must be the IVC's.
+   */
+  async proveTube(inputs: Record<string, unknown>, clientProofs: ClientProof[], log = console.log) {
+    const seg = await this.chonkSegment(clientProofs, log);
+    const agg = inputs.agg as { actions_hash: string; count: string | number };
+    assert(
+      BigInt(agg.actions_hash) === BigInt(seg.aggOut.actions_hash) && BigInt(agg.count) === BigInt(seg.aggOut.count),
+      "the engine's aggregation != the IVC's",
+    );
+    const node = await this.proveNode('tube', { ...inputs, chonk_vk: seg.chonkVk.map(hex), chonk_proof: seg.chonkProof.map(hex) });
     return { node, chonk: seg };
   }
 
@@ -371,7 +409,25 @@ export class Prover {
  * A segment as the engine built it: the circuit, its inputs, the transition it must prove, and
  * for a trade segment its receipt leaves and receipts root (SPEC.md §11).
  */
-export type SegmentWitness = { pkg: string; label: string; inputs: Record<string, unknown>; expectedEnd: Running; receiptsRoot?: bigint; receiptLeaves?: bigint[] };
+export type SegmentWitness = {
+  pkg: string;
+  label: string;
+  inputs: Record<string, unknown>;
+  expectedEnd: Running;
+  receiptsRoot?: bigint;
+  receiptLeaves?: bigint[];
+  /** A P-segment's client proofs, one per applied action, in order (SPEC.md §7.4). */
+  clientProofs?: ClientProof[];
+};
+
+/**
+ * Stand-ins for a tube's Chonk VK and proof when a batch is only executed: witness generation does
+ * not check recursive proofs, so the tube's application of the actions runs without the IVC.
+ */
+export const chonkPlaceholder = () => ({
+  chonk_vk: readVkJson('hiding_kernel').vk,
+  chonk_proof: Array<string>(SHAPE.CHONK_PROOF_LENGTH).fill(hex(0n)),
+});
 
 export type BatchWitness = {
   batchNumber: bigint;
@@ -415,7 +471,8 @@ export async function executeBatch(prover: Prover, w: BatchWitness, log = consol
   let running = w.start;
   for (const seg of w.segments) {
     const t0 = performance.now();
-    const { returnValue } = await new Noir(readCircuit(seg.pkg) as any).execute(seg.inputs as any);
+    const inputs = seg.pkg === 'tube' ? { ...seg.inputs, ...chonkPlaceholder() } : seg.inputs;
+    const { returnValue } = await new Noir(readCircuit(seg.pkg) as any).execute(inputs as any);
     const got = nodeFields(nodeFromNoir(returnValue));
     const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd, receiptsRoot: seg.receiptsRoot ?? 0n });
     const bad = got.findIndex((x, j) => x !== want[j]);
@@ -501,7 +558,14 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
   const names: string[] = [];
   let running = w.start;
   for (const [i, seg] of w.segments.entries()) {
-    const node = await prover.proveNode(seg.pkg, seg.inputs);
+    let node: ProvedNode;
+    if (seg.pkg === 'tube') {
+      const t = await prover.proveTube(seg.inputs, seg.clientProofs ?? [], log);
+      ms[`chonk_${i}`] = t.chonk.ms.chonk_prove;
+      node = t.node;
+    } else {
+      node = await prover.proveNode(seg.pkg, seg.inputs);
+    }
     const got = nodeFields(node.out);
     const want = nodeFields({ configHash: prover.configHash, start: running, end: seg.expectedEnd, receiptsRoot: seg.receiptsRoot ?? 0n });
     const bad = got.findIndex((x, j) => x !== want[j]);

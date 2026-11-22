@@ -1,7 +1,7 @@
 use crate::{
     consts::{
         DS_ACCT, DS_ACCT_PRIV, DS_ACCT_PUB, DS_ACTV, DS_BLIND, DS_ENC, DS_KEY, DS_KEY_NODE, DS_KS, DS_MAUTH,
-        KEYS_HEIGHT, MARKETS, PLAINTEXT_LEN,
+        DS_MAUTH_P, KEYS_HEIGHT, MARKETS, PLAINTEXT_LEN,
     },
     tree::empty_root,
 };
@@ -132,6 +132,12 @@ pub fn account_leaf(p: AccountPub, q: AccountPriv) -> Field {
 /// Lane-S master authorization: a Grumpkin public key (SPEC.md §7.2).
 pub fn master_auth_of(pk_x: Field, pk_y: Field) -> Field {
     hash([DS_MAUTH, pk_x, pk_y])
+}
+
+/// Lane-P master authorization (SPEC.md §7.1, §7.4): proofs of the client circuit with VK hash
+/// `vk_hash` whose public input `auth_binding` matches control the account.
+pub fn master_auth_p(vk_hash: Field, auth_binding: Field) -> Field {
+    hash([DS_MAUTH_P, vk_hash, auth_binding])
 }
 
 pub fn enc_commitment(k_enc: Field) -> Field {

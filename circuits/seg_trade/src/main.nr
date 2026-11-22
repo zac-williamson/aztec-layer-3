@@ -14,7 +14,7 @@ use l3x_exchange::{
     trade::{
         abs, ACTION_PAYLOAD, action_msg, covers, equity, exposure_fresh, initial_margin, KIND_ADD_KEY,
         KIND_CANCEL, KIND_PLACE, KIND_REVOKE_KEY, KIND_WITHDRAW, TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC,
-        TIF_POST_ONLY, worst,
+        TIF_POST_ONLY, worst, write_key_slot,
     },
     tree::{merkle_root, update},
     withdrawal_record,
@@ -162,24 +162,8 @@ fn set_key(state: State, a: Action, act_auth: Activity) -> State {
     let idx = a.account_index;
     let leaf = account_leaf(a.taker_pub, a.taker_priv);
     st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, leaf, leaf, a.taker_acct_path);
-    let slot = a.p[0] as u32;
-    assert((slot as Field == a.p[0]) & (slot < KEY_SLOTS), "key slot");
-    assert(merkle_root(DS_KEY_NODE, a.key.leaf(), slot, a.key_path) == act_auth.keys_root, "key slot path");
-    let new_key = if a.kind == KIND_ADD_KEY {
-        let mask = a.p[3] as u32;
-        let max_notional = a.p[4] as u64;
-        let expiry = a.p[5] as u64;
-        assert(
-            (mask as Field == a.p[3]) & (max_notional as Field == a.p[4]) & (expiry as Field == a.p[5]),
-            "key parameters out of range",
-        );
-        assert((a.p[1] != 0) | (a.p[2] != 0), "empty key");
-        Key { pk_x: a.p[1], pk_y: a.p[2], market_mask: mask, max_notional, expiry, nonce: a.key.nonce }
-    } else {
-        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: a.key.nonce }
-    };
     let mut act = act_auth;
-    act.keys_root = merkle_root(DS_KEY_NODE, new_key.leaf(), slot, a.key_path);
+    act.keys_root = write_key_slot(act_auth.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p);
     st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     st
 }

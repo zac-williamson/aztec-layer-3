@@ -49,6 +49,7 @@ pub global DS_LIQ: Field = 48;
 pub global DS_KEY: Field = 49;
 pub global DS_KEY_NODE: Field = 50;
 pub global DS_RECEIPT_SIG: Field = 51;
+pub global DS_MAUTH_P: Field = 52;
 /// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
 /// tree's depth (SPEC.md §11).
 pub global RECEIPT_DEPTH: u32 = 24;

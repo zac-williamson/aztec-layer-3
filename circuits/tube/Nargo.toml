@@ -5,3 +5,4 @@ authors = [""]
 
 [dependencies]
 l3x_types = { path = "../l3x_types" }
+l3x_exchange = { path = "../l3x_exchange" }
