@@ -252,7 +252,6 @@ export class Engine {
     const record = await M.withdrawalRecord(this.h, recipient, amount, salt, r.batch, r.withdrawalsCount);
     r.withdrawals = await this.h([M.DS.WD_CHAIN, r.withdrawals, record]);
     r.withdrawalsCount += 1;
-    r.withdrawalsAmount += amount;
     this.wdRecords.push(record);
     await this.absorb(M.TAG.WD);
     await this.absorb(record);
@@ -447,6 +446,8 @@ export class Engine {
       actv: M.activityToNoir(M.newActivity()),
       actv_path: zeros(M.ACCOUNTS_HEIGHT),
       k_enc: hex(0n),
+      dep_amount: '0',
+      dep_salt: hex(0n),
     };
   }
 
@@ -475,7 +476,13 @@ export class Engine {
     }
     if (q.kind === M.KIND.FORCED_WITHDRAW) return this.applyForcedWithdraw(q, item, daNonce);
     assert(q.kind === M.KIND.DEPOSIT, 'unknown request kind');
-    const amount = q.b;
+    // The queue holds a commitment to the amount; the opening came to the operator by constrained
+    // delivery at deposit time (SPEC.md §10.3).
+    const opening = q.deposit;
+    assert(opening !== undefined, `no opening for the deposit committed in ${hex(q.b)}`);
+    assert((await M.depositCommitment(this.h, opening.amount, opening.salt)) === q.b, 'deposit opening does not match its commitment');
+    const amount = opening.amount;
+    Object.assign(item, { dep_amount: amount.toString(), dep_salt: hex(opening.salt) });
     const rec = q.a < this.numAccounts ? this.accts.get(q.a)! : undefined;
     // A credit that would take collateral out of range is refunded, as for a missing account.
     const credited = !!rec && rec.priv.collateral + amount < X.MAX_COLLATERAL;
@@ -489,7 +496,8 @@ export class Engine {
       });
     }
     if (!credited) {
-      await this.appendWithdrawal(q.sender, amount, await M.requestEntry(this.h, q));
+      // Refunded to the deposit's refund address; the depositor's salt keeps the record hidden.
+      await this.appendWithdrawal(q.c ?? 0n, amount, opening.salt);
       return item;
     }
     const priv = M.copyPriv(rec!.priv);

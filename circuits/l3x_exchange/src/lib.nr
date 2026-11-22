@@ -18,11 +18,24 @@ pub fn book_empty_root() -> Field {
     book::empty_root()
 }
 
-use consts::{DS_ORACLE, DS_WD, DS_WD_NODE, MAX_WD_BATCH, WD_HEIGHT};
+use consts::{DS_DEP, DS_DEPAMT, DS_ORACLE, DS_WD, DS_WD_NODE, MAX_WD_BATCH, WD_HEIGHT};
 use l3x_types::hash::hash;
 
-/// A withdrawal or refund record (SPEC.md §10.4, C0 profile): the vault pays `recipient`
-/// `amount` once, on proof of inclusion in the batch's withdrawals tree.
+/// A queued deposit's amount commitment (SPEC.md §10.3): the priority entry carries this, never
+/// the amount. The salt is the depositor's secret.
+pub fn deposit_commitment(amount: Field, salt: Field) -> Field {
+    hash([DS_DEPAMT, amount, salt])
+}
+
+/// The blind of the credit a deposit moves into the Bridge (SPEC.md §10.3). It binds the deposit's
+/// account, refund address and depositor, so the credit's opening fixes all of them.
+pub fn deposit_blind(account_index: Field, refund_to: Field, depositor: Field, salt: Field) -> Field {
+    hash([DS_DEP, account_index, refund_to, depositor, salt])
+}
+
+/// A withdrawal or refund record (SPEC.md §10.4): paid once to `recipient`, by custody inside a
+/// net or, after t_payout, from the vault directly, on proof of inclusion in the batch's
+/// withdrawals tree.
 pub fn withdrawal_record(recipient: Field, amount: u64, salt: Field, batch: u64, index: u32) -> Field {
     hash([DS_WD, recipient, amount as Field, salt, batch as Field, index as Field])
 }

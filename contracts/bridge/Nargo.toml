@@ -7,5 +7,5 @@ authors = [""]
 aztec = { git = "https://github.com/aztec-labs-eng/aztec-nr", tag = "v6.0.0", directory = "aztec" }
 bb_proof_verification = { path = "../../circuits/vendor/bb_proof_verification" }
 l3x_exchange = { path = "../../circuits/l3x_exchange" }
-l3x_token = { path = "../token" }
+ctoken = { path = "../ctoken" }
 l3x_types = { path = "../../circuits/l3x_types" }

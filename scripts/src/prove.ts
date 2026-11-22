@@ -28,7 +28,7 @@ async function main() {
     engine.keyring.set(encC, k.kEnc);
     const sender = randomField();
     reqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender, time: now - 60n });
-    reqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: 1000n * BigInt(i + 1), sender, time: now - 50n });
+    reqs.push(await M.depositRequest(h, BigInt(M.PROTOCOL_ACCOUNTS + i), 1000n * BigInt(i + 1), sender, now - 50n));
   }
   await engine.beginBatch(1n, 0n, 0n, 0n);
   const update = (m: bigint, price: bigint) => signUpdate(h, engine.domain, oracleSks, [0, 1], m, price, price, now);

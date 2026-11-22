@@ -1,5 +1,5 @@
 [package]
-name = "l3x_token"
+name = "ctoken"
 type = "contract"
 authors = [""]
 

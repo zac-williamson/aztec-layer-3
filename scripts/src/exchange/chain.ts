@@ -11,11 +11,13 @@ import { ROOT } from '../lib.ts';
 
 export const DA_LOG_TAG = 0x6c33782e64612e7631n;
 
-export function rawArtifact(name: 'l3x_bridge-L3XBridge' | 'l3x_token-L3XToken'): any {
+export type ArtifactName = 'l3x_bridge-L3XBridge' | 'ctoken-ConfidentialToken';
+
+export function rawArtifact(name: ArtifactName): any {
   return JSON.parse(readFileSync(join(ROOT, 'contracts', 'target', `${name}.json`), 'utf8'));
 }
 
-export const artifact = (name: 'l3x_bridge-L3XBridge' | 'l3x_token-L3XToken') => loadContractArtifact(rawArtifact(name));
+export const artifact = (name: ArtifactName) => loadContractArtifact(rawArtifact(name));
 
 /** Event metadata, built from the artifact the same way `aztec codegen` builds it. */
 export async function eventMeta(raw: any, name: string) {

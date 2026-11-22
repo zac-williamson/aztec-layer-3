@@ -76,14 +76,14 @@ async function main() {
     engine.keyring.set(encC, u.keys.kEnc); // delivered by Bridge.register in a deployment
     reqs.push({ kind: M.KIND.REGISTER, a: masterAuth, b: encC, sender: u.addr, time: now - 100n + BigInt(i) });
   }
-  reqs.push({ kind: M.KIND.DEPOSIT, a: A, b: 1_000_000n, sender: users[0].addr, time: now - 90n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: B, b: 2_000_000n, sender: users[1].addr, time: now - 85n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: C, b: 3_000_000n, sender: users[2].addr, time: now - 84n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: D, b: 5_000_000n, sender: users[3].addr, time: now - 83n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: E, b: 30_000n, sender: users[4].addr, time: now - 82n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: F, b: 25_000n, sender: users[5].addr, time: now - 81n });
-  reqs.push({ kind: M.KIND.DEPOSIT, a: 99n, b: 500n, sender: users[1].addr, time: now - 80n }); // no account 99: refund
-  reqs.push({ kind: M.KIND.DEPOSIT, a: M.INSURANCE_INDEX, b: 20_000n, sender: users[2].addr, time: now - 79n }); // seed the insurance fund
+  reqs.push(await M.depositRequest(h, A, 1_000_000n, users[0].addr, now - 90n));
+  reqs.push(await M.depositRequest(h, B, 2_000_000n, users[1].addr, now - 85n));
+  reqs.push(await M.depositRequest(h, C, 3_000_000n, users[2].addr, now - 84n));
+  reqs.push(await M.depositRequest(h, D, 5_000_000n, users[3].addr, now - 83n));
+  reqs.push(await M.depositRequest(h, E, 30_000n, users[4].addr, now - 82n));
+  reqs.push(await M.depositRequest(h, F, 25_000n, users[5].addr, now - 81n));
+  reqs.push(await M.depositRequest(h, 99n, 500n, users[1].addr, now - 80n)); // no account 99: refund
+  reqs.push(await M.depositRequest(h, M.INSURANCE_INDEX, 20_000n, users[2].addr, now - 79n)); // seed the insurance fund
   let netDeposits = 11_075_000n;
   const report: Record<string, unknown> = {};
 
@@ -288,9 +288,9 @@ async function main() {
   await engine.block(t6, [await update(0n, 1750n, 1750n, t6 - 1n)]);
   await engine.priority([
     { kind: M.KIND.REGISTER, a: graceAuth, b: graceEnc, sender: grace.addr, time: t6 },
-    { kind: M.KIND.DEPOSIT, a: G, b: 500_000n, sender: grace.addr, time: t6 },
+    await M.depositRequest(h, G, 500_000n, grace.addr, t6),
     { kind: M.KIND.REGISTER, a: heidiAuth, b: heidiEnc, sender: heidi.addr, time: t6 },
-    { kind: M.KIND.DEPOSIT, a: Hd, b: 300_000n, sender: heidi.addr, time: t6 },
+    await M.depositRequest(h, Hd, 300_000n, heidi.addr, t6),
   ]);
   netDeposits += 800_000n;
   // The client proves each action; without proving, the actions carry only the proofs' public inputs.
@@ -403,7 +403,7 @@ async function main() {
   await engine.priority([
     { kind: M.KIND.FORCED_CANCEL_ALL, a: C, b: 0n, sender: users[2].addr, time: t8 },
     { kind: M.KIND.REGISTER, a: ivanAuth, b: ivanEnc, sender: ivan.addr, time: t8 },
-    { kind: M.KIND.DEPOSIT, a: Iv, b: 100_000n, sender: ivan.addr, time: t8 },
+    await M.depositRequest(h, Iv, 100_000n, ivan.addr, t8),
   ]);
   netDeposits += 100_000n;
   const iSess = await keysFromSeed(h, 9009n);

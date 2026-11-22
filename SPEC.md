@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), and a WebAuthn passkey client circuit (P2.12), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.11, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), and C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -19,7 +19,7 @@ Non-goals for v1: confidentiality against the operator; account anonymity; hidin
 
 Why a rollup and not Aztec contracts: an order as an Aztec transaction costs seconds of client proving plus block inclusion, orders of magnitude from CLOB requirements. Why Aztec and not Ethereum, where Lighter settles:
 
-- deposits and withdrawals move to and from Aztec private balances, with only net totals per custody transaction public (§10.3);
+- deposits and withdrawals move to and from confidential balances of the collateral token, with only net totals per custody transaction public (§10.3, §10.5);
 - the exchange composes with private Aztec applications;
 - its per-batch market data reaches Aztec contracts with a proof that the exchange's rules were followed.
 
@@ -88,7 +88,7 @@ Gaps that MUST be closed before the pipeline secures value:
 | That a deposit or withdrawal occurred; its Aztec block | yes | yes | no |
 | Deposit amount | no; only the net vault change per custody transaction (§10.3) | yes | no |
 | Withdrawal amount | no (inside the custody net); yes for claims paid directly from the vault (§10.4) | yes | no |
-| Depositor and withdrawal-recipient Aztec addresses | not protected; treat as public | yes | no |
+| Depositor and withdrawal-recipient Aztec addresses | yes: the token records every confidential payment's parties (§10.5) | yes | no |
 | Index, mark, funding rate, cumulative funding | yes | yes | yes |
 | Best bid and ask prices; per-batch last, VWAP, high, low | yes [D1] | yes | yes |
 | Volume, open interest, insurance fund | bucketed or hidden [D1] | yes | no |
@@ -102,13 +102,13 @@ Rules:
 - Every public output MUST be a market-level aggregate (§8.4). No public output may depend on a single account's values, except orders whose owner opts into display.
 - Order activity MUST NOT be published. Orders, nonces and session keys live in trees whose leaves never enter DA (§6.4, §6.5), so the public learns when an account's balances change, not when it quotes.
 - Counterparty pairing MUST NOT be derivable from public data. The set of accounts touched in a batch is public; their pairing is not.
-- Custody transactions MUST NOT create notes addressed to any party whose viewing key is public; intermediate notes go to operator-keyed transit escrows (§10.3).
+- Custody MUST NOT reveal an individual deposit or payout amount: each custody transaction moves only its net against the vault (§10.3), and the batch header carries no withdrawal total (§10.4).
 
 Residual leakage:
 
 - per-account timing and frequency of balance changes;
 - counts of touched accounts, padded slot tuples, nullifiers, notes and logs;
-- deposit and withdrawal timing, net custody flows, and the vault total;
+- deposit and withdrawal timing, parties and accounts, net custody flows, and the vault total;
 - top-of-book and print prices.
 
 Sparse activity enables inference, for example when one account changes in a batch whose print moved. A formal leakage analysis is outstanding.
@@ -365,7 +365,7 @@ Every action conserves collateral exactly across the touched accounts, the fee a
 Σ_accounts equity = vault − swept-but-unprocessed deposits − settled-but-unpaid withdrawals and refunds
 ```
 
-Unrealized PnL and funding sum to zero across accounts, so `Σ equity` equals net credited deposits. It is therefore never negative, and the vault always covers the two senior terms.
+Unrealized PnL and funding sum to zero across accounts, so `Σ equity` equals net credited deposits. It is therefore never negative, and the vault always covers the two senior terms. Pending deposits are credits the Bridge holds outside the vault, and the vault excludes the operator's bond and open challenge fees (§10.3, §11).
 
 ## 9. Batches, proving, data availability
 
@@ -480,22 +480,22 @@ Refresh costs `N_accounts · (2 + 2·P_MAX) / (W / slot)` fields per batch: abou
 | `state_root`, `accounts_root`, `batch_number`, `last_time`, `priority_cursor` | `PublicMutable` | exchange tip |
 | `root_vk_hash`, `config_hash`, `operators` | `DelayedPublicMutable` | readable in private; changes take effect after `upgrade_delay`. A `DelayedPublicMutable` cannot be set without its delay, so the genesis values live in `PublicImmutable` and apply until a scheduled change takes effect. |
 | `priority_count`, `priority_head[n]`, `priority_time[n]` | `PublicMutable`, `Map` | priority queue as hash-chain prefixes, `priority_head[0] = 0` |
-| `pending_deposit[h]` | `Map` | deposits awaiting sweep: submission time and status |
-| `withdrawals_root[batch]`, `settled_time[batch]`, `market_data_hash` | `Map`, `PublicMutable` | settled withdrawal lists, settlement times, latest market data |
+| `deposits[credit]` | `Map` | deposits' credits: status (pending, swept, reclaimed) and submission time |
+| `withdrawals_root[batch]`, `settled_time[batch]`, `withdrawal_paid[record]`, `market_data_hash` | `Map`, `PublicMutable` | settled withdrawal lists, settlement times, paid records, latest market data |
 | desert state | `PublicMutable`, `Map` | flag, frozen `accounts_root`, `market_data_hash` and `config_hash`, claim window, claims (§12) |
 
 | Function | Context | Behaviour |
 | --- | --- | --- |
 | `register(master_auth, enc_key_commitment, k_enc)` | private | asserts `H(DS_ENC, k_enc) == enc_key_commitment`; charges `request_fee`; queues `Register` with `owner = msg_sender`; delivers `k_enc` to the operator by constrained on-chain delivery |
-| `deposit(account_index, amount, refund_to, sk_d)` | private | §10.3 |
+| `deposit(account_index, amount, refund_to, salt, credits, change_blind, authwit_nonce)` | private | §10.3 |
 | `submit_forced(request)` | private | charges `request_fee`; queues the request with `msg_sender`, optionally encrypted |
 | `settle(header, proof, vk, da_payload, da_len)` | private | asserts `msg_sender ∈ operators` and `header.config_hash == config_hash`; checks `da_hash` over the first `da_len` fields; `verify_honk_proof(vk, proof, [H(header)], root_vk_hash)`; `enqueue_self._apply(header, da_payload, da_len)` |
 | `schedule_upgrade(vk_tree_leaves, params_hash, root_vk_hash)` | public, operator | recomputes `config_hash` from the preimage, schedules it and `root_vk_hash` together, and publishes the preimage |
 | `schedule_operator(operator)` | public, operator | schedules a new operator |
 | `_apply(header, da_payload)` | public, only-self | §10.2 |
-| `custody(…)` | private, operator | §10.3, §10.4 |
-| `reclaim_deposit(record)` | private | §10.3 |
-| `claim_withdrawal(batch, record, path)` | private | §10.4 |
+| `custody(deposits, n_deposits, payouts, n_payouts)` | private, operator | §10.3, §10.4 |
+| `reclaim_deposit(opening, blind)` | private | §10.3 |
+| `claim_withdrawal(batch, index, recipient, amount, salt, path)` | private | §10.4 |
 | `activate_desert`, `desert_refund`, `exit_register`, `exit_withdraw` | public or private | §12 |
 
 No Bridge function may change the Bridge's own contract class (§12). Configuration changes publish the new configuration's preimage as a public event when they are scheduled.
@@ -521,52 +521,89 @@ It then:
 
 ### 10.3 Custody [D2]
 
-The default profile is **C1: escrow transit with a public vault**. The vault is the Bridge's public token balance. Escrows follow the Aztec Standards Escrow pattern: authorization is `msg_sender == salt`, fixed in the escrow's address. The pattern is extended with transfers to public balances.
+The default profile is **C1: confidential transit with a public vault**. The vault is the Bridge's public balance of the collateral token (§10.5). Individual deposits and payouts move as credits, whose amounts are hidden; the vault only ever changes by the net of one custody transaction.
 
-This section assumes an AIP-20-style token interface. L3X's collateral will be a new confidential token with purpose-built bridges [D7], and custody will be re-derived against that token's interface.
+A credit is spendable only by a call from its owner (§10.5), not by whoever holds a key, so the Bridge can hold credits itself. No escrow contracts or transit escrows are needed: draft 0.10's `E_d` and `T_i` existed because a note can be spent only with its owner's keys, which a contract does not have.
 
-- **Deposit.** The user derives a fresh escrow `E_d` with `salt = bridge` and keys from `sk_d = H(user_secret, deposit_nonce)`. `Bridge.deposit`:
-  - checks the derivation and that `amount ≥ min_deposit`;
-  - calls `Token.transfer_private_to_private(user → E_d, amount)` under the user's authwit;
-  - records `pending_deposit[h]` for `h = H(DS_DEP, account_index, token, amount, E_d, refund_to, salt)`;
-  - delivers the record's preimage and `sk_d` to the operator by constrained on-chain delivery.
+- **Deposit.** `Bridge.deposit(account_index, amount, refund_to, salt, credits, change_blind, authwit_nonce)`, a private function:
+  - asserts `min_deposit ≤ amount < MAX_DEPOSIT`;
+  - calls `Token.transfer(depositor → Bridge, amount)` under the depositor's authorization of that exact call. The new credit is owned by the Bridge and has blind `deposit_blind = H(DS_DEP, account_index, refund_to, depositor, salt)`, so its opening fixes the account, the refund address and the depositor. The change returns to the depositor;
+  - delivers the opening `(account_index, amount, refund_to, depositor, salt)` to the operator by constrained delivery;
+  - records `deposits[credit] = (PENDING, now)` and emits `DepositPending(credit, account_index, refund_to, depositor, time)`.
 
-  `refund_to` is an Aztec address fixed by the depositor. Every refund path pays only `refund_to`, so knowing `sk_d` does not let the operator redirect funds. Only the Bridge can move funds out of `E_d`. The public sees that a deposit happened, not its amount.
-- **Custody transaction.** The operator uses a transit escrow `T_i` from a small pool: `salt = bridge`, operator-held keys, and a pre-established handshake with the operator. In one transaction it:
-  1. drains k pending deposits' escrows into `T_i` and appends their records to the priority queue, so the queue only ever holds funded deposits;
-  2. pays due withdrawals and refunds from `T_i` (§10.4);
-  3. settles the net against the vault, with `transfer_private_to_public` for a net inflow or `transfer_public_to_private` for a net outflow.
+  `refund_to` is an Aztec address fixed by the depositor. Every refund path pays only `refund_to`, so knowing the opening does not let the operator redirect funds. The public sees that a deposit happened, its account and its parties, not its amount.
+- **Custody transaction.** `Bridge.custody(deposits, n_deposits, payouts, n_payouts)`, private, operator only, with up to 4 deposits and 4 payouts. In one transaction it:
+  1. spends the deposits' credits, which proves each opening;
+  2. pays settled records (§10.4) as new credits of their recipients, delivered by constrained delivery, after checking each record's path to its batch's `withdrawals_root` and that it is unpaid;
+  3. settles the net against the vault in the same token call (`Token.settle`, §10.5): `Σ deposits + net_out = Σ payouts + net_in`;
+  4. marks the deposits `SWEPT` and appends each to the priority queue as `Deposit(a = account_index, b = H(DS_DEPAMT, amount, salt), c = refund_to)` with the depositor as sender, so the queue only ever holds funded deposits and never their amounts;
+  5. asserts the vault still covers the bond and open challenge fees.
 
-  AIP-20 creates the note of a public-to-private transfer in the private phase, so `T_i` can spend it in the same transaction. `T_i` ends every transaction with a zero balance, so its key never controls funds between transactions.
+  The public effects are the net vault change, the swept credits, the paid record hashes, the recipients' addresses and the queue entries. The operator SHOULD include at least `k_min` flows per custody transaction [D2].
 
-  Intermediate notes still leave logs, because v6 constrained-tagged logs are not squashed, but those logs are encrypted to `T_i`. The public effects are the net vault change, nullifiers of drained deposit notes and paid withdrawal ids, recipient notes and logs, and queue appends. The operator SHOULD include at least `k_min` flows per custody transaction [D2].
-
-  Constrained-delivery sequences are strictly ordered per (sender, recipient). The pool of transit escrows therefore lets custody transactions run in parallel, and payouts to one recipient SHOULD be batched.
-- **Reclaim.** Once a pending deposit has gone unswept for `T_dep` (default 24 h), or at any time in desert mode, anyone may call `reclaim_deposit`. It drains `E_d` to `refund_to`. A concurrent sweep and reclaim are resolved by `E_d`'s note nullifiers: whichever transaction lands first wins.
+  Constrained-delivery sequences are strictly ordered per (sender, recipient), and two sends to one recipient in a transaction need a handshake committed earlier. The operator therefore pays at most one record per recipient per custody transaction until their handshake exists.
+- **Reclaim.** Once a pending deposit has gone unswept for `T_dep` (default 24 h), or at any time in desert mode, anyone holding its opening may call `reclaim_deposit`. It returns the credit to `refund_to` as a new credit, delivered by constrained delivery, and marks the deposit `RECLAIMED`. A concurrent sweep and reclaim are resolved by the credit's spent nullifier: whichever transaction lands first wins.
 - **Scope.** Deposits can be censored (the operator may decline to sweep one) but not lost, and they never trigger desert mode, so dust deposits cannot force it [D13].
 
-Draft 0.1 kept collateral in a "float" escrow with a published key. That leaked every intermediate amount, because anyone could decrypt its constrained-tagged logs.
+Draft 0.1 kept collateral in a "float" escrow with a published key, which leaked every intermediate amount. Drafts 0.2–0.10 used per-deposit escrows and operator-keyed transit escrows over an AIP-20-style token; the D7 token makes them unnecessary.
 
 Alternatives:
 
-- **C0, public vault only**: deposits use `transfer_private_to_public` and every payout comes from the vault directly, so every amount is public. Simplest; for the first prototype only.
-- **C2, private pool**: collateral sits in one escrow whose key is held by the operator, so not even the total is public. Exits in desert mode then need that key, so funds liveness depends on the operator or a guardian set holding it. Not recommended.
+- **C0, public vault only**: deposits and payouts move public balances, so every amount is public. P1 used it.
+- **C2, private pool**: collateral sits in a confidential balance whose opening only the operator knows, so not even the total is public. Exits in desert mode then need that opening, so funds liveness depends on the operator or a guardian set. Not recommended.
 
 ### 10.4 Withdrawals and refunds
 
 A `Withdraw` or `ForcedWithdraw` debits the account in the batch. A deposit the circuit rejects (for example, one naming an account that does not exist) becomes a refund to its `refund_to`. Both append a record:
 
 ```
-record        = H(DS_WD, withdrawal_id, account_index, recipient, token, amount)
-withdrawal_id = H(DS_WDID, batch_number, index_in_batch, salt)
-salt          = H(DS_WDSALT, k_enc, batch_number, index_in_batch)
+record = H(DS_WD, recipient, amount, salt, batch_number, index_in_batch)
+salt   = H(DS_WDSALT, k_enc, batch_number, index_in_batch)     withdrawals
+salt   = the deposit's salt                                       refunds
 ```
 
-For a refund, the depositor's `salt` from the deposit record replaces the `k_enc` derivation, so the depositor can rebuild it. The salt makes `withdrawal_id` globally unique and unguessable, so record hashes in DA cannot be brute-forced from public owners and plausible amounts. The record's fields and salt are also in the owner's encrypted change entry, so the owner can always rebuild the record.
+The salt makes each record unguessable, so record hashes in DA cannot be brute-forced from public recipients and plausible amounts, and lets the owner rebuild the record: the account's owner from its key, the depositor from its salt. The record's fields and salt are also in the owner's encrypted change entry.
 
-After settlement the operator pays records in `custody` from `T_i`: it proves inclusion in `withdrawals_root[batch]` (historical public read), emits `withdrawal_id` as a nullifier, and pays the recipient privately. The amount is hidden inside the custody net; the recipient's address is not protected (§4).
+The header publishes a batch's `withdrawals_root` and record count, not their total: since draft 0.11 the total is hidden, as custody pays records inside a net.
 
-If a record is unpaid `T_payout` (default 24 h) after `settled_time[batch]`, the owner calls `claim_withdrawal`, which pays from the vault directly; the amount becomes public. The vault is a public balance, so a claim cannot be blocked by consuming a note under it.
+After settlement the operator pays records in `custody` (§10.3). The amount is hidden inside the custody net; the recipient's address is not protected (§4).
+
+If a record is unpaid `T_payout` (default 24 h) after its batch settled, anyone may call `claim_withdrawal`, which pays the recipient from the vault into its public balance; the amount becomes public. The vault is a public balance, so a claim cannot be blocked by consuming anything under it. Its path is folded in the private phase; the public phase compares the root with the batch's.
+
+### 10.5 Collateral token [D7]
+
+The collateral is a token built for L3X: **amounts hidden, addresses public**. It is confidential in the same sense as the exchange (§1): who pays whom is public, how much is not. The Shield bridge, which makes holdings private, does not fit. The token's L1 bridges are not built yet; the token's `minter` stands in for them.
+
+**Balances.** An address holds a public balance, a plain amount as in an ERC-20, and a confidential balance, a set of credits.
+
+```
+credit       = H(DS_CREDIT, owner, amount, blind)       never published
+created(c)   = H(DS_CREATED, c)                          nullifier, emitted when c is created
+spent(c)     = H(DS_SPENT, c)                            nullifier, emitted when c is spent
+```
+
+- Creating a credit emits `created(c)`; the duplicate-nullifier rule makes credits unique.
+- Spending a credit proves that `created(c)` exists, by a nullifier read request against the anchor block, and emits `spent(c)`, so a credit is spent once.
+- Only the owner spends: every private function recomputes `c` with the caller (or the address that authorized the call) as the owner. Spending authority is the caller, not a key, so contracts hold credits like accounts.
+- Every private function checks value conservation and amount ranges in the circuit. A zero amount marks an unused input or output; no credit has a zero amount.
+- The two nullifiers of a credit cannot be linked without its opening, so the public cannot tell which earlier payment funded a later one.
+
+**Functions.**
+
+| Function | Context | Effect |
+| --- | --- | --- |
+| `mint(to, amount)`, `burn(amount)` | public | the minter creates supply in a public balance; anyone destroys its own |
+| `transfer_public`, `approve`, `transfer_public_from` | public | public balances, with ERC-20 allowances |
+| `shield(amount, blind)` | private | caller's public balance → a new credit of the caller |
+| `transfer(from, to, amount, credits[2], blind, change_blind, authwit_nonce)` | private | credits of `from` → a credit of `to` plus change; a caller other than `from` needs `from`'s authorization of the exact call |
+| `unshield(to, amount, credits[2], change_blind)` | private | caller's credits → public balance of `to`, plus change |
+| `settle(credits[4], outputs[4], public_in, public_out)` | private | caller's credits and `public_in` from its public balance → the outputs and `public_out` to its public balance |
+
+**Delivery.** A new credit's opening reaches its owner by constrained delivery, except when the owner is the caller, who chose it. Change returns to the payer by unconstrained delivery, since only the payer could be harmed by a wrong message. Constrained delivery stops a payer, or the operator's custody, from paying a credit its recipient cannot open.
+
+**Parties.** Every confidential payment emits a plaintext log `(tag = "ct.parties", from, to)`. Public balance changes emit `PublicTransfer(from, to, amount)`, with the token itself standing for the confidential side of `shield`, `unshield` and `settle`.
+
+**Limits.** A private call may emit 16 nullifiers. Each input emits one (`spent`) and each output three (`created`, its delivered event's commitment and its constrained-delivery sequence nullifier), so `settle` with 4 inputs and 4 outputs emits exactly 16. That caps one custody transaction at 4 deposits and 4 payouts.
 
 ## 11. Sequencing and receipts
 
@@ -590,19 +627,18 @@ Every desert function uses only frozen values.
 
 **Claims, by seniority:**
 
-1. **Pending deposits** (never swept): `reclaim_deposit` to `refund_to`, at any time.
-2. **Swept, unprocessed deposits**: `desert_refund` pays `refund_to` from the vault. The depositor knows the record preimage.
-3. **Settled, unpaid withdrawals and refunds**: `claim_withdrawal` from the vault.
+1. **Pending deposits** (never swept): `reclaim_deposit` returns the credit to `refund_to`, at any time. They were never in the vault, so they take nothing from it.
+2. **Swept, unprocessed deposits**: `desert_refund(index, account_index, amount, salt, refund_to, depositor, time)` rebuilds the queue entry from the deposit's opening and pays `refund_to` from the vault. The depositor holds the opening.
+3. **Settled, unpaid withdrawals and refunds**: `claim_withdrawal` from the vault, without waiting for `T_payout`.
 4. **Accounts**: `exit_register` proves, in a private function, the opening of the account's leaf in the frozen `accounts_root` and records its equity under a per-account nullifier. The path and the opening both come from the last `W` of DA. Anyone may register a claim; it pays only the leaf's `owner`.
 
-**Payout.** Items 2–4 register within `T_claim`. When the window closes:
+**Payout.** Items 2–3 are paid in full from the vault when claimed, until the payout ratio is fixed. Their amounts are hidden until claimed, so the vault cannot reserve for them; they keep their seniority by being claimed within `T_claim`. Account claims register within `T_claim`. At the first account payout after the window:
 
-- items 2–3 are paid in full from the vault;
-- registered account claims are paid `min(1, V/U)·claim`, where `V` is what remains and `U` is their total;
-- later claims are paid from the residual in the same order, at no better than the same ratio, without time limit;
+- the ratio is fixed at `min(1, V/U)`, where `V` is the vault and `U` the registered account claims' total, and each registered account claim is paid `ratio·claim`;
+- later claims of any kind are paid from the residual, the vault less what the window's account claims are still owed, first come first served: a later account claim at no better than the ratio, a later item 2 or 3 in full if the residual allows;
 - protocol accounts (`insurance`, `fee`) are paid last, only from the residual, and only after `T_late` (default 1 year), so triggering desert mode cannot profit the operator.
 
-Exit amounts are public in desert mode. Underwater accounts do not register, so their deficit is socialized through the pro-rata factor; by §8.8 the vault always covers items 2–3.
+Exit amounts are public in desert mode. Underwater accounts do not register, so their deficit is socialized through the pro-rata factor; by §8.8 the vault covers items 2–3 claimed in the window in full.
 
 **Upgrades.** The Bridge MUST be immutable: no function may update its contract class. Aztec's default update delay is one day and its minimum is 600 s, either of which would undercut every deadline here. The exchange evolves only through `root_vk_hash`, `config_hash` and `operators`. Changes to these take effect after `upgrade_delay` (default 21 days), which MUST exceed `T_force + T_payout` plus a margin, so users can exit first. No key may shorten the delay; Lighter's 21-day timelock can be zeroed by a 4-of-7 multisig, which is the main reason ETHBEAT rates it Stage 0.
 
@@ -716,7 +752,7 @@ P0 status (2026-11-21): complete on Aztec 6.0.0 rather than 6.1, which had not y
 - The Bridge's checks are covered by TXE tests: replay, priority-queue forgeries, `T_force`, time bounds, halt and resume, and delayed configuration and operator changes.
 - M1, M4, M5 and M7 are measured (§14); M2 and M3 are the IVC and tube figures from the same runs.
 
-Left for later phases: a client subtree with more than one circuit (built in P2.7), and the custody paths of C1 (P2).
+Left for later phases: a client subtree with more than one circuit (built in P2.7), and the custody paths of C1 (built in P2.13).
 
 ### P1 profile (as built, 2026-11-21)
 
@@ -832,6 +868,7 @@ P2 is built in increments, each leaving every test green.
 - P2.10: dead-order removal, and ticks that read only live orders.
 - P2.11: the risk sweep (§8.7), checked at refresh.
 - P2.12: a WebAuthn passkey client circuit.
+- P2.13: C1 custody over the D7 collateral token.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1222,6 +1259,30 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - Signature counters are not checked; the operator can watch them for cloned authenticators.
 - **Cost.** `client_webauthn` is 87,206 gates and proves in 0.7–1 s on the reference laptop, with the build running alongside. The P-256 verification is about half of it (46,551 gates alone in `client_p256`); the seven SHA-256 compressions are a cheap black box.
 
+**C1 custody and the collateral token** (P2.13, §10.3–§10.5):
+
+- **Token.** `ConfidentialToken` (`contracts/ctoken`) implements §10.5: public balances with allowances, credits as nullifier pairs, `shield`, `transfer` (with `authorize_once` for callers acting for `from`), `unshield` and `settle`. Its public bytecode is 213 fields.
+- **Deposit.** A depositor shields a public balance and calls `Bridge.deposit`, which pulls the amount through `Token.transfer` under the depositor's authorization. The credit's blind binds the account, refund address and depositor; the opening goes to the operator by constrained delivery.
+- **Custody.** One operator call sweeps up to four deposits and pays up to four records through one `Token.settle`, whose public leg is the net. Payout paths are folded in the private phase; the public phase checks their roots against the batches, marks the records paid, queues the deposits and checks that the vault still covers the bond.
+- **Queue.** A `Deposit` entry is `(a = account, b = H(DS_DEPAMT, amount, salt), c = refund_to)`. `seg_priority` takes the opening as witness and checks it against `b`. A refund record goes to `refund_to`, salted with the deposit's salt instead of the public entry.
+- **Header.** `withdrawals_amount` left the header and `Running` (18 and 13 fields), and the Bridge no longer tracks unpaid withdrawals or queued deposits as public totals. Desert mode instead pays items 2–3 in full until the payout ratio is fixed (§12).
+- **Claims.** `claim_withdrawal` waits `T_payout` outside desert mode and pays into the recipient's public balance. It and `desert_refund` fold their hashes in the private phase.
+- **Deployment size.** The Bridge's public bytecode grew to 1,664 fields, past the local network's per-transaction DA admission limit (the deployment needed 56,768 of 55,836 DA gas). Moving the claim's path, the refund's entry and the custody event out of public code brought it to 1,598 fields.
+
+**Tests** (P2.13):
+
+- **Token TXE:** 18 tests: shielding, payment with change, unshielding, settlement against a public balance (four payees, the 16-nullifier limit), conservation, double spends, another owner's credit, an invented credit, payment beyond the inputs, and authorization for exactly one call.
+- **Bridge TXE:** 82 tests, up from 65. New: deposits wait for custody, need the depositor's authorization and a minimum; only the operator runs custody; a deposit is swept once and cannot be altered; custody nets deposits against payouts, pays a net outflow, pays a record once, cannot inflate or redirect a payout, and never pays from the bond; reclaim waits for `T_dep`, pays only `refund_to`, and races a sweep; a claim waits for `T_payout`; desert refunds are senior in the window and junior after the ratio is fixed.
+- **Adversarial:** a deposit credited with an inflated amount, 79 witnesses in all.
+- **Native** and every proving suite run unchanged in shape, with deposits queued as commitments.
+- **Exit test** on the 6.0.0 local network, with real client proofs:
+  - Alice and Bob shield public balances and deposit three times, one spending a deposit's change; the vault stays empty until custody. The operator opens every pending deposit from its delivered openings.
+  - Custody 1 sweeps the three deposits (net in 3,000,777). Custody 2 pays Bob's batch-1 refund as a credit (net out 777), which Bob finds by constrained delivery and spends. Custody 3 sweeps a new deposit of Alice's and pays Bob's forced withdrawal (net out 1,972,283).
+  - Bob's batch-2 withdrawal, which custody never paid, is claimed from the vault after `t_payout` with the DA and his key alone.
+  - In desert mode, Alice's queued deposit is refunded from the vault and her unswept one returns to her as a credit. Payouts match the engine exactly: Alice 1,005,366 plus her 5,000 refund, Bob 16,230, and the fee account's 119 after `t_late`, which leaves 2 units of funding rounding.
+  - Every deposit and payout publishes its payer and payee in the token's plaintext log, read back from the transaction's effects, and no amount.
+  - Client-proved transaction times on the reference laptop, over two runs: a shield 5.7–7.1 s, a deposit with its authorization 6.5–7.1 s, a custody transaction 6.5–7.3 s.
+
 **Tests** (P2.12):
 
 - **Native**, batch 8: Ivan registers with a passkey and grants a session key with a WebAuthn assertion, proved through the IVC and the tube. The DA reopens his account.
@@ -1277,7 +1338,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments:**
 
-1. C1 custody (§10.3), once the D7 token is specified.
+1. The collateral token's L1 bridges (D7): a portal that mints into public balances on an L1 deposit and burns on withdrawal.
 2. From P3: the ranking of ADL counterparties (§8.5).
 
 ## 16. Decisions
@@ -1292,7 +1353,7 @@ All resolved on 2026-11-20. The draft default was adopted for every decision exc
 | D4 | Operator | One bonded operator that sees plaintext | Committee with threshold-encrypted order flow |
 | D5 | Matching | Continuous | Frequent batch auctions per L3 block |
 | D6 | Oracle | k-of-n signed updates from an external provider (provider not yet named) | An Aztec-native feed |
-| D7 | Collateral | A new token type with purpose-built bridges, built for this system (amounts hidden, addresses public, per §1), specified separately. The Shield bridge is out of scope. | Existing Aztec stablecoins |
+| D7 | Collateral | A new token type with purpose-built bridges, built for this system: amounts hidden, addresses public (confirmed 2026-11-22). The token is specified in §10.5 and built (P2.13); its L1 bridges are not built yet. The Shield bridge is out of scope. | Existing Aztec stablecoins |
 | D8 | v1 scope | Perpetuals only | Perpetuals and spot |
 | D9 | Client-proof lane | Master authorization, key grants, withdrawals, credentials | Per-order proofs |
 | D10 | Settlement cadence | One batch per Aztec slot | One per L2 block |

@@ -29,6 +29,10 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.10**: dead orders. Maintenance removes void and expired orders, and a tick proves its top-of-book orders live, so an order that cannot fill never moves the mark.
 - **P2.11**: the risk sweep. A refreshed account must not be due for liquidation at fresh marks, so with the refresh deadline every due liquidation happens within about two refresh windows.
 - **P2.12**: passkeys. A WebAuthn client circuit lets a browser passkey authorize lane-P actions: the assertion's challenge is the action message, and the relying party is bound into the account's authorization.
+- **P2.13**: C1 custody over the D7 collateral token, whose amounts are hidden and addresses public.
+  - The token keeps public balances and credits: hidden-amount commitments that appear on chain only as a created and a spent nullifier, spendable only by a call from their owner, so contracts hold them without keys.
+  - A deposit moves a hidden amount into a credit the Bridge holds and delivers its opening to the operator. The operator's custody transaction sweeps deposits into the public vault and pays settled withdrawals as credits, so only its net is public; the queue holds deposits' amounts as commitments.
+  - Unswept deposits return to their refund address after `t_dep`; records custody leaves unpaid are claimable from the vault after `t_payout`.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -56,8 +60,8 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/agg_ultra` | M1 measurement: `agg_app`'s checks in plain UltraHonk |
 | `circuits/rogue_app`, `circuits/rogue_segment`, `circuits/rogue_client` | Adversarial fixtures for the VK tests; never deployed |
 | `circuits/vendor/bb_proof_verification` | Vendored from aztec-packages v6.0.0 (Apache-2.0) |
-| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C0 deposits, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
-| `contracts/token` | Minimal public collateral token for C0 (not the D7 token) |
+| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C1 deposits, custody and reclaim, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
+| `contracts/ctoken` | `ConfidentialToken`, the D7 collateral token: public balances and hidden-amount credits, with every payment's parties public; TXE tests |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
 | `scripts/src/exchange` | Engine (mirrors the circuits and builds witnesses), trees, Grumpkin Schnorr, DA decoding, exit client, and the exchange tests |
 | `scripts/out` | Generated: VK manifest, batch, measurements and settlement reports (git-ignored) |
@@ -127,8 +131,8 @@ npm run e2e
 ```
 
 This runs the exit test on an in-process 6.0.0 local network, with real client-side proofs:
-- Users register, deposit and trade in two markets over three settled batches; funding applies an hour of L2 time later. They claim a refund and a withdrawal from the DA.
-- The operator stops and desert mode starts.
+- Users register, shield token balances into credits, and deposit them; the operator's custody transactions sweep deposits into the vault and pay withdrawals and refunds as credits. They trade in two markets over three settled batches; funding applies an hour of L2 time later. One withdrawal custody leaves unpaid is claimed from the vault after `t_payout`, with the DA alone.
+- The operator stops and desert mode starts. A deposit custody queued is refunded from the vault, and one it never swept returns as a credit.
 - Each user exits with a fresh client that holds only the node, the Bridge address and the user's seed, valued at the frozen indices with funding accrued to the freeze.
 
 It writes `scripts/out/e2e.json`.
@@ -137,7 +141,7 @@ It writes `scripts/out/e2e.json`.
 cd contracts && aztec compile && aztec test
 ```
 
-This compiles the Bridge and runs its TXE tests.
+This compiles the token and the Bridge and runs their TXE tests.
 
 ## Status
 
@@ -178,7 +182,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.11: tests | Every native refresh passes the check; 1 more adversarial witness (74 in all). |
 | P2.12: passkeys | client_webauthn checks the challenge, user presence and relying party, hashes clientDataJSON (up to 311 bytes) with SHA-256, and verifies the P-256 assertion signature. |
 | P2.12: tests | Native batch 8 grants a session key by passkey; 4 more adversarial witnesses (78 in all); the simulated authenticator agrees with Node's ECDSA verifier. |
-| P2: next | C1 custody once the D7 token is specified; from P3, ADL ranking. |
+| P2.13: custody | The D7 token (credits as nullifier pairs, constrained delivery of openings, plaintext parties); deposits into Bridge-held credits; custody netting up to four deposits and four payouts against the vault; reclaim after `t_dep`; claims after `t_payout`; deposit amounts committed in the queue; no withdrawal total in the header. |
+| P2.13: tests | 18 token TXE tests; 82 Bridge TXE tests; 1 more adversarial witness (79 in all); the exit test deposits through custody, receives payouts as credits, and refunds and reclaims deposits in desert mode. |
+| P2: next | The collateral token's L1 bridges; from P3, ADL ranking. |
 
 ## Caveats
 

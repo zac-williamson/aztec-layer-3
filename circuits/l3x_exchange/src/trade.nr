@@ -141,7 +141,6 @@ pub fn withdraw(
     let record = withdrawal_record(recipient, amount, salt, r.batch, index);
     r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
     r.withdrawals_count = index + 1;
-    r.withdrawals_amount += amount;
     r = absorb(absorb(r, TAG_WD), record);
     (new_leaf, r)
 }

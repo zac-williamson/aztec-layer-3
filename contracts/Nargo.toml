@@ -1,2 +1,2 @@
 [workspace]
-members = ["token", "bridge"]
+members = ["ctoken", "bridge"]

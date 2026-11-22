@@ -51,6 +51,10 @@ pub global DS_KEY_NODE: Field = 50;
 pub global DS_RECEIPT_SIG: Field = 51;
 pub global DS_MAUTH_P: Field = 52;
 pub global DS_CLEAN: Field = 53;
+/// A queued deposit's amount commitment, H(DS_DEPAMT, amount, salt) (SPEC.md §10.3).
+pub global DS_DEPAMT: Field = 54;
+/// A deposit's credit blind, H(DS_DEP, account index, refund_to, depositor, salt) (SPEC.md §10.3).
+pub global DS_DEP: Field = 55;
 /// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
 /// tree's depth (SPEC.md §11).
 pub global RECEIPT_DEPTH: u32 = 24;

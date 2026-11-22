@@ -55,7 +55,7 @@ async function main() {
     engine.keyring.set(encC, k.kEnc);
     const sender = randomField();
     reqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender, time: now });
-    reqs.push({ kind: M.KIND.DEPOSIT, a: idx(i), b: 1_000_000n, sender, time: now });
+    reqs.push(await M.depositRequest(h, idx(i), 1_000_000n, sender, now));
   }
   await engine.beginBatch(1n, 0n, 0n, 0n);
   await engine.block(now, [await update(engine, 0n, 2000n, now), await update(engine, 1n, 30_000n, now)]);
@@ -213,6 +213,10 @@ async function main() {
   t = clone(prio);
   t.items[1].account_index = idx(1).toString();
   await expectFail('deposit credited to another account', 'seg_priority', t, 'deposit index');
+  // The queue commits to each deposit's amount (SPEC.md §10.3): no other amount opens it.
+  t = clone(prio);
+  t.items[1].dep_amount = (BigInt(t.items[1].dep_amount) * 2n).toString();
+  await expectFail('deposit credited with an inflated amount', 'seg_priority', t, 'deposit opening');
   t = clone(maint);
   t.items[0].priv_part.collateral = '999999999';
   await expectFail('refresh publishes an inflated opening', 'seg_refresh', t, 'account path');
@@ -235,9 +239,9 @@ async function main() {
     L.keyring.set(encC, k.kEnc);
     const sender = randomField();
     lreqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender, time: now });
-    lreqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: [5_000_000n, 30_000n, 1_100n][i], sender, time: now });
+    lreqs.push(await M.depositRequest(h, BigInt(M.PROTOCOL_ACCOUNTS + i), [5_000_000n, 30_000n, 1_100n][i], sender, now));
   }
-  lreqs.push({ kind: M.KIND.DEPOSIT, a: M.INSURANCE_INDEX, b: 10_000n, sender: randomField(), time: now });
+  lreqs.push(await M.depositRequest(h, M.INSURANCE_INDEX, 10_000n, randomField(), now));
   await L.beginBatch(1n, 0n, 0n, 0n);
   await L.block(now, [await update(L, 0n, 2000n, now), await update(L, 1n, 30_000n, now)]);
   await L.priority(lreqs);
@@ -366,7 +370,7 @@ async function main() {
     const encC = await M.encCommitment(h, k.kEnc);
     K.keyring.set(encC, k.kEnc);
     kreqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender: kaddr[i], time: now });
-    kreqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: [2_000_000n, 1_000_000n][i], sender: kaddr[i], time: now });
+    kreqs.push(await M.depositRequest(h, BigInt(M.PROTOCOL_ACCOUNTS + i), [2_000_000n, 1_000_000n][i], kaddr[i], now));
   }
   await K.beginBatch(1n, 0n, 0n, 0n);
   await K.block(now, [await update(K, 0n, 2000n, now), await update(K, 1n, 30_000n, now)]);
@@ -470,7 +474,7 @@ async function main() {
     PE.keyring.set(encC, k.kEnc);
     const sender = randomField();
     preqs.push({ kind: M.KIND.REGISTER, a: pAuth[i], b: encC, sender, time: now });
-    preqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: 50_000n, sender, time: now });
+    preqs.push(await M.depositRequest(h, BigInt(M.PROTOCOL_ACCOUNTS + i), 50_000n, sender, now));
   }
   await PE.beginBatch(1n, 0n, 0n, 0n);
   await PE.block(now);

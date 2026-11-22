@@ -10,7 +10,7 @@ use l3x_exchange::{
     state::State,
     trade::{equity, exposure_fresh, initial_margin},
     tree::{merkle_root, update},
-    withdrawal_record,
+    deposit_commitment, withdrawal_record,
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, priority_next_head, Running};
 
@@ -32,6 +32,11 @@ struct Item {
     /// The account's encryption key. The Bridge checked it against the commitment at
     /// registration and delivered it to the operator, so every request is processable.
     k_enc: Field,
+    /// Deposit: the amount and salt that open the request's amount commitment. The Bridge computed
+    /// the commitment from this opening, checked the amount's range and delivered the opening to the
+    /// operator by constrained delivery, so every deposit is processable.
+    dep_amount: u64,
+    dep_salt: Field,
 }
 
 /// Priority segment (SPEC.md §7.3, §12): executes the next `n` queued requests in order.
@@ -95,8 +100,9 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field, params: Param
         r = r2;
     } else {
         assert(req.kind == KIND_DEPOSIT, "request kind not executed by this segment");
-        let amount = req.b as u64;
-        assert(amount as Field == req.b, "deposit amount out of range");
+        // The queue holds only a commitment to the amount (SPEC.md §10.3).
+        let amount = w.dep_amount;
+        assert(deposit_commitment(amount as Field, w.dep_salt) == req.b, "deposit opening");
         assert(amount < MAX_DEPOSIT, "deposit amount out of range");
         let idx = req.a as u32;
         let exists = (idx as Field == req.a) & (idx < st.num_accounts);
@@ -121,12 +127,11 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field, params: Param
             }
         }
         if !credited {
-            // No such account, or no room: refund the depositor from the vault (SPEC.md §10.4).
-            // The priority entry is public and unique, so it serves as the record's salt.
-            let record = withdrawal_record(req.sender, amount, req.entry(), r.batch, r.withdrawals_count);
+            // No such account, or no room: refund to the deposit's refund_to (SPEC.md §10.4). The
+            // depositor's secret salt keeps the record unguessable, and lets the depositor rebuild it.
+            let record = withdrawal_record(req.c, amount, w.dep_salt, r.batch, r.withdrawals_count);
             r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
             r.withdrawals_count += 1;
-            r.withdrawals_amount += amount;
             r = absorb(absorb(r, TAG_WD), record);
         }
     }
@@ -178,7 +183,6 @@ fn forced_withdraw(state: State, running: Running, w: Item, da_nonce: Field, par
             let record = withdrawal_record(req.b, amount, salt, r.batch, index);
             r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
             r.withdrawals_count = index + 1;
-            r.withdrawals_amount += amount;
             r = absorb(absorb(r, TAG_WD), record);
         }
     }

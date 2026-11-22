@@ -51,7 +51,6 @@ export type Running = {
   daLen: number;
   withdrawals: bigint;
   withdrawalsCount: number;
-  withdrawalsAmount: bigint;
   batch: bigint;
   time: bigint;
 };
@@ -71,7 +70,6 @@ export function runningFields(r: Running): bigint[] {
     BigInt(r.daLen),
     r.withdrawals,
     BigInt(r.withdrawalsCount),
-    r.withdrawalsAmount,
     r.batch,
     r.time,
   ];
@@ -90,7 +88,6 @@ export const runningToNoir = (r: Running) => ({
   da_len: r.daLen,
   withdrawals: hex(r.withdrawals),
   withdrawals_count: r.withdrawalsCount,
-  withdrawals_amount: r.withdrawalsAmount.toString(),
   batch: r.batch.toString(),
   time: r.time.toString(),
 });
@@ -111,7 +108,6 @@ const runningFromNoir = (o: any): Running => ({
   daLen: Number(BigInt(o.da_len)),
   withdrawals: BigInt(o.withdrawals),
   withdrawalsCount: Number(BigInt(o.withdrawals_count)),
-  withdrawalsAmount: BigInt(o.withdrawals_amount),
   batch: BigInt(o.batch),
   time: BigInt(o.time),
 });
@@ -134,7 +130,6 @@ export function batchStart(state: bigint, priorityHead: bigint, priorityCursor: 
     daLen: 0,
     withdrawals: 0n,
     withdrawalsCount: 0,
-    withdrawalsAmount: 0n,
     batch,
     time,
   };
@@ -704,7 +699,6 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
     e.priorityHead,
     w.withdrawalsRoot,
     BigInt(e.withdrawalsCount),
-    e.withdrawalsAmount,
     e.actionLog,
     await daFinalize(api, e.da, e.daLen),
     w.marketDataHash,
@@ -715,9 +709,9 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
   const headerHash = await l3xHash(api, [DS.HEADER, ...header]);
   assert(headerHash === root.headerHash, 'TS header hash != root circuit output');
   assert(headerHash === root.publicInputs[0], 'TS header hash != root proof public input');
-  assert((await daHash(api, w.daPayload)) === header[14], 'flat DA hash != segment sponge');
+  assert((await daHash(api, w.daPayload)) === header[13], 'flat DA hash != segment sponge');
   const receipts = await receiptsOf(api, w);
-  assert(receipts.receiptsRoot === header[18], 'TS receipts tree != the root circuit\'s');
+  assert(receipts.receiptsRoot === header[17], 'TS receipts tree != the root circuit\'s');
 
   return {
     header,

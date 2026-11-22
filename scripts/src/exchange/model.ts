@@ -2,7 +2,7 @@
 // Noir input encodings. Every function here must agree with the circuit it names; the engine's
 // differential checks compare the circuits' outputs with these values on every segment.
 import type { Barretenberg } from '@aztec-foundation/bb.js';
-import { DS as DS0, R, hex, l3xHash, permute } from '../lib.ts';
+import { DS as DS0, R, hex, l3xHash, permute, randomField } from '../lib.ts';
 
 export const DS = {
   ...DS0,
@@ -40,6 +40,8 @@ export const DS = {
   RECEIPT_SIG: 51n,
   MAUTH_P: 52n,
   CLEAN: 53n,
+  DEPAMT: 54n,
+  DEP: 55n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -134,7 +136,12 @@ export type Params = {
   fundingInterval: bigint;
   markets: MarketParams[];
 };
-export type Request = { kind: bigint; a: bigint; b: bigint; c?: bigint; sender: bigint; time: bigint };
+/**
+ * A priority request as queued. A Deposit's `b` commits to its amount and `c` is its refund address;
+ * `deposit` is the opening the operator received by constrained delivery, never on chain.
+ */
+export type Request = { kind: bigint; a: bigint; b: bigint; c?: bigint; sender: bigint; time: bigint; deposit?: DepositOpening };
+export type DepositOpening = { amount: bigint; salt: bigint };
 
 export const emptyPosition = (): Position => ({ size: 0n, entry: 0n, funding: 0n });
 export const emptyPriv = (blind = 0n): AccountPriv => ({ collateral: 0n, positions: Array.from({ length: MARKETS }, emptyPosition), blind });
@@ -258,6 +265,31 @@ export const nextHead = (h: H, head: bigint, entry: bigint) => h([DS.PRIORITY, h
 export const logAppend = (h: H, log: bigint, x: bigint, kind: bigint) => h([DS.ACTION_LOG, log, x, kind]);
 export const segmentNonce = (h: H, batch: bigint, actionLogEnd: bigint, startDaLen: number) =>
   h([DS.DANONCE, batch, actionLogEnd, BigInt(startDaLen)]);
+/** A queued deposit's amount commitment (SPEC.md §10.3). */
+export const depositCommitment = (h: H, amount: bigint, salt: bigint) => h([DS.DEPAMT, amount, salt]);
+/** The blind of the credit a deposit moves into the Bridge (SPEC.md §10.3). */
+export const depositBlind = (h: H, account: bigint, refundTo: bigint, depositor: bigint, salt: bigint) =>
+  h([DS.DEP, account, refundTo, depositor, salt]);
+/** A Deposit request as custody queues it, with the operator's opening. */
+export async function depositRequest(
+  h: H,
+  account: bigint,
+  amount: bigint,
+  sender: bigint,
+  time: bigint,
+  opts: { salt?: bigint; refundTo?: bigint } = {},
+): Promise<Request> {
+  const salt = opts.salt ?? randomField();
+  return {
+    kind: KIND.DEPOSIT,
+    a: account,
+    b: await depositCommitment(h, amount, salt),
+    c: opts.refundTo ?? sender,
+    sender,
+    time,
+    deposit: { amount, salt },
+  };
+}
 export const withdrawalRecord = (h: H, recipient: bigint, amount: bigint, salt: bigint, batch: bigint, index: number) =>
   h([DS.WD, recipient, amount, salt, batch, BigInt(index)]);
 export const oracleMessage = (h: H, domain: bigint, market: bigint, price: bigint, external: bigint, time: bigint) =>

@@ -2,10 +2,13 @@ mod test;
 
 use aztec::macros::aztec;
 
-/// L3X settlement contract, the subset of SPEC.md §10 and §12 built so far (P1, and P2.1):
+/// L3X settlement contract (SPEC.md §10, §12):
 /// - registration with constrained delivery of the account's encryption key to the operator;
-/// - C0 custody: deposits move into the Bridge's public token balance (the vault) and queue a
-///   priority request; withdrawals are paid from the vault on proof of inclusion;
+/// - C1 custody over the D7 confidential token (§10.3–10.5): a deposit moves into a credit the
+///   Bridge holds, with its opening delivered to the operator; the operator's custody transactions
+///   sweep deposits into the vault (the Bridge's public balance) and pay settled withdrawals as new
+///   credits, so only each transaction's net is public; unswept deposits return to their refund
+///   address after t_dep, and unpaid withdrawals are claimable from the vault after t_payout;
 /// - settlement: state root, header binding, replay protection, priority deadlines, time bounds,
 ///   Mode R DA as one public log per batch, market data;
 /// - delayed configuration: the operator, root VK hash and configuration hash change only
@@ -35,6 +38,7 @@ pub contract L3XBridge {
             KIND_FORCED_CANCEL_ALL, KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, MAX_DEPOSIT,
             PLAINTEXT_LEN, PROTOCOL_ACCOUNTS, RECEIPT_DEPTH, WD_HEIGHT,
         },
+        deposit_blind, deposit_commitment,
         sig::{assert_signed, Signature},
         request::payload_hash,
         state::{genesis_state_root, index_and_funding, MARKET_DATA_LEN, market_data_hash},
@@ -42,7 +46,9 @@ pub contract L3XBridge {
         tree::merkle_root,
         withdrawal_record,
     };
-    use l3x_token::L3XToken;
+    use ctoken::{
+        ConfidentialToken, Credit, credit_id, Output, SETTLE_INPUTS, SETTLE_OUTPUTS, TRANSFER_INPUTS,
+    };
     use l3x_types::{
         BatchHeader, config_hash as config_hash_of, DA_MAX, da_hash_flat, hash::hash, HEADER_LEN,
         merge::{VK_TREE_LEAVES, vk_tree_root_of}, priority_entry, priority_next_head, receipt_leaf, receipt_node,
@@ -55,6 +61,13 @@ pub contract L3XBridge {
     global UPGRADE_DELAY: u64 = 21 * 24 * 60 * 60;
     /// Tag at fields[0] of the DA log ("l3x.da.v1"), so indexers can find settlement payloads.
     global DA_LOG_TAG: Field = 0x6c33782e64612e7631;
+    /// Flows one custody transaction can carry: deposits it sweeps and records it pays.
+    global CUSTODY_DEPOSITS: u32 = SETTLE_INPUTS;
+    global CUSTODY_PAYOUTS: u32 = SETTLE_OUTPUTS;
+    /// Pending-deposit states.
+    global PENDING: u8 = 1;
+    global SWEPT: u8 = 2;
+    global RECLAIMED: u8 = 3;
 
     #[event]
     struct PriorityRequested {
@@ -77,7 +90,6 @@ pub contract L3XBridge {
         priority_end: u64,
         da_len: u32,
         withdrawals_count: u64,
-        withdrawals_amount: u64,
         market_data: [Field; MARKET_DATA_LEN],
     }
 
@@ -86,6 +98,32 @@ pub contract L3XBridge {
     struct KeyDelivered {
         enc_commitment: Field,
         k_enc: Field,
+    }
+
+    /// Private event that delivers a deposit's opening to the operator, who needs it to sweep and
+    /// queue the deposit. The credit is credit_id(bridge, amount, deposit_blind(...)).
+    #[event]
+    struct DepositDelivered {
+        account_index: Field,
+        amount: u128,
+        refund_to: AztecAddress,
+        depositor: AztecAddress,
+        salt: Field,
+    }
+
+    /// A deposit's credit is held by the Bridge, awaiting custody. The amount is hidden.
+    #[event]
+    struct DepositPending {
+        credit: Field,
+        account_index: Field,
+        refund_to: AztecAddress,
+        depositor: AztecAddress,
+        time: u64,
+    }
+
+    #[event]
+    struct DepositReclaimed {
+        credit: Field,
     }
 
     /// Emitted once, at deployment: the protocol accounts' public parts, from which exit clients
@@ -113,12 +151,21 @@ pub contract L3XBridge {
         effective_at: u64,
     }
 
+    /// A record paid from the vault directly, after t_payout or in desert mode; the amount is public.
     #[event]
     struct WithdrawalPaid {
         batch: u64,
         index: u32,
         recipient: AztecAddress,
-        amount: u64,
+        amount: u128,
+    }
+
+    /// A queued deposit no batch processed, refunded from the vault in desert mode.
+    #[event]
+    struct DepositRefunded {
+        index: u64,
+        refund_to: AztecAddress,
+        amount: u128,
     }
 
     #[event]
@@ -126,7 +173,6 @@ pub contract L3XBridge {
         accounts_root: Field,
         market_data_hash: Field,
         claim_close: u64,
-        refunds_owed: u128,
     }
 
     #[event]
@@ -165,6 +211,47 @@ pub contract L3XBridge {
         pub slash: u128,
     }
 
+    /// Custody rules (SPEC.md §10.3, §10.4): an unswept deposit is reclaimable t_dep after it was
+    /// made; a settled record custody has not paid is claimable from the vault t_payout after its
+    /// batch settled; deposits below min_deposit are refused, so dust cannot burden custody.
+    #[derive(Deserialize, Eq, Packable, Serialize)]
+    pub struct CustodyConfig {
+        pub t_dep: u64,
+        pub t_payout: u64,
+        pub min_deposit: u128,
+    }
+
+    /// A pending deposit's opening, as its depositor delivered it to the operator.
+    #[derive(Deserialize, Eq, Serialize)]
+    pub struct DepositOpening {
+        pub account_index: Field,
+        pub amount: u128,
+        pub refund_to: AztecAddress,
+        pub depositor: AztecAddress,
+        pub salt: Field,
+    }
+
+    /// A settled withdrawal or refund record for custody to pay, its path in its batch's
+    /// withdrawals tree, and the blind of the recipient's new credit.
+    #[derive(Deserialize, Eq, Serialize)]
+    pub struct Payout {
+        pub batch: u64,
+        pub index: u32,
+        pub recipient: AztecAddress,
+        pub amount: u64,
+        pub salt: Field,
+        pub path: [Field; WD_HEIGHT],
+        pub blind: Field,
+    }
+
+    /// A deposit's credit as the Bridge tracks it: PENDING from the deposit until custody sweeps it
+    /// (SWEPT) or it is reclaimed (RECLAIMED).
+    #[derive(Deserialize, Eq, Packable, Serialize)]
+    pub struct PendingDeposit {
+        state: u8,
+        time: u64,
+    }
+
     /// Fixed at deployment, including the public parts of the protocol accounts (insurance at
     /// index 0, fee at index 1), which exit clients need to rebuild the genesis accounts tree.
     #[derive(Deserialize, Eq, Packable, Serialize)]
@@ -180,13 +267,14 @@ pub contract L3XBridge {
         request_fee: u128,
         deployed_at: u64,
         receipts: ReceiptConfig,
+        custody: CustodyConfig,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
     }
 
-    /// The exchange tip, the priority cursor and count, settled but unpaid withdrawals, and the L3
-    /// time at which the current refresh cycle began.
+    /// The exchange tip, the priority cursor and count, and the L3 time at which the current
+    /// refresh cycle began.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Tip {
         state_root: Field,
@@ -196,18 +284,16 @@ pub contract L3XBridge {
         market_data_hash: Field,
         priority_cursor: u64,
         priority_count: u64,
-        withdrawals_owed: u128,
         cycle_start: u64,
     }
 
     /// Priority queue slot n: the hash-chain head after n entries (zero for n = 0), entry n and its
-    /// time, and the total deposited by entries before n.
+    /// time.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Slot {
         head: Field,
         entry: Field,
         time: u64,
-        deposit_prefix: u128,
     }
 
     #[derive(Deserialize, Eq, Packable, Serialize)]
@@ -245,7 +331,6 @@ pub contract L3XBridge {
         accounts_root: Field,
         market_data_hash: Field,
         claim_close: u64,
-        refunds_owed: u128,
         total_claims: u128,
         payout_num: u128,
         payout_den: u128,
@@ -282,6 +367,7 @@ pub contract L3XBridge {
         claims: Map<u32, PublicMutable<Claim, Context>, Context>,
         escrow: PublicMutable<Escrow, Context>,
         challenges: Map<Field, PublicMutable<Challenge, Context>, Context>,
+        deposits: Map<Field, PublicMutable<PendingDeposit, Context>, Context>,
     }
 
     #[external("public")]
@@ -297,6 +383,7 @@ pub contract L3XBridge {
         t_late: u64,
         request_fee: u128,
         receipts: ReceiptConfig,
+        custody: CustodyConfig,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
@@ -314,6 +401,7 @@ pub contract L3XBridge {
                 request_fee,
                 deployed_at: self.context.timestamp(),
                 receipts,
+                custody,
                 protocol_owners,
                 protocol_master_auths,
                 protocol_enc_commitments,
@@ -345,7 +433,6 @@ pub contract L3XBridge {
                 market_data_hash: 0,
                 priority_cursor: 0,
                 priority_count: 0,
-                withdrawals_owed: 0,
                 cycle_start: 0,
             },
         );
@@ -385,20 +472,217 @@ pub contract L3XBridge {
         let config = self.storage.config.read();
         if config.request_fee > 0 {
             let operator = self.internal.current_operator();
-            self.call(L3XToken::at(config.token).transfer_from(sender, operator, config.request_fee));
+            self.call(ConfidentialToken::at(config.token).transfer_public_from(sender, operator, config.request_fee));
         }
         self.internal.queue_entry(kind, account_index, b, c, sender);
     }
 
-    /// Deposits into an account (C0): the funds move into the vault now, and the request credits
-    /// the account when processed, or refunds the caller if the account does not exist.
+    // ---- Custody (SPEC.md §10.3, C1) ----
+
+    /// Deposits `amount` into account `account_index`. The amount moves from the caller's credits
+    /// into a credit the Bridge holds, under the caller's authorization of that token call; only the
+    /// depositor and the operator learn it, the operator by constrained delivery of the opening.
+    /// The credit's blind binds the account, `refund_to` and the depositor, so the opening fixes
+    /// them. Custody later sweeps the credit into the vault and queues the deposit; until then,
+    /// after t_dep or in desert mode, anyone holding the opening can return it to `refund_to`.
+    #[external("private")]
+    fn deposit(
+        account_index: Field,
+        amount: u128,
+        refund_to: AztecAddress,
+        salt: Field,
+        credits: [Credit; TRANSFER_INPUTS],
+        change_blind: Field,
+        authwit_nonce: Field,
+    ) {
+        let config = self.storage.config.read();
+        assert(
+            (amount > 0) & (amount >= config.custody.min_deposit) & (amount < MAX_DEPOSIT as u128),
+            "deposit amount out of range",
+        );
+        let depositor = self.msg_sender();
+        let blind = deposit_blind(account_index, refund_to.to_field(), depositor.to_field(), salt);
+        let credit = self.call(
+            ConfidentialToken::at(config.token).transfer(
+                depositor,
+                self.address,
+                amount,
+                credits,
+                blind,
+                change_blind,
+                authwit_nonce,
+            ),
+        );
+        let operator = self.storage.operator.get_current_value();
+        let operator = if operator.is_zero() { config.genesis_operator } else { operator };
+        self.emit(DepositDelivered { account_index, amount, refund_to, depositor, salt }).deliver_to(
+            operator,
+            MessageDelivery::onchain_constrained(),
+        );
+        self.enqueue_self._record_deposit(credit, account_index, refund_to, depositor);
+    }
+
     #[external("public")]
-    fn deposit(account_index: Field, amount: u128) {
-        assert((amount > 0) & (amount < MAX_DEPOSIT as u128), "deposit amount out of range");
-        let sender = self.msg_sender();
+    #[only_self]
+    fn _record_deposit(credit: Field, account_index: Field, refund_to: AztecAddress, depositor: AztecAddress) {
+        assert(!self.storage.desert.read().active, "desert mode");
+        let time = self.context.timestamp();
+        self.storage.deposits.at(credit).write(PendingDeposit { state: PENDING, time });
+        self.emit(DepositPending { credit, account_index, refund_to, depositor, time });
+    }
+
+    /// The operator's custody transaction. It sweeps up to CUSTODY_DEPOSITS pending deposits,
+    /// queueing each with its amount committed, and pays up to CUSTODY_PAYOUTS settled records as
+    /// new credits of their recipients, delivered by constrained delivery. One token settlement
+    /// nets the flows against the vault, so only the net is public; the operator SHOULD include at
+    /// least k_min flows [D2]. Each payout is checked here against its path; the public phase
+    /// checks the path's root against its batch and pays each record once.
+    #[external("private")]
+    fn custody(
+        deposits: [DepositOpening; CUSTODY_DEPOSITS],
+        n_deposits: u32,
+        payouts: [Payout; CUSTODY_PAYOUTS],
+        n_payouts: u32,
+    ) {
+        let config = self.storage.config.read();
+        let operator = self.storage.operator.get_current_value();
+        let operator = if operator.is_zero() { config.genesis_operator } else { operator };
+        assert(self.msg_sender() == operator, "not operator");
+        assert((n_deposits <= CUSTODY_DEPOSITS) & (n_payouts <= CUSTODY_PAYOUTS), "too many flows");
+
+        let mut credits = [Credit::empty(); SETTLE_INPUTS];
+        let mut ids = [0; CUSTODY_DEPOSITS];
+        let mut accounts = [0; CUSTODY_DEPOSITS];
+        let mut commitments = [0; CUSTODY_DEPOSITS];
+        let mut refund_tos = [AztecAddress::zero(); CUSTODY_DEPOSITS];
+        let mut depositors = [AztecAddress::zero(); CUSTODY_DEPOSITS];
+        let mut swept: u128 = 0;
+        for i in 0..CUSTODY_DEPOSITS {
+            if i < n_deposits {
+                let d = deposits[i];
+                let blind = deposit_blind(d.account_index, d.refund_to.to_field(), d.depositor.to_field(), d.salt);
+                credits[i] = Credit { amount: d.amount, blind };
+                ids[i] = credit_id(self.address, d.amount, blind);
+                accounts[i] = d.account_index;
+                commitments[i] = deposit_commitment(d.amount as Field, d.salt);
+                refund_tos[i] = d.refund_to;
+                depositors[i] = d.depositor;
+                swept += d.amount;
+            }
+        }
+
+        let mut outputs = [Output::empty(); SETTLE_OUTPUTS];
+        let mut records = [0; CUSTODY_PAYOUTS];
+        let mut batches = [0; CUSTODY_PAYOUTS];
+        let mut roots = [0; CUSTODY_PAYOUTS];
+        let mut paid: u128 = 0;
+        for j in 0..CUSTODY_PAYOUTS {
+            if j < n_payouts {
+                let p = payouts[j];
+                assert(p.amount > 0, "empty payout");
+                records[j] = withdrawal_record(p.recipient.to_field(), p.amount, p.salt, p.batch, p.index);
+                batches[j] = p.batch;
+                roots[j] = merkle_root(DS_WD_NODE, records[j], p.index, p.path);
+                outputs[j] = Output { to: p.recipient, amount: p.amount as u128, blind: p.blind };
+                paid += p.amount as u128;
+            }
+        }
+
+        let net_in = if swept > paid { swept - paid } else { 0 };
+        let net_out = if paid > swept { paid - swept } else { 0 };
+        let _ = self.call(ConfidentialToken::at(config.token).settle(credits, outputs, net_out, net_in));
+        self.enqueue_self._custody(
+            ids,
+            accounts,
+            commitments,
+            refund_tos,
+            depositors,
+            n_deposits,
+            records,
+            batches,
+            roots,
+            n_payouts,
+        );
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _custody(
+        ids: [Field; CUSTODY_DEPOSITS],
+        accounts: [Field; CUSTODY_DEPOSITS],
+        commitments: [Field; CUSTODY_DEPOSITS],
+        refund_tos: [AztecAddress; CUSTODY_DEPOSITS],
+        depositors: [AztecAddress; CUSTODY_DEPOSITS],
+        n_deposits: u32,
+        records: [Field; CUSTODY_PAYOUTS],
+        batches: [u64; CUSTODY_PAYOUTS],
+        roots: [Field; CUSTODY_PAYOUTS],
+        n_payouts: u32,
+    ) {
+        assert(!self.storage.desert.read().active, "desert mode");
+        for i in 0..CUSTODY_DEPOSITS {
+            if i < n_deposits {
+                let slot = self.storage.deposits.at(ids[i]);
+                let mut d = slot.read();
+                assert(d.state == PENDING, "deposit not pending");
+                d.state = SWEPT;
+                slot.write(d);
+                // The queue holds only funded deposits, with their amounts committed.
+                self.internal.queue_entry(KIND_DEPOSIT, accounts[i], commitments[i], refund_tos[i].to_field(), depositors[i]);
+            }
+        }
+        for j in 0..CUSTODY_PAYOUTS {
+            if j < n_payouts {
+                assert(
+                    roots[j] == self.storage.settled.at(batches[j]).read().withdrawals_root,
+                    "record not in the batch's withdrawals tree",
+                );
+                assert(!self.storage.withdrawal_paid.at(records[j]).read(), "already paid");
+                self.storage.withdrawal_paid.at(records[j]).write(true);
+            }
+        }
+        // A net outflow comes from the vault, never from the bond or open challenges' fees. The
+        // net itself is public in the token's PublicTransfer event.
         let token = self.storage.config.read().token;
-        self.call(L3XToken::at(token).transfer_from(sender, self.address, amount));
-        self.internal.queue_entry(KIND_DEPOSIT, account_index, amount as Field, 0, sender);
+        let e = self.storage.escrow.read();
+        assert(self.view(ConfidentialToken::at(token).balance_of_public(self.address)) >= e.bond + e.fees, "vault short");
+    }
+
+    /// Returns a deposit custody has not swept to its refund address, as a new credit delivered by
+    /// constrained delivery: after t_dep, or at any time in desert mode. Anyone holding the opening
+    /// may call it; the funds go only to `refund_to`. A concurrent sweep and reclaim are resolved by
+    /// the credit's spent nullifier: whichever lands first wins.
+    #[external("private")]
+    fn reclaim_deposit(deposit: DepositOpening, blind: Field) {
+        let token = self.storage.config.read().token;
+        let dblind = deposit_blind(
+            deposit.account_index,
+            deposit.refund_to.to_field(),
+            deposit.depositor.to_field(),
+            deposit.salt,
+        );
+        let mut credits = [Credit::empty(); SETTLE_INPUTS];
+        credits[0] = Credit { amount: deposit.amount, blind: dblind };
+        let mut outputs = [Output::empty(); SETTLE_OUTPUTS];
+        outputs[0] = Output { to: deposit.refund_to, amount: deposit.amount, blind };
+        let _ = self.call(ConfidentialToken::at(token).settle(credits, outputs, 0, 0));
+        self.enqueue_self._reclaim(credit_id(self.address, deposit.amount, dblind));
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _reclaim(credit: Field) {
+        let slot = self.storage.deposits.at(credit);
+        let mut d = slot.read();
+        assert(d.state == PENDING, "deposit not pending");
+        let t_dep = self.storage.config.read().custody.t_dep;
+        assert(
+            self.storage.desert.read().active | (self.context.timestamp() >= d.time + t_dep),
+            "deposit not yet reclaimable",
+        );
+        d.state = RECLAIMED;
+        slot.write(d);
+        self.emit(DepositReclaimed { credit });
     }
 
     #[external("public")]
@@ -418,10 +702,8 @@ pub contract L3XBridge {
         slot.entry = entry;
         slot.time = time;
         self.storage.slots.at(index).write(slot);
-        let deposited = if kind == KIND_DEPOSIT { b as u128 } else { 0 };
         let mut next = self.storage.slots.at(index + 1).read();
         next.head = priority_next_head(slot.head, entry);
-        next.deposit_prefix = slot.deposit_prefix + deposited;
         self.storage.slots.at(index + 1).write(next);
         tip.priority_count = index + 1;
         self.storage.tip.write(tip);
@@ -514,7 +796,6 @@ pub contract L3XBridge {
         tip.last_time = h.max_time;
         tip.priority_cursor = h.priority_end;
         tip.market_data_hash = h.market_data_hash;
-        tip.withdrawals_owed += h.withdrawals_amount as u128;
         self.storage.tip.write(tip);
         self.storage.settled.at(batch_number).write(
             Settled { withdrawals_root: h.withdrawals_root, receipts_root: h.receipts_root, time: now },
@@ -535,17 +816,20 @@ pub contract L3XBridge {
                 priority_end: h.priority_end,
                 da_len,
                 withdrawals_count: h.withdrawals_count,
-                withdrawals_amount: h.withdrawals_amount,
                 market_data,
             },
         );
     }
 
-    // ---- Withdrawals (SPEC.md §10.4, C0 profile) ----
+    // ---- Withdrawals (SPEC.md §10.4) ----
 
-    /// Pays a settled withdrawal or refund record from the vault, once, to its recipient. Anyone
-    /// may call it; it works in desert mode too.
-    #[external("public")]
+    /// Pays a settled withdrawal or refund record that custody has not paid t_payout after its
+    /// batch settled, from the vault into the recipient's public balance; the amount becomes
+    /// public. Anyone may call it, once per record. In desert mode it needs no wait, and is senior
+    /// to exit claims only until the payout ratio is fixed (SPEC.md §12). The record's path is
+    /// folded here, in the private phase, which keeps the hashing out of the published public
+    /// bytecode; the public phase compares the root with the batch's.
+    #[external("private")]
     fn claim_withdrawal(
         batch: u64,
         index: u32,
@@ -555,17 +839,48 @@ pub contract L3XBridge {
         path: [Field; WD_HEIGHT],
     ) {
         let record = withdrawal_record(recipient.to_field(), amount, salt, batch, index);
-        assert(
-            merkle_root(DS_WD_NODE, record, index, path) == self.storage.settled.at(batch).read().withdrawals_root,
-            "record not in the batch's withdrawals tree",
-        );
+        let root = merkle_root(DS_WD_NODE, record, index, path);
+        self.enqueue_self._claim_withdrawal(batch, index, record, root, recipient, amount);
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _claim_withdrawal(batch: u64, index: u32, record: Field, root: Field, recipient: AztecAddress, amount: u64) {
+        let settled = self.storage.settled.at(batch).read();
+        assert(root == settled.withdrawals_root, "record not in the batch's withdrawals tree");
         assert(!self.storage.withdrawal_paid.at(record).read(), "already paid");
+        let config = self.storage.config.read();
+        assert(
+            self.storage.desert.read().active | (self.context.timestamp() > settled.time + config.custody.t_payout),
+            "payout window still open",
+        );
         self.storage.withdrawal_paid.at(record).write(true);
-        let mut tip = self.storage.tip.read();
-        tip.withdrawals_owed -= amount as u128;
-        self.storage.tip.write(tip);
-        self.call(L3XToken::at(self.storage.config.read().token).transfer(recipient, amount as u128));
-        self.emit(WithdrawalPaid { batch, index, recipient, amount });
+        let pay = self.internal.senior_payment(amount as u128);
+        self.call(ConfidentialToken::at(config.token).transfer_public(recipient, pay));
+        self.emit(WithdrawalPaid { batch, index, recipient, amount: pay });
+    }
+
+    /// What a senior obligation (a settled record, or the refund of a queued deposit) is paid.
+    /// Outside desert mode, in full: custody moves every deposit in and every payout out, so the
+    /// vault covers every record (SPEC.md §8.8). In desert mode, in full until the payout ratio is
+    /// fixed, and afterwards from what the window's claims are not owed.
+    #[internal("public")]
+    fn senior_payment(amount: u128) -> u128 {
+        let vault = self.internal.vault_balance();
+        let d = self.storage.desert.read();
+        if !d.active {
+            assert(amount <= vault, "vault short");
+            amount
+        } else {
+            let available = if d.payout_den == 0 {
+                vault
+            } else if vault > d.window_owed {
+                vault - d.window_owed
+            } else {
+                0
+            };
+            if amount < available { amount } else { available }
+        }
     }
 
     // ---- Desert mode (SPEC.md §12) ----
@@ -586,37 +901,49 @@ pub contract L3XBridge {
         d.accounts_root = tip.accounts_root;
         d.market_data_hash = tip.market_data_hash;
         d.claim_close = now + config.t_claim;
-        d.refunds_owed =
-            self.storage.slots.at(tip.priority_count).read().deposit_prefix - pending.deposit_prefix;
         self.storage.desert.write(d);
         self.emit(
             DesertActivated {
                 accounts_root: d.accounts_root,
                 market_data_hash: d.market_data_hash,
                 claim_close: d.claim_close,
-                refunds_owed: d.refunds_owed,
             },
         );
     }
 
-    /// Refunds a deposit the exchange never processed, to its depositor, in full.
-    #[external("public")]
-    fn desert_refund(index: u64, account_index: Field, amount: u128, depositor: AztecAddress) {
-        let mut d = self.storage.desert.read();
-        assert(d.active, "not in desert mode");
-        assert(index >= self.storage.tip.read().priority_cursor, "request was processed");
-        let slot = self.storage.slots.at(index).read();
+    /// Refunds a deposit custody queued but no batch processed, to its refund address, from the
+    /// vault; the opening makes the amount public. A senior obligation (see senior_payment). The
+    /// entry is rebuilt here, in the private phase, from the opening and the time the queue gave
+    /// it; the public phase compares it with the stored entry.
+    #[external("private")]
+    fn desert_refund(
+        index: u64,
+        account_index: Field,
+        amount: u128,
+        salt: Field,
+        refund_to: AztecAddress,
+        depositor: AztecAddress,
+        time: u64,
+    ) {
         let entry = priority_entry(
-            payload_hash(KIND_DEPOSIT, account_index, amount as Field, 0),
+            payload_hash(KIND_DEPOSIT, account_index, deposit_commitment(amount as Field, salt), refund_to.to_field()),
             depositor.to_field(),
-            slot.time,
+            time,
         );
-        assert(entry == slot.entry, "not this deposit");
+        self.enqueue_self._desert_refund(index, entry, amount, refund_to);
+    }
+
+    #[external("public")]
+    #[only_self]
+    fn _desert_refund(index: u64, entry: Field, amount: u128, refund_to: AztecAddress) {
+        assert(self.storage.desert.read().active, "not in desert mode");
+        assert(index >= self.storage.tip.read().priority_cursor, "request was processed");
+        assert(entry == self.storage.slots.at(index).read().entry, "not this deposit");
         assert(!self.storage.refunded.at(index).read(), "already refunded");
         self.storage.refunded.at(index).write(true);
-        d.refunds_owed -= amount;
-        self.storage.desert.write(d);
-        self.call(L3XToken::at(self.storage.config.read().token).transfer(depositor, amount));
+        let pay = self.internal.senior_payment(amount);
+        self.call(ConfidentialToken::at(self.storage.config.read().token).transfer_public(refund_to, pay));
+        self.emit(DepositRefunded { index, refund_to, amount: pay });
     }
 
     /// Registers an account's exit claim from its leaf in the frozen accounts root (SPEC.md §12).
@@ -669,11 +996,12 @@ pub contract L3XBridge {
     }
 
     /// After the claim window, pays a registered claim to its owner (SPEC.md §12).
-    /// - A window claim gets min(1, V/U) of its equity, where V is the vault less the senior
-    ///   obligations (unpaid withdrawals and refunds) when the ratio is fixed, at the first payout,
-    ///   and U the window's total claims.
-    /// - A late claim gets the same ratio at best, paid from the residual: the vault less the
-    ///   senior obligations and what the window's claims are still owed.
+    /// - A window claim gets min(1, V/U) of its equity, where V is the vault when the ratio is
+    ///   fixed, at the first payout, and U the window's total claims. Senior obligations (unpaid
+    ///   records, queued deposits) claimed before then were already paid from the vault; their
+    ///   amounts are hidden until claimed, so they cannot be reserved.
+    /// - A late claim gets the same ratio at best, paid from the residual: the vault less what the
+    ///   window's claims are still owed.
     /// - A protocol account's claim is paid the same way, and only t_late after the window, so
     ///   triggering desert mode cannot profit the operator.
     #[external("public")]
@@ -691,15 +1019,13 @@ pub contract L3XBridge {
         }
         let token = config.token;
         let vault = self.internal.vault_balance();
-        let senior = self.storage.tip.read().withdrawals_owed + d.refunds_owed;
         if d.payout_den == 0 {
             // ratio = min(1, V/U), and 1 when no claim was registered in the window.
-            let v = if vault > senior { vault - senior } else { 0 };
             if d.total_claims == 0 {
                 d.payout_num = 1;
                 d.payout_den = 1;
             } else {
-                d.payout_num = if v < d.total_claims { v } else { d.total_claims };
+                d.payout_num = if vault < d.total_claims { vault } else { d.total_claims };
                 d.payout_den = d.total_claims;
             }
             d.window_owed = d.total_claims * d.payout_num / d.payout_den;
@@ -709,14 +1035,13 @@ pub contract L3XBridge {
             d.window_owed = if d.window_owed > pay { d.window_owed - pay } else { 0 };
             pay
         } else {
-            let reserved = senior + d.window_owed;
-            let residual = if vault > reserved { vault - reserved } else { 0 };
+            let residual = if vault > d.window_owed { vault - d.window_owed } else { 0 };
             if pay < residual { pay } else { residual }
         };
         self.storage.desert.write(d);
         claim.paid = true;
         self.storage.claims.at(account_index).write(claim);
-        self.call(L3XToken::at(token).transfer(claim.owner, amount));
+        self.call(ConfidentialToken::at(token).transfer_public(claim.owner, amount));
     }
 
     // ---- Receipts and accountability (SPEC.md §11) ----
@@ -725,7 +1050,7 @@ pub contract L3XBridge {
     #[external("public")]
     fn post_bond(amount: u128) {
         let token = self.storage.config.read().token;
-        self.call(L3XToken::at(token).transfer_from(self.msg_sender(), self.address, amount));
+        self.call(ConfidentialToken::at(token).transfer_public_from(self.msg_sender(), self.address, amount));
         let mut e = self.storage.escrow.read();
         e.bond += amount;
         self.storage.escrow.write(e);
@@ -755,7 +1080,7 @@ pub contract L3XBridge {
         let existing = self.storage.challenges.at(id).read();
         assert(!existing.open & !existing.done, "receipt already challenged");
         if config.request_fee > 0 {
-            self.call(L3XToken::at(config.token).transfer_from(challenger, self.address, config.request_fee));
+            self.call(ConfidentialToken::at(config.token).transfer_public_from(challenger, self.address, config.request_fee));
         }
         let mut e = self.storage.escrow.read();
         e.fees += config.request_fee;
@@ -798,7 +1123,7 @@ pub contract L3XBridge {
         self.storage.escrow.write(e);
         if c.fee > 0 {
             let config = self.storage.config.read();
-            self.call(L3XToken::at(config.token).transfer(self.internal.current_operator(), c.fee));
+            self.call(ConfidentialToken::at(config.token).transfer_public(self.internal.current_operator(), c.fee));
         }
         self.emit(ChallengeResolved { id, answered: true, payout: c.fee });
     }
@@ -819,7 +1144,7 @@ pub contract L3XBridge {
         c.open = false;
         c.done = true;
         self.storage.challenges.at(id).write(c);
-        self.call(L3XToken::at(config.token).transfer(c.challenger, penalty + c.fee));
+        self.call(ConfidentialToken::at(config.token).transfer_public(c.challenger, penalty + c.fee));
         self.emit(ChallengeResolved { id, answered: false, payout: penalty + c.fee });
     }
 
@@ -827,7 +1152,7 @@ pub contract L3XBridge {
     #[internal("public")]
     fn vault_balance() -> u128 {
         let token = self.storage.config.read().token;
-        let balance = self.view(L3XToken::at(token).balance_of(self.address));
+        let balance = self.view(ConfidentialToken::at(token).balance_of_public(self.address));
         let e = self.storage.escrow.read();
         let held = e.bond + e.fees;
         if balance > held { balance - held } else { 0 }
@@ -935,10 +1260,12 @@ pub contract L3XBridge {
         (c.open, c.done, c.deadline, self.storage.escrow.read().bond)
     }
 
+    /// (state, time) of a deposit's credit: 0 unknown, 1 pending, 2 swept, 3 reclaimed.
     #[external("public")]
     #[view]
-    fn get_withdrawals_root(batch: u64) -> Field {
-        self.storage.settled.at(batch).read().withdrawals_root
+    fn get_deposit(credit: Field) -> (u8, u64) {
+        let d = self.storage.deposits.at(credit).read();
+        (d.state, d.time)
     }
 
     #[internal("public")]
