@@ -12,19 +12,30 @@ use l3x_types::hash::hash;
 pub global KIND_PLACE: Field = 1;
 pub global KIND_CANCEL: Field = 2;
 pub global KIND_WITHDRAW: Field = 3;
+pub global KIND_ADD_KEY: Field = 4;
+pub global KIND_REVOKE_KEY: Field = 5;
 pub global TIF_GTC: Field = 0;
 pub global TIF_IOC: Field = 1;
 pub global TIF_FOK: Field = 2;
 pub global TIF_POST_ONLY: Field = 3;
-pub global ACTION_PAYLOAD: u32 = 6;
+pub global TIF_GTT: Field = 4;
+pub global ACTION_PAYLOAD: u32 = 8;
 
-/// The message an account signs for an action (SPEC.md §7.1): the domain binds chain and
-/// deployment, the nonce orders the account's actions.
-///   PlaceOrder:  p = (market, side, price, lots, tif, reduce_only)
-///   CancelOrder: p = (market, side, price, seq, 0, 0)
-///   Withdraw:    p = (amount, recipient, 0, 0, 0, 0)
-pub fn action_msg(domain: Field, kind: Field, account_index: u32, nonce: u64, p: [Field; ACTION_PAYLOAD]) -> Field {
-    hash([DS_ACTION, domain, kind, account_index as Field, nonce as Field, p[0], p[1], p[2], p[3], p[4], p[5]])
+/// The message a key signs for an action (SPEC.md §7.1): the domain binds chain and deployment,
+/// the key id binds the signing key's slot (MASTER_KEY for the master key), and the nonce orders
+/// that key's actions.
+///   PlaceOrder:  p = (market, side, price, lots, tif, reduce_only, expiry, 0)
+///   CancelOrder: p = (market, side, price, seq, 0, 0, 0, 0)
+///   Withdraw:    p = (amount, recipient, 0, …)
+///   AddKey:      p = (slot, pk_x, pk_y, market_mask, max_notional, expiry, 0, 0)
+///   RevokeKey:   p = (slot, 0, …)
+pub fn action_msg(domain: Field, kind: Field, account_index: u32, key_id: u32, nonce: u64, p: [Field; ACTION_PAYLOAD]) -> Field {
+    hash(
+        [
+            DS_ACTION, domain, kind, account_index as Field, key_id as Field, nonce as Field, p[0], p[1], p[2],
+            p[3], p[4], p[5], p[6], p[7],
+        ],
+    )
 }
 
 pub fn abs(x: i64) -> u64 {

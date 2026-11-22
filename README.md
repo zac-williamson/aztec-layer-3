@@ -17,6 +17,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.2**: liquidation (SPEC.md §8.5) as operator steps checked in circuit.
   - The waterfall: cancel the account's orders, close against the book within a ratio-preserving limit, insurance takeover lowest PnL first, deficit absorption.
   - Auto-deleveraging at the bankruptcy price once the insurance account cannot absorb a position.
+- **P2.3**: session keys scoped by market, notional cap and expiry; GTT orders, removed when matching meets them expired; forced withdrawals, closes and cancellations submitted through the Bridge.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -27,10 +28,11 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/l3x_types` | Shared constants, Poseidon2 sponge, running values and node output, VK tree, DA sponge, `BatchHeader` |
 | `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick |
-| `circuits/seg_priority` | X-segment: Register and Deposit requests in queue order (refunds for missing accounts) |
-| `circuits/seg_trade` | X-segment: signed PlaceOrder (GTC, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, Withdraw |
+| `circuits/seg_priority` | X-segment: Register, Deposit and ForcedWithdraw requests in queue order (refunds for missing accounts) |
+| `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, Withdraw, AddKey, RevokeKey, signed by the master key or a session key |
 | `circuits/seg_refresh` | X-segment (maintenance): sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
+| `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
 | `circuits/client_auth` | P-lane client circuit: knowledge of the secret behind an account's auth binding, authorizing `msg` |
 | `circuits/agg_app` | Chonk app: verifies 10 client proofs against the pinned client VK and folds the first `count` |
 | `circuits/{init,tail,hiding}_kernel` | IVC kernels: OINK, HN, HN_FINAL, each pinning its predecessor's VK hash |
@@ -41,7 +43,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/agg_ultra` | M1 measurement: `agg_app`'s checks in plain UltraHonk |
 | `circuits/rogue_app`, `circuits/rogue_segment` | Adversarial fixtures for the VK tests; never deployed |
 | `circuits/vendor/bb_proof_verification` | Vendored from aztec-packages v6.0.0 (Apache-2.0) |
-| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C0 deposits, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
+| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C0 deposits, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
 | `contracts/token` | Minimal public collateral token for C0 (not the D7 token) |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
 | `scripts/src/exchange` | Engine (mirrors the circuits and builds witnesses), trees, Grumpkin Schnorr, DA decoding, exit client, and the exchange tests |
@@ -87,11 +89,12 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs four batches natively across markets 0–2. They cover:
+This runs five batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
-- a 13% fall in market 0 followed by both liquidation waterfalls, one ending in an insurance takeover and deficit, the other in auto-deleveraging.
+- a 13% fall in market 0 followed by both liquidation waterfalls, one ending in an insurance takeover and deficit, the other in auto-deleveraging;
+- a session key's trading and refusals, a GTT order removed after expiry, and forced withdraw, close and cancel-all requests.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -137,7 +140,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.1: tests | Native run with exact conservation after every batch; 25 adversarial witnesses rejected; 47 Bridge TXE tests; the exit test on a local network with funding accrued to the freeze. |
 | P2.2: liquidation | Cancel, close within the ratio-preserving limit, insurance takeover lowest PnL first, deficit absorption, auto-deleveraging at the bankruptcy price; preconditions checked in circuit at fresh marks. |
 | P2.2: tests | Both liquidation waterfalls proved in the native run; 11 more adversarial witnesses (36 in all). |
-| P2: next | P2.3 session keys, forced requests, GTT; P2.4 refresh-rate enforcement, late desert claims, protocol-account seniority; P2.5 receipts, client-proof actions; C1 custody once the D7 token is specified. |
+| P2.3: keys, GTT, forced requests | Session keys (256 slots, scoped by markets, notional and expiry, nonces never reset); GTT orders; forced withdraw, close and cancel-all through `Bridge.submit_forced`, consumed without effect unless valid and from the owner. |
+| P2.3: tests | Native batch 5; 11 more adversarial witnesses (47); 50 TXE tests; a forced withdrawal through the Bridge in the exit test. |
+| P2: next | P2.4 refresh-rate enforcement, late desert claims, protocol-account seniority; P2.5 receipts, client-proof actions; C1 custody once the D7 token is specified. |
 
 ## Caveats
 

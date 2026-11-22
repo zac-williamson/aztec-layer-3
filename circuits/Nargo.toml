@@ -13,6 +13,7 @@ members = [
     "seg_trade",
     "seg_refresh",
     "seg_liquidate",
+    "seg_forced",
     "padding",
     "merge",
     "root",

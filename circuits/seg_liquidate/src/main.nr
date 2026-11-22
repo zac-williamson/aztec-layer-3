@@ -40,6 +40,7 @@ struct Step {
     price: u32,
     seq: u64,
     cancel_lots: u64,
+    cancel_expiry: u64,
     lots: u64,
     n_fills: u32,
     fills: [Fill; F],
@@ -136,7 +137,7 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
     if s.kind == LIQ_CANCEL {
         assert(below(e, mm), "account is not liquidatable");
         assert(s.cancel_lots > 0, "no such order");
-        let o = Order { side: s.side, account_index: idx, lots: s.cancel_lots };
+        let o = Order { side: s.side, account_index: idx, lots: s.cancel_lots, expiry: s.cancel_expiry };
         let index = order_index(s.side, s.price, s.seq);
         let (root, _) = replace(st.markets[m].book_root, index, o, Order::empty(), s.book_path);
         st.markets[m].book_root = root;

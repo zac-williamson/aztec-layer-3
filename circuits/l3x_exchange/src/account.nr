@@ -1,5 +1,9 @@
-use crate::consts::{
-    DS_ACCT, DS_ACCT_PRIV, DS_ACCT_PUB, DS_ACTV, DS_BLIND, DS_ENC, DS_KS, DS_MAUTH, MARKETS, PLAINTEXT_LEN,
+use crate::{
+    consts::{
+        DS_ACCT, DS_ACCT_PRIV, DS_ACCT_PUB, DS_ACTV, DS_BLIND, DS_ENC, DS_KEY, DS_KEY_NODE, DS_KS, DS_MAUTH,
+        KEYS_HEIGHT, MARKETS, PLAINTEXT_LEN,
+    },
+    tree::empty_root,
 };
 use l3x_types::hash::hash;
 
@@ -145,10 +149,51 @@ pub fn keystream(k_enc: Field, account_index: u32, da_nonce: Field, pos: u32, i:
     hash([DS_KS, k_enc, account_index as Field, da_nonce, (pos + i) as Field])
 }
 
-/// Activity leaf (SPEC.md §6.4), never published: the master key's nonce, the number of open
-/// orders, and the open bid and ask lots per market.
+/// A session key (SPEC.md §6.4, §7.2): a Grumpkin key that may place and cancel orders in the
+/// markets of `market_mask`, each order's notional at most `max_notional`, until L3 time `expiry`.
+/// `nonce` is the slot's action nonce; it is never reset when the slot's key changes.
+pub struct Key {
+    pub pk_x: Field,
+    pub pk_y: Field,
+    pub market_mask: u32,
+    pub max_notional: u64,
+    pub expiry: u64,
+    pub nonce: u64,
+}
+
+impl Key {
+    pub fn empty() -> Self {
+        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: 0 }
+    }
+
+    /// A slot that was never used is the empty leaf, so a fresh keys tree is the empty tree.
+    pub fn leaf(self) -> Field {
+        if (self.pk_x == 0) & (self.pk_y == 0) & (self.nonce == 0) {
+            0
+        } else {
+            hash(
+                [
+                    DS_KEY, self.pk_x, self.pk_y, self.market_mask as Field, self.max_notional as Field,
+                    self.expiry as Field, self.nonce as Field,
+                ],
+            )
+        }
+    }
+
+    pub fn allows_market(self, market: u32) -> bool {
+        ((self.market_mask >> market) & 1) == 1
+    }
+}
+
+pub fn empty_keys_root() -> Field {
+    empty_root::<KEYS_HEIGHT>(DS_KEY_NODE)
+}
+
+/// Activity leaf (SPEC.md §6.4), never published: the master key's nonce, the session keys, the
+/// number of open orders, and the open bid and ask lots per market.
 pub struct Activity {
     pub nonce: u64,
+    pub keys_root: Field,
     pub open_orders: u32,
     pub open_bid: [u64; MARKETS],
     pub open_ask: [u64; MARKETS],
@@ -156,16 +201,17 @@ pub struct Activity {
 
 impl Activity {
     pub fn new() -> Self {
-        Activity { nonce: 0, open_orders: 0, open_bid: [0; MARKETS], open_ask: [0; MARKETS] }
+        Activity { nonce: 0, keys_root: empty_keys_root(), open_orders: 0, open_bid: [0; MARKETS], open_ask: [0; MARKETS] }
     }
 
     pub fn hash(self) -> Field {
-        let mut inputs: [Field; 3 + MARKETS] = [0; 3 + MARKETS];
+        let mut inputs: [Field; 4 + MARKETS] = [0; 4 + MARKETS];
         inputs[0] = DS_ACTV;
         inputs[1] = self.nonce as Field;
-        inputs[2] = self.open_orders as Field;
+        inputs[2] = self.keys_root;
+        inputs[3] = self.open_orders as Field;
         for m in 0..MARKETS {
-            inputs[3 + m] = (self.open_bid[m] as Field) + (self.open_ask[m] as Field) * TWO_64;
+            inputs[4 + m] = (self.open_bid[m] as Field) + (self.open_ask[m] as Field) * TWO_64;
         }
         hash(inputs)
     }

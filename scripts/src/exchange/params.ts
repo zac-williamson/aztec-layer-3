@@ -73,6 +73,7 @@ export async function protocolAccounts(h: M.H, owners: [bigint, bigint] = [0x1n,
 /** Genesis exchange state (SPEC.md §6): the protocol accounts, empty books, no indices. */
 export async function genesisState(api: Barretenberg, protocol?: ProtocolAccount[]) {
   const h = M.hasher(api);
+  await M.initModel(h);
   const accts = protocol ?? (await protocolAccounts(h));
   const accounts = await new MerkleTree(h, M.ACCOUNTS_HEIGHT, M.DS.ACCT_NODE).init();
   const activity = await new MerkleTree(h, M.ACCOUNTS_HEIGHT, M.DS.ACTV_NODE).init();

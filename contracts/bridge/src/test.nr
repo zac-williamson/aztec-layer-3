@@ -21,6 +21,7 @@ global ROOT_VK: Field = 0x1234;
 global CONFIG: Field = 0x5678;
 global T_FORCE: u64 = 1000;
 global T_CLAIM: u64 = 500;
+global REQUEST_FEE: u128 = 25;
 global T_LAG: u64 = 15 * 60;
 global UPGRADE_DELAY: u64 = 21 * 24 * 60 * 60;
 global TEST_DA_LEN: u32 = 8;
@@ -64,6 +65,7 @@ unconstrained fn setup() -> Env {
             token,
             T_FORCE,
             T_CLAIM,
+            REQUEST_FEE,
             [operator, operator],
             PROTOCOL_MAUTH,
             PROTOCOL_ENC,
@@ -464,6 +466,32 @@ unconstrained fn withdrawal_recipient_cannot_be_redirected() {
         e.alice,
         L3XBridge::at(e.bridge).claim_withdrawal(1, 0, e.alice, 300, 5, single_record_path()),
     );
+}
+
+// ---- Forced requests (SPEC.md §7.3, §12) ----
+
+#[test]
+unconstrained fn forced_request_pays_the_fee_and_queues() {
+    let e = setup();
+    let _ = e.env.call_public(e.alice, L3XBridge::at(e.bridge).submit_forced(3, 2, e.alice.to_field(), 0));
+    let (_, _, _, _, cursor, count) = tip(e);
+    assert((cursor == 0) & (count == 1));
+    assert(balance(e, e.operator) == REQUEST_FEE);
+    assert(balance(e, e.alice) == 10_000 - REQUEST_FEE);
+}
+
+#[test(should_fail_with = "not a forced request")]
+unconstrained fn forced_request_kind_checked() {
+    let e = setup();
+    let _ = e.env.call_public(e.alice, L3XBridge::at(e.bridge).submit_forced(2, 2, 1000, 0));
+}
+
+#[test(should_fail_with = "priority request overdue")]
+unconstrained fn unprocessed_forced_request_blocks_settlement() {
+    let e = setup();
+    let _ = e.env.call_public(e.alice, L3XBridge::at(e.bridge).submit_forced(5, 2, 0, 0));
+    let now = now_plus(e, T_FORCE + 10);
+    settle(e, e.operator, next_header(e, now, 0), now);
 }
 
 // ---- Desert mode (SPEC.md §12) ----

@@ -31,8 +31,9 @@ pub contract L3XBridge {
     use l3x_exchange::{
         account::{account_leaf, AccountPub, enc_commitment, from_plaintext},
         consts::{
-            ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, KIND_DEPOSIT, KIND_REGISTER, MAX_DEPOSIT,
-            PLAINTEXT_LEN, PROTOCOL_ACCOUNTS, WD_HEIGHT,
+            ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, KIND_DEPOSIT, KIND_FORCED_CANCEL_ALL,
+            KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, MAX_DEPOSIT, PLAINTEXT_LEN, PROTOCOL_ACCOUNTS,
+            WD_HEIGHT,
         },
         request::payload_hash,
         state::{genesis_state_root, index_and_funding, MARKET_DATA_LEN, market_data_hash},
@@ -60,6 +61,7 @@ pub contract L3XBridge {
         kind: Field,
         a: Field,
         b: Field,
+        c: Field,
         sender: AztecAddress,
         time: u64,
     }
@@ -142,6 +144,7 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        request_fee: u128,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
@@ -225,6 +228,7 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        request_fee: u128,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
@@ -237,6 +241,7 @@ pub contract L3XBridge {
                 token,
                 t_force,
                 t_claim,
+                request_fee,
                 protocol_owners,
                 protocol_master_auths,
                 protocol_enc_commitments,
@@ -291,6 +296,27 @@ pub contract L3XBridge {
         self.enqueue_self._queue(KIND_REGISTER, master_auth, enc_key_commitment, self.msg_sender());
     }
 
+    /// Queues a forced request (SPEC.md §7.3, §12) on behalf of the caller, who must own the account
+    /// for it to take effect. It pays `request_fee` to the operator, so the queue cannot be flooded
+    /// for free; like every priority request it must be processed within t_force.
+    ///   ForcedWithdraw:  b = recipient
+    ///   ForcedClose:     b = market, c = worst price
+    ///   ForcedCancelAll: no fields
+    #[external("public")]
+    fn submit_forced(kind: Field, account_index: Field, b: Field, c: Field) {
+        assert(
+            (kind == KIND_FORCED_WITHDRAW) | (kind == KIND_FORCED_CLOSE) | (kind == KIND_FORCED_CANCEL_ALL),
+            "not a forced request",
+        );
+        let sender = self.msg_sender();
+        let config = self.storage.config.read();
+        if config.request_fee > 0 {
+            let operator = self.internal.current_operator();
+            self.call(L3XToken::at(config.token).transfer_from(sender, operator, config.request_fee));
+        }
+        self.internal.queue_entry(kind, account_index, b, c, sender);
+    }
+
     /// Deposits into an account (C0): the funds move into the vault now, and the request credits
     /// the account when processed, or refunds the caller if the account does not exist.
     #[external("public")]
@@ -299,22 +325,22 @@ pub contract L3XBridge {
         let sender = self.msg_sender();
         let token = self.storage.config.read().token;
         self.call(L3XToken::at(token).transfer_from(sender, self.address, amount));
-        self.internal.queue_entry(KIND_DEPOSIT, account_index, amount as Field, sender);
+        self.internal.queue_entry(KIND_DEPOSIT, account_index, amount as Field, 0, sender);
     }
 
     #[external("public")]
     #[only_self]
     fn _queue(kind: Field, a: Field, b: Field, sender: AztecAddress) {
-        self.internal.queue_entry(kind, a, b, sender);
+        self.internal.queue_entry(kind, a, b, 0, sender);
     }
 
     #[internal("public")]
-    fn queue_entry(kind: Field, a: Field, b: Field, sender: AztecAddress) {
+    fn queue_entry(kind: Field, a: Field, b: Field, c: Field, sender: AztecAddress) {
         assert(!self.storage.desert.read().active, "desert mode");
         let mut tip = self.storage.tip.read();
         let index = tip.priority_count;
         let time = self.context.timestamp();
-        let entry = priority_entry(payload_hash(kind, a, b), sender.to_field(), time);
+        let entry = priority_entry(payload_hash(kind, a, b, c), sender.to_field(), time);
         let mut slot = self.storage.slots.at(index).read();
         slot.entry = entry;
         slot.time = time;
@@ -326,7 +352,7 @@ pub contract L3XBridge {
         self.storage.slots.at(index + 1).write(next);
         tip.priority_count = index + 1;
         self.storage.tip.write(tip);
-        self.emit(PriorityRequested { index, entry, kind, a, b, sender, time });
+        self.emit(PriorityRequested { index, entry, kind, a, b, c, sender, time });
     }
 
     // ---- Settlement (SPEC.md §10.1–10.2) ----
@@ -496,7 +522,7 @@ pub contract L3XBridge {
         assert(index >= self.storage.tip.read().priority_cursor, "request was processed");
         let slot = self.storage.slots.at(index).read();
         let entry = priority_entry(
-            payload_hash(KIND_DEPOSIT, account_index, amount as Field),
+            payload_hash(KIND_DEPOSIT, account_index, amount as Field, 0),
             depositor.to_field(),
             slot.time,
         );

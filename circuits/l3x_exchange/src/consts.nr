@@ -1,6 +1,11 @@
 // Tree heights.
 pub global ACCOUNTS_HEIGHT: u32 = 32;
 pub global BOOK_HEIGHT: u32 = 80;
+/// Session-key slots per account: a tree of height 8 (256 slots) in the activity leaf (SPEC.md §6.4).
+pub global KEYS_HEIGHT: u32 = 8;
+pub global KEY_SLOTS: u32 = 256;
+/// The key id an action uses when the master key signs it.
+pub global MASTER_KEY: u32 = 256;
 /// Withdrawal records per batch: a tree of height 4 (16 leaves) built by the root.
 pub global WD_HEIGHT: u32 = 4;
 pub global MAX_WD_BATCH: u32 = 16;
@@ -41,10 +46,18 @@ pub global DS_DOMAIN: Field = 45;
 pub global DS_MKTS: Field = 46;
 pub global DS_MKT_PARAMS: Field = 47;
 pub global DS_LIQ: Field = 48;
+pub global DS_KEY: Field = 49;
+pub global DS_KEY_NODE: Field = 50;
 
-// Priority request kinds (SPEC.md §7.3).
+// Priority request kinds (SPEC.md §7.3). Forced requests carry the account index in `a`.
 pub global KIND_REGISTER: Field = 1;
 pub global KIND_DEPOSIT: Field = 2;
+/// b = recipient: withdraw all free collateral.
+pub global KIND_FORCED_WITHDRAW: Field = 3;
+/// b = market, c = worst price: close the position against the book, no worse than c.
+pub global KIND_FORCED_CLOSE: Field = 4;
+/// Cancel up to FORCED_CANCELS of the account's orders.
+pub global KIND_FORCED_CANCEL_ALL: Field = 5;
 
 // Action-log entry kinds.
 pub global LOG_PRIORITY: Field = 1;

@@ -39,10 +39,11 @@ pub struct Taker {
 
 /// Matches up to `lots` of a taker order on `side` with limit price `limit` against the best
 /// opposite orders of market `mid`, in up to F steps (`n` used). Every step proves that its order
-/// is the best on its side; fills execute at the maker's price, settle both sides' funding first,
-/// and charge `maker_fee_ppm` and `taker_fee_ppm` into `fees_pending`. Makers' leaves are written
-/// and published here; the taker's is left to the caller. Returns the updated state, running
-/// values, market and taker, the unfilled lots and the filled notional.
+/// is the best on its side. A step cancels the taker's own order (self-trade prevention), removes
+/// an expired GTT order, or fills: fills execute at the maker's price, settle both sides' funding
+/// first, and charge `maker_fee_ppm` and `taker_fee_ppm` into `fees_pending`. Makers' leaves are
+/// written and published here; the taker's is left to the caller. Returns the updated state,
+/// running values, market and taker, the unfilled lots and the filled notional.
 pub fn match_order<let F: u32>(
     state: State,
     running: Running,
@@ -92,9 +93,32 @@ pub fn match_order<let F: u32>(
                     t.act.open_ask[mid] -= f.order.lots;
                 }
                 t.act.open_orders -= 1;
+            } else if f.order.expired(r.time) {
+                // An expired GTT order is removed instead of filled; its owner's open lots shrink.
+                mkt.book_root = walk(0, 0, 0, f.index, f.book_path).root;
+                let mut mact = f.maker_actv;
+                if f.order.side == SIDE_BID {
+                    mact.open_bid[mid] = f.maker_actv.open_bid[mid] - f.order.lots;
+                } else {
+                    mact.open_ask[mid] = f.maker_actv.open_ask[mid] - f.order.lots;
+                }
+                mact.open_orders = f.maker_actv.open_orders - 1;
+                st.activity_root = update(
+                    DS_ACTV_NODE,
+                    st.activity_root,
+                    f.order.account_index,
+                    f.maker_actv.hash(),
+                    mact.hash(),
+                    f.maker_actv_path,
+                );
             } else {
                 let q = if remaining < f.order.lots { remaining } else { f.order.lots };
-                let left = Order { side: f.order.side, account_index: f.order.account_index, lots: f.order.lots - q };
+                let left = Order {
+                    side: f.order.side,
+                    account_index: f.order.account_index,
+                    lots: f.order.lots - q,
+                    expiry: f.order.expiry,
+                };
                 mkt.book_root = walk(left.leaf(), left.ask_lots(), left.bid_lots(), f.index, f.book_path).root;
                 let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, f, q, left.lots, da_nonce);
                 st = st2;

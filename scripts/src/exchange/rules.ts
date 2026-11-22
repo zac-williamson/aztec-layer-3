@@ -2,8 +2,9 @@
 // margin, mark ticks and the book index.
 import * as M from './model.ts';
 
-export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n } as const;
-export const TIF = { GTC: 0n, IOC: 1n, FOK: 2n, POST_ONLY: 3n } as const;
+export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n } as const;
+export const TIF = { GTC: 0n, IOC: 1n, FOK: 2n, POST_ONLY: 3n, GTT: 4n } as const;
+export const ACTION_PAYLOAD = 8;
 export const PPM = 1_000_000n;
 export const MICRO = 1_000_000n;
 export const MAX_PRICE = 1n << 24n;
@@ -16,8 +17,8 @@ export const MAX_OPEN_ORDERS = 1000n;
 export const FUNDING = { R: 100n, R_CLAMP: 500n, CAP: 40_000n, DIV: 8n } as const;
 const TWO_48 = 1n << 48n;
 
-export const actionMsg = (h: M.H, domain: bigint, kind: bigint, account: bigint, nonce: bigint, p: bigint[]) =>
-  h([M.DS.ACTION, domain, kind, account, nonce, ...p]);
+export const actionMsg = (h: M.H, domain: bigint, kind: bigint, account: bigint, keyId: bigint, nonce: bigint, p: bigint[]) =>
+  h([M.DS.ACTION, domain, kind, account, keyId, nonce, ...p]);
 
 export const abs = (x: bigint) => (x < 0n ? -x : x);
 /** Truncating division toward zero, as the circuits compute it through magnitudes. */
@@ -155,9 +156,10 @@ export function orderIndex(side: bigint, price: bigint, seq: bigint): bigint {
 export const RIGHTMOST = (1n << 80n) - 1n;
 export const LEFTMOST = 0n;
 
-export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint };
-export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint) =>
-  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots]);
+export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint };
+export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint) =>
+  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots, expiry]);
+export const expired = (o: { expiry: bigint }, now: bigint) => o.expiry !== 0n && o.expiry < now;
 export const askLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.ASK ? o.lots : 0n);
 export const bidLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.BID ? o.lots : 0n);
 

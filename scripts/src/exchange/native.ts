@@ -191,12 +191,66 @@ async function main() {
   const b4 = await settle(w4);
   assert(b4.header[0] === b3.header[1], 'batch 4 does not chain from batch 3');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the four
+  // Batch 5: session keys, GTT and forced requests (SPEC.md §6.5, §7.2, §7.3). Alice gives a
+  // session key markets 0 and 1, a 500,000 notional cap and an expiry; it rests a GTT bid, and the
+  // engine refuses its order in market 2, its oversized order and its withdrawal. Once the GTT bid
+  // has expired, Bob's sell removes it and fills Carol's bid behind it. Alice revokes the key, whose
+  // next order is refused. The queue then carries Carol's forced withdrawal, a forced withdrawal
+  // Eve submits for Alice's account (no effect), Bob's forced close and Dave's forced cancel-all.
+  await engine.beginBatch(5n, b4.end.priorityHead, b4.end.priorityCursor, b4.end.time);
+  const t5 = now + 3900n;
+  await engine.block(t5, [await update(0n, 1750n, 1750n, t5 - 1n), await update(1n, 30_010n, 30_010n, t5 - 1n)]);
+  const sess = await keysFromSeed(h, 9001n);
+  const SLOT = 3n;
+  const { ADD_KEY, REVOKE_KEY } = X.KIND_ACT;
+  const bySession = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, sess, kind, A, nonce, p, SLOT);
+  await engine.trade([
+    await act(alice, A, 5n, ADD_KEY, [SLOT, sess.pk.x, sess.pk.y, 0b0011n, 500_000n, t5 + 1000n]),
+    await bySession(1n, PLACE, [0n, BID, 1745n, 10n, X.TIF.GTT, 0n, t5 + 5n]),
+    await bySession(2n, PLACE, [2n, BID, 100n, 1n, GTC, 0n]), // market 2 is outside the mask
+    await bySession(2n, PLACE, [0n, BID, 1745n, 1000n, GTC, 0n]), // notional 1,745,000 > 500,000
+    await bySession(2n, WITHDRAW, [10n, users[0].addr]), // session keys cannot withdraw
+    await act(carol, C, 4n, PLACE, [0n, BID, 1740n, 15n, GTC, 0n]),
+  ]);
+  await engine.block(t5 + 10n);
+  await engine.trade([
+    await act(bob, B, 5n, PLACE, [0n, ASK, 1700n, 10n, IOC, 0n]), // removes the expired GTT bid, fills Carol
+    await act(alice, A, 6n, REVOKE_KEY, [SLOT]),
+    await bySession(2n, PLACE, [0n, BID, 1745n, 1n, GTC, 0n]), // revoked
+  ]);
+  const reasons5 = engine.rejected.slice(5).map((r) => r.reason);
+  log(`engine refused: ${reasons5.join('; ')}`);
+  assert(
+    reasons5.join('|') ===
+      "market not allowed for the session key|order above the session key's notional limit|session keys only place and cancel|signing key is not the slot's",
+    'unexpected batch 5 rejections',
+  );
+  assert(engine.accts.get(C)!.priv.positions[0].size === 30n && engine.orders[0].size > 0, 'GTT removal and fill');
+  assert(![...engine.orders[0].values()].some((o) => o.account === A), 'expired GTT bid still resting');
+  const carolBefore = engine.accts.get(C)!.priv.collateral;
+  await engine.priority([
+    { kind: M.KIND.FORCED_WITHDRAW, a: C, b: users[2].addr, sender: users[2].addr, time: t5 },
+    { kind: M.KIND.FORCED_WITHDRAW, a: A, b: users[4].addr, sender: users[4].addr, time: t5 }, // not the owner
+    { kind: M.KIND.FORCED_CLOSE, a: B, b: 0n, c: 2100n, sender: users[1].addr, time: t5 },
+    { kind: M.KIND.FORCED_CANCEL_ALL, a: D, b: 0n, sender: users[3].addr, time: t5 },
+  ]);
+  const forcedOut = carolBefore - engine.accts.get(C)!.priv.collateral;
+  netDeposits -= forcedOut;
+  log(`forced: carol withdrew ${forcedOut}; bob closed to ${engine.accts.get(B)!.priv.positions[0].size} in market 0; dave has ${engine.actv.get(D)!.openOrders} open orders`);
+  assert(forcedOut > 0n && engine.accts.get(B)!.priv.positions[0].size === 0n && engine.actv.get(D)!.openOrders === 0n, 'forced requests');
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 5');
+  const w5 = await engine.endBatch();
+  log(`batch 5: ${w5.segments.map((s) => s.label).join(' | ')}; ${w5.daPayload.length} DA fields`);
+  const b5 = await settle(w5);
+  assert(b5.header[0] === b4.header[1], 'batch 5 does not chain from batch 4');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the five
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b4.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b5.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
@@ -205,15 +259,15 @@ async function main() {
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -60n && pos(C).positions[0].size === 20n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === 0n && pos(C).positions[0].size === 30n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
-  log(`header of batch 4 ${hex(b4.headerHash)}`);
+  log(`header of batch 5 ${hex(b5.headerHash)}`);
   await api.destroy();
 }
 

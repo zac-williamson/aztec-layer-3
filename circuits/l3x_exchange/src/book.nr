@@ -25,15 +25,17 @@ pub fn empty_root() -> Field {
     e
 }
 
+/// A resting order. `expiry` is the L3 time after which a GTT order is void (zero: none).
 pub struct Order {
     pub side: Field,
     pub account_index: u32,
     pub lots: u64,
+    pub expiry: u64,
 }
 
 impl Order {
     pub fn empty() -> Self {
-        Order { side: 0, account_index: 0, lots: 0 }
+        Order { side: 0, account_index: 0, lots: 0, expiry: 0 }
     }
 
     /// The leaf value; an order with no lots left is the empty leaf.
@@ -41,8 +43,13 @@ impl Order {
         if self.lots == 0 {
             0
         } else {
-            hash([DS_ORDER, self.side, self.account_index as Field, self.lots as Field])
+            hash([DS_ORDER, self.side, self.account_index as Field, self.lots as Field, self.expiry as Field])
         }
+    }
+
+    /// A GTT order past its expiry (SPEC.md §6.5): matching removes it instead of filling it.
+    pub fn expired(self, now: u64) -> bool {
+        (self.expiry != 0) & (self.expiry < now)
     }
 
     pub fn ask_lots(self) -> u64 {

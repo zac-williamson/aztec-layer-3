@@ -116,11 +116,11 @@ async function main() {
   // fill (no other leaf write would expose it).
   t = clone(quiet);
   const evil = await keysFromSeed(h, 666n);
-  const p0 = [0n, BID, 1990n, 5n, GTC, 0n];
+  const p0 = [0n, BID, 1990n, 5n, GTC, 0n, 0n, 0n];
   t.actions[0].taker_pub.master_auth = hex(await M.masterAuthOf(h, evil.pk!.x, evil.pk!.y));
   t.actions[0].pk_x = hex(evil.pk!.x);
   t.actions[0].pk_y = hex(evil.pk!.y);
-  t.actions[0].sig = sigToNoir(await sign(h, evil.sk, await X.actionMsg(h, engine.domain, PLACE, idx(2), 2n, p0)));
+  t.actions[0].sig = sigToNoir(await sign(h, evil.sk, await X.actionMsg(h, engine.domain, PLACE, idx(2), M.MASTER_KEY, 2n, p0)));
   await expectFail('operator substitutes the signing key', 'seg_trade', t, 'Merkle path does not match root');
   t = clone(buy);
   await resign(t, 0, 1, 0n, PLACE, [0n, BID, 2002n, 5n, IOC, 0n]);
@@ -192,7 +192,7 @@ async function main() {
   await expectFail('block time regresses', 'seg_block', t, 'time regressed');
   // The operator hides the bids to move the mark: an empty side must be proved empty.
   t = clone(tick);
-  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0' } };
+  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0' } };
   await expectFail('tick hides the best bid', 'seg_block', t, 'empty bid side path');
   t = clone(tick);
   t.updates[0].ask.seq = (BigInt(t.updates[0].ask.seq) + 2n).toString(); // a later ask at the same price (not the leaf's sibling)
@@ -281,6 +281,85 @@ async function main() {
   // The honest ends of both waterfalls execute: V is deleveraged against P, W taken over.
   await L.liquidate([{ kind: 'adl', account: V, market: 0, counterparty: P }, { kind: 'takeover', account: W, market: 0 }]);
   await execute('seg_liquidate', L.segments[L.segments.length - 1].inputs);
+
+  // Session keys, GTT and forced requests (SPEC.md §6.5, §7.2, §7.3). Q provides liquidity; R gives
+  // a session key market 0 only, a 100,000 notional cap and an expiry, and its key rests a bid.
+  const K = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  const ku = await Promise.all([21n, 22n].map((x) => keysFromSeed(h, x)));
+  const [Q, Rk] = [2n, 3n];
+  const kaddr = [randomField(), randomField()];
+  const kreqs: M.Request[] = [];
+  for (const [i, k] of ku.entries()) {
+    const encC = await M.encCommitment(h, k.kEnc);
+    K.keyring.set(encC, k.kEnc);
+    kreqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender: kaddr[i], time: now });
+    kreqs.push({ kind: M.KIND.DEPOSIT, a: BigInt(M.PROTOCOL_ACCOUNTS + i), b: [2_000_000n, 1_000_000n][i], sender: kaddr[i], time: now });
+  }
+  await K.beginBatch(1n, 0n, 0n, 0n);
+  await K.block(now, [await update(K, 0n, 2000n, now), await update(K, 1n, 30_000n, now)]);
+  await K.priority(kreqs);
+  const kact = (u: number, nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, K.domain, ku[u], kind, BigInt(M.PROTOCOL_ACCOUNTS + u), nonce, p);
+  const sessKey = await keysFromSeed(h, 31337n);
+  const bySess = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, K.domain, sessKey, kind, Rk, nonce, p, 0n);
+  const keyExpiry = now + 1000n;
+  await K.trade([
+    await kact(0, 1n, PLACE, [0n, ASK, 2000n, 50n, GTC, 0n]),
+    await kact(0, 2n, PLACE, [0n, ASK, 2001n, 50n, GTC, 0n]),
+    await kact(0, 3n, PLACE, [0n, BID, 1990n, 50n, GTC, 0n]),
+    await kact(0, 4n, PLACE, [0n, BID, 1989n, 5n, GTC, 0n]),
+    await kact(0, 5n, PLACE, [0n, BID, 1988n, 5n, GTC, 0n]),
+    await kact(0, 6n, PLACE, [0n, BID, 1987n, 5n, GTC, 0n]),
+    await kact(1, 1n, X.KIND_ACT.ADD_KEY, [0n, sessKey.pk.x, sessKey.pk.y, 0b01n, 100_000n, keyExpiry]),
+  ]);
+  const ks = K.segments.length;
+  await K.trade([await bySess(1n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n])]);
+  const sessPlace = clone(K.segments[ks].inputs) as any;
+  await K.trade([await kact(1, 2n, PLACE, [0n, BID, 2000n, 20n, IOC, 0n])]); // R goes long 20
+  assert(K.rejected.length === 0, `session setup rejected: ${K.rejected.map((r) => r.reason)}`);
+  await execute('seg_trade', sessPlace);
+  const reSess = async (inputs: any, nonce: bigint, kind: bigint, p: bigint[]) => {
+    const a = await bySess(nonce, kind, p);
+    inputs.actions[0] = { ...inputs.actions[0], kind: hex(kind), nonce: nonce.toString(), p: a.p.map(hex), sig: sigToNoir(a.sig) };
+    return inputs;
+  };
+  await expectFail('session key outside its markets', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [1n, BID, 30_000n, 1n, GTC, 0n]), 'market not allowed for the session key');
+  await expectFail('session key above its notional cap', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 100n, GTC, 0n]), "order above the session key's notional limit");
+  await expectFail('session key withdrawing', 'seg_trade', await reSess(clone(sessPlace), 1n, WITHDRAW, [10n, 77n]), 'session keys only place and cancel');
+  await expectFail('session key adding a key', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.ADD_KEY, [1n, 5n, 6n, 1n, 1n, keyExpiry]), 'session keys only place and cancel');
+  await expectFail('session key nonce replayed', 'seg_trade', await reSess(clone(sessPlace), 0n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n]), 'nonce');
+  t = clone(sessPlace);
+  t.start.time = (keyExpiry + 1n).toString();
+  await expectFail('expired session key', 'seg_trade', t, 'session key expired');
+  t = clone(sessPlace);
+  t.actions[0].key = { ...t.actions[0].key, pk_x: hex(ku[0].pk.x), pk_y: hex(ku[0].pk.y) };
+  t.actions[0].pk_x = hex(ku[0].pk.x);
+  t.actions[0].pk_y = hex(ku[0].pk.y);
+  t.actions[0].sig = sigToNoir(await sign(h, ku[0].sk, await X.actionMsg(h, K.domain, PLACE, Rk, 0n, 1n, [0n, BID, 1995n, 10n, GTC, 0n, 0n, 0n])));
+  await expectFail('another key in the session slot', 'seg_trade', t, 'session key path');
+  const st0 = BigInt(sessPlace.start.time);
+  await expectFail('GTT order already expired', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 10n, X.TIF.GTT, 0n, st0]), 'order already expired');
+  await expectFail('GTC order with an expiry', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n, st0 + 100n]), 'only GTT orders expire');
+  // Forced requests: R closes its long against Q's bids; Q cancels its orders. The probe path a
+  // close that stopped at once would need, on the book as it stands before the close:
+  const probe = K.books[0].path(X.orderIndex(M.SIDE.ASK, 1900n, K.markets[0].nextSeq)).map((x) => ({ hash: hex(x.hash), ask: x.ask.toString(), bid: x.bid.toString() }));
+  const kf = K.segments.length;
+  await K.priority([
+    { kind: M.KIND.FORCED_CLOSE, a: Rk, b: 0n, c: 1900n, sender: kaddr[1], time: now },
+    { kind: M.KIND.FORCED_CANCEL_ALL, a: Q, b: 0n, sender: kaddr[0], time: now },
+  ]);
+  const forcedClose = clone(K.segments[kf].inputs) as any;
+  const forcedCancel = clone(K.segments[kf + 1].inputs) as any;
+  // The close first cancels R's own resting bid (self-trade prevention), then fills against Q.
+  assert(forcedClose.n_fills === 2 && forcedCancel.n_cancels === 4, `forced setup: ${forcedClose.n_fills} steps, ${forcedCancel.n_cancels} cancels`);
+  await execute('seg_forced', forcedClose);
+  await execute('seg_forced', forcedCancel);
+  t = clone(forcedClose);
+  t.n_fills = 0;
+  t.probe_path = probe;
+  await expectFail('forced close stops with liquidity left', 'seg_forced', t, 'crossing bids remain');
+  t = clone(forcedCancel);
+  t.n_cancels = 3;
+  await expectFail('forced cancel-all leaves cancellable orders', 'seg_forced', t, 'forced cancel-all must cancel every order it can');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

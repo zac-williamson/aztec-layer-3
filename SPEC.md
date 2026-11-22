@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.6, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), and liquidation with the insurance backstop (P2.2), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.7, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), and session keys, GTT orders and forced requests (P2.3), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -673,7 +673,7 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 | M3 | Tube: 1,473,521 gates, 4.5 s, 480-field RollupHonk proof. |
 | M4 | Root, with two RollupHonk verifications and full IPA verification: 8,388,352 gates (≈ 2^23), 42–46 s, 458-field ZK proof. This is a fixed cost per batch. |
 | M5 | `Bridge.settle` on a 6.0.0 local network, with client proving and node transaction-proof verification on.<br>Client proving: the private `settle` circuit is 191,285 gates. It verifies the root proof, hashes a 4,080-field argument, checks the DA sponge and reads three `DelayedPublicMutable`s. The transaction's other circuits: account entrypoint 15,777, `private_kernel_init` 57,095, reset-tail-to-public 97,654, hiding kernel 44,438. Send to checkpointed: 6.6–7.1 s.<br>Gas, 40-field payload: 2,240 DA gas, 3.78M L2 gas.<br>Gas, 1,714-field payload: 55,808 DA gas, 5.49M L2 gas. 1,714 fields is the most the network admits (§9.5): its per-transaction DA cap is 55,836 DA gas. A 4,080-field payload would need 131,520 DA gas.<br>Building the log costs ≈ 1,030 L2 gas per field, so a 3,600-field payload would pass the AVM's 6M processable L2 gas. Log emission must be made cheaper before Mode R can use mainnet-geometry capacity. |
-| M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. P2.2: `seg_liquidate` 327,161 gates for two liquidation steps (each any of cancel, close with two matching steps, takeover, deficit, ADL); its segments prove in 3.6–6.3 s under load. Risk-sweep costs await phase 3. |
+| M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. P2.2: `seg_liquidate` 327,161 gates for two liquidation steps (each any of cancel, close with two matching steps, takeover, deficit, ADL); its segments prove in 3.6–6.3 s under load. P2.3 (session keys, GTT, forced requests): `seg_trade` 430,513; `seg_priority` 155,159; `seg_liquidate` 386,374; `seg_forced` 221,271. Risk-sweep costs await phase 3. |
 | M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
@@ -820,8 +820,9 @@ P2 is built in increments, each leaving every test green.
 
 - P2.1: multiple markets, oracles with mark and funding ticks, fees, and the protocol accounts.
 - P2.2: liquidation and the insurance backstop.
+- P2.3: session keys, GTT orders and forced priority requests.
 
-Both are built. Where they narrow the design, the full design remains normative.
+All three are built. Where they narrow the design, the full design remains normative.
 
 **State** (§6):
 
@@ -830,7 +831,7 @@ Both are built. Where they narrow the design, the full design remains normative.
   - `pack(p) = size + entry·2^64 + funding·2^128`, each limb a 64-bit two's complement.
   - `funding` is the market's cumulative funding index when the position last settled.
   - The hashed fields are exactly the plaintext a DA entry encrypts, so decrypting an entry yields the leaf opening.
-- `ActivityLeaf = H(DS_ACTV, nonce, open_orders, open_bid_m + open_ask_m·2^64 for each m)`.
+- `ActivityLeaf = H(DS_ACTV, nonce, keys_root, open_orders, open_bid_m + open_ask_m·2^64 for each m)` (P2.3 added `keys_root`).
 - `MarketLeaf` has 16 fields:
   - the book root and next sequence number;
   - the index price and its time;
@@ -857,13 +858,14 @@ Both are built. Where they narrow the design, the full design remains normative.
 
 | Segment | Per proof | Gates | Change from P1 |
 | --- | --- | --- | --- |
-| `seg_block` | one L3 block, ≤ 4 index updates | 162,273 | k-of-n signatures, a mark tick per update with two 80-level top-of-book walks |
-| `seg_priority` | ≤ 4 requests | 100,033 | four position slots |
-| `seg_trade` | ≤ 2 signed actions, ≤ 2 matching steps each | 340,288 | any market; funding settlement, fees, FOK, post-only, reduce-only, self-trade prevention; margin over every market |
+| `seg_block` | one L3 block, ≤ 4 index updates | 162,307 | k-of-n signatures, a mark tick per update with two 80-level top-of-book walks |
+| `seg_priority` | ≤ 4 requests | 155,159 | four position slots; forced withdrawals (margin) |
+| `seg_trade` | ≤ 2 signed actions, ≤ 2 matching steps each | 430,513 | any market; funding settlement, fees, FOK, post-only, GTT, reduce-only, self-trade prevention; margin over every market; session keys |
 | `seg_refresh` | sweep and ≤ 4 refresh entries | 48,147 | the sweep |
-| `seg_liquidate` (P2.2) | ≤ 2 liquidation steps | 327,161 | new |
+| `seg_liquidate` (P2.2) | ≤ 2 liquidation steps | 386,374 | new |
+| `seg_forced` (P2.3) | one forced close or cancel-all | 221,271 | new |
 
-Gate counts are for the P2.2 build.
+Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action proves a session-key slot, and each matching step carries the expired-order removal, whose maker activity update could be merged with the fill's.
 
 **Oracles, mark and funding** (§8.4):
 
@@ -930,6 +932,35 @@ Gate counts are for the P2.2 build.
   - Payouts are valued at the frozen indices with funding accrued: Alice 1,005,366 plus her refunded 5,000 deposit, Bob 1,993,513.
   - The vault keeps 121: the fee account's 119 and 2 units of funding rounding, which the protocol accounts claim once §12's seniority rule is built.
 
+**Session keys** (P2.3, §6.4, §7.2):
+
+- `keys_root` is a height-8 tree: 256 slots of `KeyLeaf = H(DS_KEY, pk, market_mask, max_notional, expiry, nonce)`. A slot that was never used is the empty leaf.
+- Every action names its signing key: `MASTER_KEY` (256), or a slot. The key id is part of the signed message: `H(DS_ACTION, domain, kind, account, key_id, nonce, p[8])`.
+  - The master key's nonce lives in the activity leaf.
+  - A slot's nonce lives in its key leaf and is never reset when the slot's key changes, so an old key's signatures cannot be replayed.
+- A session key may only place and cancel orders, in the markets of its mask, with `price·lots ≤ max_notional`, and until L3 time passes its expiry. The withdraw, transfer and admin levels of §7.2 stay with the master key.
+- `AddKey(slot, pk, mask, max_notional, expiry)` and `RevokeKey(slot)` are master-key actions. They change only the activity tree, so managing keys publishes nothing.
+
+**GTT orders** (P2.3, §6.5):
+
+- `OrderLeaf = H(DS_ORDER, side, account, lots, expiry)`. Only GTT orders have an expiry, and it must lie in the future when the order is placed.
+- When matching meets an expired order, it removes the order instead of filling it, and the owner's open lots shrink. The step counts against the action's matching steps.
+- An expired order counts toward its owner's margin, and toward a tick's top of book, until it is removed.
+
+**Forced priority requests** (P2.3, §7.3, §12):
+
+- `Bridge.submit_forced(kind, account, b, c)` queues a request with `msg_sender` and pays `request_fee` to the operator, so the queue cannot be flooded for free.
+  - `ForcedWithdraw(b = recipient)`
+  - `ForcedClose(b = market, c = worst price)`
+  - `ForcedCancelAll`
+  - The request payload gained a fourth field: `payload_hash = H(DS_REQ, kind, a, b, c)`. Existing kinds have `c = 0`, so their hashes did not change.
+- A request takes effect only if the account exists and `msg_sender` is its owner. Otherwise, or if a field is out of range, it is consumed without effect. No request's own fields can make a segment unprovable, which would stall the queue into desert mode. For the same reason, a deposit that would push collateral out of range is now refunded.
+- `ForcedWithdraw` (in `seg_priority`): withdraws all free collateral, `max(0, min(collateral, equity − IM))`, to the recipient. Equity needs fresh indices wherever the account is exposed. An account that is not exposed needs none, so a user can always close first and then withdraw.
+- `ForcedClose` and `ForcedCancelAll` (in `seg_forced`, one per segment):
+  - The close is a reduce-only IOC order at the taker fee, no worse than the worst price. It may stop early only when its two matching steps run out or no liquidity is left within that price.
+  - Cancel-all removes `min(4, open orders)` of the account's orders.
+  - In both cases the owner can submit more requests for the rest.
+
 **Liquidation** (P2.2, §8.5):
 
 - Liquidations are operator steps in their own segment. Each step's message is logged as an action. Each precondition is checked at current marks, with fresh indices wherever the accounts involved are exposed.
@@ -965,12 +996,26 @@ Gate counts are for the P2.2 build.
   - a liquidation on a stale index.
 - `EXECUTE_ONLY=1 npm run native` executes every segment and compares it with the engine without proving, in about 10 s.
 
+**Tests** (P2.3):
+
+- **Native**, batch 5:
+  - A session key rests a GTT bid. The engine refuses its order outside the mask, its order above the notional cap and its withdrawal. After the key is revoked, its next order is refused too.
+  - The GTT bid expires, and a sell removes it and fills the next bid.
+  - Through the queue: a forced withdrawal; one submitted by a non-owner, which has no effect; a forced close of 70 lots; a forced cancel-all.
+- **Adversarial:** 11 more witnesses, 47 in all:
+  - a session key outside its markets, above its cap, withdrawing or adding a key;
+  - a replayed key nonce, an expired session key, another key in the slot;
+  - a GTT order already expired, a GTC order with an expiry;
+  - a forced close that stops with liquidity left;
+  - a forced cancel-all that leaves cancellable orders.
+- **TXE:** 50 tests. New ones cover the request fee and queueing, the kind check, and an unprocessed forced request blocking settlement after `T_force`.
+- **Exit test:** Bob forces a withdrawal through the Bridge on the local network. Batch 3 processes it, and he claims the record from the DA.
+
 **Next increments:**
 
-1. P2.3: session keys, forced priority requests and GTT orders.
-2. P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
-3. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
-4. C1 custody (§10.3), once the D7 token is specified.
+1. P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
+2. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
+3. C1 custody (§10.3), once the D7 token is specified.
 
 ## 16. Decisions
 

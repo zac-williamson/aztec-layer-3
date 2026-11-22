@@ -35,6 +35,8 @@ export const DS = {
   MKTS: 46n,
   MKT_PARAMS: 47n,
   LIQ: 48n,
+  KEY: 49n,
+  KEY_NODE: 50n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -43,7 +45,11 @@ export const WD_HEIGHT = 4;
 export const MAX_WD_BATCH = 16;
 export const MARKETS = 4;
 export const N_ORACLES = 3;
-export const KIND = { REGISTER: 1n, DEPOSIT: 2n } as const;
+export const KEYS_HEIGHT = 8;
+export const KEY_SLOTS = 256;
+/** The key id of actions the master key signs. */
+export const MASTER_KEY = 256n;
+export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n } as const;
 export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
@@ -70,7 +76,9 @@ const TWO_128 = 1n << 128n;
 export type AccountPub = { owner: bigint; masterAuth: bigint; encCommitment: bigint; class: bigint };
 export type Position = { size: bigint; entry: bigint; funding: bigint };
 export type AccountPriv = { collateral: bigint; positions: Position[]; blind: bigint };
-export type Activity = { nonce: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[] };
+export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[] };
+/** A session key (SPEC.md §7.2). */
+export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint };
 export type Market = {
   bookRoot: bigint;
   nextSeq: bigint;
@@ -120,11 +128,24 @@ export type Params = {
   fundingInterval: bigint;
   markets: MarketParams[];
 };
-export type Request = { kind: bigint; a: bigint; b: bigint; sender: bigint; time: bigint };
+export type Request = { kind: bigint; a: bigint; b: bigint; c?: bigint; sender: bigint; time: bigint };
 
 export const emptyPosition = (): Position => ({ size: 0n, entry: 0n, funding: 0n });
 export const emptyPriv = (blind = 0n): AccountPriv => ({ collateral: 0n, positions: Array.from({ length: MARKETS }, emptyPosition), blind });
-export const newActivity = (): Activity => ({ nonce: 0n, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n) });
+/** Root of an empty keys tree; set once by `initModel` (every activity leaf starts with it). */
+export let EMPTY_KEYS_ROOT = 0n;
+export async function initModel(h: H) {
+  let e = 0n;
+  for (let i = 0; i < KEYS_HEIGHT; i++) e = await h([DS.KEY_NODE, e, e]);
+  EMPTY_KEYS_ROOT = e;
+}
+export const newActivity = (): Activity => {
+  if (EMPTY_KEYS_ROOT === 0n) throw new Error('initModel was not called');
+  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n) };
+};
+export const emptyKey = (): Key => ({ pkX: 0n, pkY: 0n, marketMask: 0n, maxNotional: 0n, expiry: 0n, nonce: 0n });
+export const keyLeaf = (h: H, k: Key) =>
+  k.pkX === 0n && k.pkY === 0n && k.nonce === 0n ? Promise.resolve(0n) : h([DS.KEY, k.pkX, k.pkY, k.marketMask, k.maxNotional, k.expiry, k.nonce]);
 export const copyPriv = (q: AccountPriv): AccountPriv => ({ ...q, positions: q.positions.map((p) => ({ ...p })) });
 export const copyActivity = (a: Activity): Activity => ({ ...a, openBid: [...a.openBid], openAsk: [...a.openAsk] });
 export const genesisMarket = (bookRoot: bigint): Market => ({
@@ -165,7 +186,7 @@ export const blindOf = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number
 export const keystream = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number, i: number) =>
   h([DS.KS, k, idx, nonce, BigInt(pos + i)]);
 export const activityHash = (h: H, a: Activity) =>
-  h([DS.ACTV, a.nonce, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64)]);
+  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64)]);
 
 export const marketHash = (h: H, m: Market) =>
   h([
@@ -211,8 +232,8 @@ export async function paramsHash(h: H, p: Params) {
 }
 export const domainOf = (h: H, p: Params) => h([DS.DOMAIN, p.chainId, p.instance]);
 
-export const payloadHash = (h: H, kind: bigint, a: bigint, b: bigint) => h([DS.REQ, kind, a, b, 0n]);
-export const requestEntry = async (h: H, r: Request) => h([DS.PRIORITY_ENTRY, await payloadHash(h, r.kind, r.a, r.b), r.sender, r.time]);
+export const payloadHash = (h: H, kind: bigint, a: bigint, b: bigint, c = 0n) => h([DS.REQ, kind, a, b, c]);
+export const requestEntry = async (h: H, r: Request) => h([DS.PRIORITY_ENTRY, await payloadHash(h, r.kind, r.a, r.b, r.c ?? 0n), r.sender, r.time]);
 export const nextHead = (h: H, head: bigint, entry: bigint) => h([DS.PRIORITY, head, entry]);
 export const logAppend = (h: H, log: bigint, x: bigint, kind: bigint) => h([DS.ACTION_LOG, log, x, kind]);
 export const segmentNonce = (h: H, batch: bigint, actionLogEnd: bigint, startDaLen: number) =>
@@ -243,6 +264,7 @@ export const privToNoir = (q: AccountPriv) => ({
 });
 export const activityToNoir = (a: Activity) => ({
   nonce: a.nonce.toString(),
+  keys_root: hex(a.keysRoot),
   open_orders: a.openOrders.toString(),
   open_bid: a.openBid.map(String),
   open_ask: a.openAsk.map(String),
@@ -296,10 +318,19 @@ export const paramsToNoir = (p: Params) => ({
   funding_interval: p.fundingInterval.toString(),
   markets: p.markets.map(marketParamsToNoir),
 });
+export const keyToNoir = (k: Key) => ({
+  pk_x: hex(k.pkX),
+  pk_y: hex(k.pkY),
+  market_mask: k.marketMask.toString(),
+  max_notional: k.maxNotional.toString(),
+  expiry: k.expiry.toString(),
+  nonce: k.nonce.toString(),
+});
 export const requestToNoir = (r: Request) => ({
   kind: hex(r.kind),
   a: hex(r.a),
   b: hex(r.b),
+  c: hex(r.c ?? 0n),
   sender: hex(r.sender),
   time: r.time.toString(),
 });

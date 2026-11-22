@@ -9,8 +9,10 @@
 //     segments, merged, root) and settles it. Bob claims his refund using only the published DA.
 //  3. Batch 2: Alice rests a bid in market 0 and Bob sells into it; Alice offers in market 1 and
 //     Bob buys; Alice cancels her rest and Bob withdraws. Bob claims the withdrawal from the DA.
-//     Batch 3, an hour of L2 time later: new indices, so funding is applied; fees are swept and
-//     the accounts refreshed.
+//     Bob then forces a withdrawal of his free collateral through the Bridge, paying the request
+//     fee. Batch 3, an hour of L2 time later: new indices, so funding is applied; the forced
+//     withdrawal is processed and Bob claims it from the DA; fees are swept and the accounts
+//     refreshed.
 //  4. The operator stops. Alice queues one more deposit, which nobody processes; after t_force
 //     anyone can activate desert mode.
 //  5. For each user, a fresh exit client, given only the node, the Bridge address and the user's
@@ -41,6 +43,7 @@ import { protocolAccounts, testParams } from './params.ts';
 const log = (m: string) => console.log(`[e2e] ${m}`);
 const T_FORCE = 3600n;
 const T_CLAIM = 86_400n;
+const REQUEST_FEE = 100n;
 const ALICE_SEED = 0xa11cen;
 const BOB_SEED = 0xb0bn;
 
@@ -92,6 +95,7 @@ async function main() {
       token.address,
       T_FORCE,
       T_CLAIM,
+      REQUEST_FEE,
       [operator, operator],
       protocol.map((p) => p.pub.masterAuth),
       protocol.map((p) => p.pub.encCommitment),
@@ -140,7 +144,7 @@ async function main() {
     const queued = await allPublicEvents(node, await eventMeta(raw, 'PriorityRequested'), bridge.address);
     const requests: M.Request[] = [];
     for (const ev of queued as any[]) {
-      const r: M.Request = { kind: big(ev.kind), a: big(ev.a), b: big(ev.b), sender: big(ev.sender), time: big(ev.time) };
+      const r: M.Request = { kind: big(ev.kind), a: big(ev.a), b: big(ev.b), c: big(ev.c), sender: big(ev.sender), time: big(ev.time) };
       assert((await M.requestEntry(h, r)) === big(ev.entry), `request ${ev.index} does not match its entry`);
       requests.push(r);
     }
@@ -215,15 +219,43 @@ async function main() {
     assert((await balance(bob)) === bobBefore + 1000n, 'withdrawal not paid');
     log('bob claimed his 1000 withdrawal using the DA and his key alone');
 
+    // Bob forces a withdrawal of his free collateral through the Bridge (SPEC.md §7.3), paying the
+    // request fee to the operator; the next batch must process it.
+    const opBefore = await balance(operator);
+    await asOf(bob).methods.submit_forced(M.KIND.FORCED_WITHDRAW, B, bob, 0n).send({ from: bob, wait });
+    assert((await balance(operator)) === opBefore + REQUEST_FEE, 'request fee not paid to the operator');
+    const queued2 = (await allPublicEvents(node, await eventMeta(raw, 'PriorityRequested'), bridge.address)) as any[];
+    const forced: M.Request[] = [];
+    for (const ev of queued2.slice(requests.length)) {
+      const q: M.Request = { kind: big(ev.kind), a: big(ev.a), b: big(ev.b), c: big(ev.c), sender: big(ev.sender), time: big(ev.time) };
+      assert((await M.requestEntry(h, q)) === big(ev.entry), `request ${ev.index} does not match its entry`);
+      forced.push(q);
+    }
+    requests.push(...forced);
+    log(`bob queued a forced withdrawal (fee ${REQUEST_FEE} to the operator)`);
+
     // An hour of L2 time later funding is due; the next indices apply it.
     await (node as any).warpL2TimeAtLeastBy(Number(params.fundingInterval + 60n));
+    const bobCollateral = engine.accts.get(B)!.priv.collateral;
     await runBatch('batch3', async () => {
       const t = await l2Time();
       await engine.block(t, [await update(0n, 2200n, t), await update(1n, 30_300n, t)]);
+      await engine.priority(forced);
       await engine.maintenance({ sweep: true, refresh: 4 });
     });
     log(`funding applied: market 0 cum ${engine.markets[0].cumFunding}, market 1 cum ${engine.markets[1].cumFunding} (micro-units per lot)`);
     assert(engine.markets[0].cumFunding > 0n && engine.markets[1].cumFunding > 0n, 'funding not applied');
+    // The forced withdrawal's record is the batch's first; Bob claims it from the DA alone.
+    const forcedAmount = bobCollateral - engine.accts.get(B)!.priv.collateral;
+    assert(forcedAmount > 0n, 'forced withdrawal moved nothing');
+    const fwSalt = await h([M.DS.WDSALT, users.bob.keys.kEnc, 3n, 0n]);
+    const fwRecord = await M.withdrawalRecord(h, big(bob), forcedAmount, fwSalt, 3n, 0);
+    const fp = await withdrawalPath(h, (await daLogs(node, bridge.address))[2].payload, 3n, fwRecord);
+    bobBefore = await balance(bob);
+    await asOf(bob).methods.claim_withdrawal(3n, fp.index, bob, forcedAmount, fwSalt, fp.path).send({ from: bob, wait });
+    assert((await balance(bob)) === bobBefore + forcedAmount, 'forced withdrawal not paid');
+    log(`bob's forced withdrawal of ${forcedAmount} was processed and claimed from the DA`);
+    report.forcedWithdrawal = forcedAmount;
 
     // 4. The operator stops. Alice queues a deposit nobody processes; after t_force, desert mode.
     await asOf(alice).methods.deposit(A, 5_000n).send({ from: alice, wait });
