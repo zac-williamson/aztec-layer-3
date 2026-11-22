@@ -236,7 +236,7 @@ async function main() {
   log(`engine refused: ${reasons5.join('; ')}`);
   assert(
     reasons5.join('|') ===
-      "market not allowed for the session key|order above the session key's notional limit|session keys only place and cancel|signing key is not the slot's",
+      "market not allowed for the session key|order above the session key's notional limit|session keys only place, cancel and modify|signing key is not the slot's",
     'unexpected batch 5 rejections',
   );
   assert(engine.accts.get(C)!.priv.positions[0].size === 30n && engine.orders[0].size > 0, 'GTT removal and fill');
@@ -334,12 +334,60 @@ async function main() {
   const b6 = await settle(w6);
   assert(b6.header[0] === b5.header[1], 'batch 6 does not chain from batch 5');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the six
+  // Batch 7: ModifyOrder and Transfer (SPEC.md §7.3). Dave rests a bid of 20 at 1,745 and Heidi's
+  // session key a bid of 5 behind it at the same price; Dave reduces his to 8, which keeps its
+  // place, so Bob's sell of 10 fills Dave's 8 before 2 of Heidi's. Heidi's key also reduces a
+  // market-1 bid, and Alice transfers 25,000 to Heidi. The engine refuses a modification that adds
+  // lots, a transfer beyond Alice's collateral, one to an account that does not exist, one to the
+  // insurance account, and one Heidi's session key signs.
+  await engine.beginBatch(7n, b6.end.priorityHead, b6.end.priorityCursor, b6.end.time);
+  const t7 = now + 4100n;
+  await engine.block(t7, [await update(0n, 1750n, 1750n, t7 - 1n), await update(1n, 30_010n, 30_010n, t7 - 1n)]);
+  const { MODIFY, TRANSFER } = X.KIND_ACT;
+  const byHeidiKey = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, hSess, kind, Hd, nonce, p, 5n);
+  await engine.trade([
+    await act(dave, D, 3n, PLACE, [0n, BID, 1745n, 20n, GTC, 0n]),
+    await byHeidiKey(1n, PLACE, [0n, BID, 1745n, 5n, GTC, 0n]),
+    await byHeidiKey(2n, PLACE, [1n, BID, 29_900n, 2n, GTC, 0n]),
+  ]);
+  const daveBid = [...engine.orders[0].values()].find((o) => o.account === D && o.price === 1745n)!;
+  const heidiBid = [...engine.orders[1].values()].find((o) => o.account === Hd)!;
+  const aliceBefore = engine.accts.get(A)!.priv.collateral;
+  const daveBefore = engine.accts.get(D)!.priv.positions[0].size;
+  await engine.trade([
+    await act(dave, D, 4n, MODIFY, [0n, BID, 1745n, daveBid.seq, 25n]), // adds lots
+    await act(dave, D, 4n, MODIFY, [0n, BID, 1745n, daveBid.seq, 8n]),
+    await byHeidiKey(3n, MODIFY, [1n, BID, 29_900n, heidiBid.seq, 1n]),
+    await act(bob, B, 7n, PLACE, [0n, ASK, 1745n, 10n, IOC, 0n]), // Dave's 8 first, then 2 of Heidi's 5
+    await act(alice, A, 7n, TRANSFER, [5_000_000n, Hd]), // more than her collateral
+    await act(alice, A, 7n, TRANSFER, [25_000n, 99n]), // no account 99
+    await act(alice, A, 7n, TRANSFER, [25_000n, M.INSURANCE_INDEX]), // a protocol account
+    await byHeidiKey(4n, TRANSFER, [1n, A]), // session keys cannot transfer
+    await act(alice, A, 7n, TRANSFER, [25_000n, Hd]),
+  ]);
+  const reasons7 = engine.rejected.slice(14).map((r) => r.reason);
+  log(`engine refused: ${reasons7.join('; ')}`);
+  assert(
+    reasons7.join('|') ===
+      'a modification only reduces an order|collateral below the amount|no such account|transfers go to user accounts|session keys only place, cancel and modify',
+    'unexpected batch 7 rejections',
+  );
+  assert(engine.accts.get(D)!.priv.positions[0].size === daveBefore + 8n && engine.accts.get(Hd)!.priv.positions[0].size === 2n, 'the modified bid kept its place');
+  assert(engine.actv.get(Hd)!.openBid[1] === 1n && engine.actv.get(Hd)!.openBid[0] === 3n, "Heidi's open bids after the fill and the modification");
+  assert(engine.accts.get(A)!.priv.collateral === aliceBefore - 25_000n, "Alice's transfer");
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 7');
+  const w7 = await engine.endBatch();
+  log(`batch 7: ${w7.segments.map((s) => s.label).join(' | ')}; ${w7.daPayload.length} DA fields`);
+  const b7 = await settle(w7);
+  assert(b7.header[0] === b6.header[1], 'batch 7 does not chain from batch 6');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the seven
   // batches, then open every user's account and compare with the engine.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b6.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b7.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   for (const [i, u] of users.entries()) {
     const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
@@ -352,16 +400,16 @@ async function main() {
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -20n && pos(C).positions[0].size === 30n && pos(G).positions[0].size === 20n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 40n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 30n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 6 ${hex(b6.headerHash)}`);
+  log(`header of batch 7 ${hex(b7.headerHash)}`);
   await api.destroy();
 }
 

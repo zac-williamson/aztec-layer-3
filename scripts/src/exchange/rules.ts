@@ -2,7 +2,7 @@
 // margin, mark ticks and the book index.
 import * as M from './model.ts';
 
-export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n } as const;
+export const KIND_ACT = { PLACE: 1n, CANCEL: 2n, WITHDRAW: 3n, ADD_KEY: 4n, REVOKE_KEY: 5n, MODIFY: 6n, TRANSFER: 7n } as const;
 export const TIF = { GTC: 0n, IOC: 1n, FOK: 2n, POST_ONLY: 3n, GTT: 4n } as const;
 export const ACTION_PAYLOAD = 8;
 export const PPM = 1_000_000n;

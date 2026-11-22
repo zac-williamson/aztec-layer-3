@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), and the client subtree with a P-256 client circuit (P2.7), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), and order modification and transfers (P2.8), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -825,6 +825,7 @@ P2 is built in increments, each leaving every test green.
 - P2.5: receipts and accountability (first part), then client-proof actions (second part).
 - P2.6: client-proof withdrawals.
 - P2.7: the client subtree, with a P-256 client circuit.
+- P2.8: `ModifyOrder` and `Transfer`.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1142,6 +1143,36 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Narrowing.** Every circuit in the subtree may authorize every lane-P kind. §7.1's per-kind permission is not built.
 - **Cost.** `client_p256` is 46,551 gates and proves in about 250 ms on the reference laptop, against 29 ms for `client_auth`. A VK hash and a 6-level membership path per slot take `agg_app` from 109,564 to 113,267 Mega gates (+3.4%). The tube is unchanged in size.
 
+**ModifyOrder and Transfer** (P2.8, §7.3):
+
+- **ModifyOrder** `(market, side, price, seq, lots)`. It reduces a resting order in place to `lots`, which must be positive and below the order's remaining lots.
+  - The order keeps its index, and so its place in the queue.
+  - The account's open lots shrink by the difference. Its open-order count does not change.
+  - A modification that would add lots or move the price is a cancellation and a new order, sent as two actions.
+  - Session keys may modify, in their markets, as the Trade level of §7.2 allows.
+- **Transfer** `(amount, destination)`. It needs the master key, the Withdraw level of §7.2.
+  - The source is debited under the withdrawal rules: the collateral, fresh indices wherever the account is exposed, and IM afterwards.
+  - The destination must be another user account, and its collateral must stay in range. Protocol accounts change only through the sweep and liquidation, so no trade touches their leaves.
+  - Both accounts get change entries. A transfer therefore shows which two accounts changed, but never the amount (§4).
+- **Shared rules.** `l3x_exchange::trade` now has `debit` and `credit`, and `withdraw` is `debit` plus the withdrawal record. The tube and `seg_trade` use the same routines.
+- **Witness.** A trade action carries the destination account's opening and its path, valid after the source's debit.
+- **Cost.** `seg_trade` grows from 430,919 to 476,001 gates (+10.5%), still within 2^19: each action slot carries a destination account update and change entry.
+- **Not built.** Client-proof transfers, and `CancelAll`.
+
+**Tests** (P2.8):
+
+- **Native**, batch 7:
+  - Dave rests a bid of 20 at 1,745, and Heidi's session key rests a bid of 5 behind it at the same price.
+  - Dave reduces his bid to 8, which keeps its place: Bob's sell of 10 fills Dave's 8 before 2 of Heidi's.
+  - Heidi's key also reduces a market-1 bid, and Alice transfers 25,000 to Heidi.
+  - The engine refuses a modification that adds lots and a transfer beyond Alice's collateral. It also refuses transfers to an account that does not exist and to the insurance account, and a transfer signed by Heidi's session key.
+  - 30 receipts across the seven batches each have a path to their batch's root.
+- **Adversarial:** 7 more witnesses, 69 in all:
+  - a modification that adds lots;
+  - transfers above the collateral, to a missing account, to the same account and to a protocol account;
+  - a transfer published under another key;
+  - a session key that transfers.
+
 **Tests** (P2.7):
 
 - **Native**, batch 6: Heidi registers in lane P with a P-256 key. Her session-key grant is aggregated in one P-segment with Grace's, each proof under its own circuit, and she later withdraws by P-256 proof. The DA reopens her account.
@@ -1158,7 +1189,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. The remaining kinds of §7.3: `CancelAll`, `ModifyOrder`, `Transfer`.
+2. `CancelAll` in constant time: a per-account order epoch, with cancelled orders removed lazily, as expired GTT orders are.
 3. WebAuthn passkeys as a client circuit.
 
 ## 16. Decisions

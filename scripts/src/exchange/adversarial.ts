@@ -288,6 +288,35 @@ async function main() {
   await L.liquidate([{ kind: 'adl', account: V, market: 0, counterparty: P }, { kind: 'takeover', account: W, market: 0 }]);
   await execute('seg_liquidate', L.segments[L.segments.length - 1].inputs);
 
+  // ModifyOrder and Transfer (SPEC.md §7.3): account 4 reduces its resting bid, then moves
+  // collateral to account 3.
+  const nm = engine.segments.length;
+  const bid1990 = [...engine.orders[0].values()].find((o) => o.account === idx(2) && o.price === 1990n)!;
+  const { MODIFY, TRANSFER } = X.KIND_ACT;
+  await engine.trade([await act(2, 4n, MODIFY, [0n, BID, 1990n, bid1990.seq, 2n]), await act(2, 5n, TRANSFER, [5000n, idx(1)])]);
+  assert(engine.rejected.length === 0, `modify/transfer setup rejected: ${engine.rejected.map((r) => r.reason)}`);
+  const moves = clone(engine.segments[nm].inputs) as any;
+  await execute('seg_trade', moves);
+  t = clone(moves);
+  await resign(t, 0, 2, 4n, MODIFY, [0n, BID, 1990n, bid1990.seq, 9n]);
+  await expectFail('modification that adds lots', 'seg_trade', t, 'a modification only reduces an order');
+  t = clone(moves);
+  await resign(t, 1, 2, 5n, TRANSFER, [5_000_000n, idx(1)]);
+  await expectFail('transfer above the collateral', 'seg_trade', t, 'collateral below the amount');
+  t = clone(moves);
+  await resign(t, 1, 2, 5n, TRANSFER, [5000n, 99n]);
+  await expectFail('transfer to a missing account', 'seg_trade', t, 'no such account');
+  t = clone(moves);
+  await resign(t, 1, 2, 5n, TRANSFER, [5000n, idx(2)]);
+  await expectFail('transfer to the same account', 'seg_trade', t, 'transfer to the same account');
+  t = clone(moves);
+  await resign(t, 1, 2, 5n, TRANSFER, [5000n, M.INSURANCE_INDEX]);
+  t.actions[1].dest_pub.class = '1';
+  await expectFail('transfer to a protocol account', 'seg_trade', t, 'transfers go to user accounts');
+  t = clone(moves);
+  t.actions[1].dest_k_enc = hex(5n);
+  await expectFail('transfer published under another key', 'seg_trade', t, 'k_enc does not open the commitment');
+
   // Session keys, GTT and forced requests (SPEC.md §6.5, §7.2, §7.3). Q provides liquidity; R gives
   // a session key market 0 only, a 100,000 notional cap and an expiry, and its key rests a bid.
   const K = await Engine.create(api, params, prover.vkTreeRoot, protocol);
@@ -330,8 +359,9 @@ async function main() {
   };
   await expectFail('session key outside its markets', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [1n, BID, 30_000n, 1n, GTC, 0n]), 'market not allowed for the session key');
   await expectFail('session key above its notional cap', 'seg_trade', await reSess(clone(sessPlace), 1n, PLACE, [0n, BID, 1995n, 100n, GTC, 0n]), "order above the session key's notional limit");
-  await expectFail('session key withdrawing', 'seg_trade', await reSess(clone(sessPlace), 1n, WITHDRAW, [10n, 77n]), 'session keys only place and cancel');
-  await expectFail('session key adding a key', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.ADD_KEY, [1n, 5n, 6n, 1n, 1n, keyExpiry]), 'session keys only place and cancel');
+  await expectFail('session key withdrawing', 'seg_trade', await reSess(clone(sessPlace), 1n, WITHDRAW, [10n, 77n]), 'session keys only place, cancel and modify');
+  await expectFail('session key adding a key', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.ADD_KEY, [1n, 5n, 6n, 1n, 1n, keyExpiry]), 'session keys only place, cancel and modify');
+  await expectFail('session key transferring', 'seg_trade', await reSess(clone(sessPlace), 1n, X.KIND_ACT.TRANSFER, [10n, Q]), 'session keys only place, cancel and modify');
   await expectFail('session key nonce replayed', 'seg_trade', await reSess(clone(sessPlace), 0n, PLACE, [0n, BID, 1995n, 10n, GTC, 0n]), 'nonce');
   t = clone(sessPlace);
   t.start.time = (keyExpiry + 1n).toString();

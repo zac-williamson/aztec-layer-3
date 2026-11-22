@@ -746,10 +746,16 @@ export class Engine {
         throw e;
       }
     }
-    const names: Record<string, string> = { [X.KIND_ACT.WITHDRAW.toString()]: 'withdraw', [X.KIND_ACT.ADD_KEY.toString()]: 'add key', [X.KIND_ACT.REVOKE_KEY.toString()]: 'revoke key' };
+    const names: Record<string, string> = {
+      [X.KIND_ACT.WITHDRAW.toString()]: 'withdraw',
+      [X.KIND_ACT.TRANSFER.toString()]: 'transfer',
+      [X.KIND_ACT.ADD_KEY.toString()]: 'add key',
+      [X.KIND_ACT.REVOKE_KEY.toString()]: 'revoke key',
+    };
     const labels = actions.map((a) => {
       const by = a.keyId === M.MASTER_KEY ? '' : ` by key ${a.keyId}`;
-      return (a.kind === X.KIND_ACT.PLACE ? `place m${a.p[0]}` : a.kind === X.KIND_ACT.CANCEL ? `cancel m${a.p[0]}` : names[a.kind.toString()]) + by;
+      const book = a.kind === X.KIND_ACT.PLACE ? 'place' : a.kind === X.KIND_ACT.CANCEL ? 'cancel' : a.kind === X.KIND_ACT.MODIFY ? 'modify' : '';
+      return (book ? `${book} m${a.p[0]}` : names[a.kind.toString()]) + by;
     });
     await this.finishSegment(
       'seg_trade',
@@ -799,6 +805,10 @@ export class Engine {
       rest_path: emptyBookPath(),
       cancel_lots: '0',
       cancel_expiry: '0',
+      dest_pub: M.pubToNoir(M.zeroPub()),
+      dest_priv: M.privToNoir(M.emptyPriv()),
+      dest_k_enc: hex(0n),
+      dest_acct_path: zeros(M.ACCOUNTS_HEIGHT),
     };
   }
 
@@ -988,7 +998,7 @@ export class Engine {
       if (!(await verify(this.h, a.pk, a.sig, msg))) throw new Error('bad signature');
       if (key.nonce + 1n !== a.nonce) throw new Error('nonce');
       if (this.running.time > key.expiry) throw new Error('session key expired');
-      if (a.kind !== X.KIND_ACT.PLACE && a.kind !== X.KIND_ACT.CANCEL) throw new Error('session keys only place and cancel');
+      if (a.kind !== X.KIND_ACT.PLACE && a.kind !== X.KIND_ACT.CANCEL && a.kind !== X.KIND_ACT.MODIFY) throw new Error('session keys only place, cancel and modify');
       if (a.p[0] >= BigInt(M.MARKETS) || ((key.marketMask >> a.p[0]) & 1n) !== 1n) throw new Error('market not allowed for the session key');
       if (a.kind === X.KIND_ACT.PLACE && a.p[2] * a.p[3] > key.maxNotional) throw new Error("order above the session key's notional limit");
       keyWitness = { key: M.keyToNoir(key), key_path: this.keyTrees.get(a.account)!.path(BigInt(slot)).map(hex) };
@@ -1010,8 +1020,9 @@ export class Engine {
       taker_actv: M.activityToNoir(oldAct),
     };
     if (a.kind === X.KIND_ACT.PLACE) return { ...this.emptyAction(), ...common, ...(await this.execPlace(a, rec, oldAct, act, daNonce)) };
-    if (a.kind === X.KIND_ACT.CANCEL) return { ...this.emptyAction(), ...common, ...(await this.execCancel(a, act)) };
+    if (a.kind === X.KIND_ACT.CANCEL || a.kind === X.KIND_ACT.MODIFY) return { ...this.emptyAction(), ...common, ...(await this.execCancel(a, act)) };
     if (a.kind === X.KIND_ACT.WITHDRAW) return { ...this.emptyAction(), ...common, ...(await this.execWithdraw(a, rec, act, daNonce)) };
+    if (a.kind === X.KIND_ACT.TRANSFER) return { ...this.emptyAction(), ...common, ...(await this.execTransfer(a, rec, act, daNonce)) };
     if (a.kind === X.KIND_ACT.ADD_KEY || a.kind === X.KIND_ACT.REVOKE_KEY) return { ...this.emptyAction(), ...common, ...(await this.execSetKey(a, act)) };
     throw new Error('unknown action kind');
   }
@@ -1227,21 +1238,30 @@ export class Engine {
     return { fills, remaining, notional };
   }
 
+  /** CancelOrder, or ModifyOrder, which reduces the order in place and keeps its queue position. */
   private async execCancel(a: SignedAction, act: M.Activity) {
-    const [mk, side, price, seq] = a.p;
+    const [mk, side, price, seq, newLots] = a.p;
+    const modify = a.kind === X.KIND_ACT.MODIFY;
     const m = Number(mk);
     if (mk < 0n || m >= M.MARKETS) throw new Error('market');
     const index = X.orderIndex(side, price, seq);
     const o = this.orders[m].get(index);
     if (!o || o.account !== a.account) throw new Error('no such order');
+    const lots = modify ? newLots : 0n;
+    if (modify && !(lots > 0n && lots < o.lots)) throw new Error('a modification only reduces an order');
     const acctPath = this.accounts.path(a.account).map(hex);
     const restPath = siblingsToNoir(this.books[m].path(index));
-    await this.books[m].set(index, 0n, 0n, 0n);
-    this.orders[m].delete(index);
+    if (modify) {
+      await this.books[m].set(index, await X.orderLeaf(this.h, side, a.account, lots, o.expiry), X.askLots({ side, lots }), X.bidLots({ side, lots }));
+      this.orders[m].set(index, { ...o, lots });
+    } else {
+      await this.books[m].set(index, 0n, 0n, 0n);
+      this.orders[m].delete(index);
+    }
     this.markets[m].bookRoot = this.books[m].root;
-    const nact: M.Activity = { ...M.copyActivity(act), openOrders: act.openOrders - 1n };
-    if (side === M.SIDE.BID) nact.openBid[m] -= o.lots;
-    else nact.openAsk[m] -= o.lots;
+    const nact: M.Activity = { ...M.copyActivity(act), openOrders: modify ? act.openOrders : act.openOrders - 1n };
+    if (side === M.SIDE.BID) nact.openBid[m] -= o.lots - lots;
+    else nact.openAsk[m] -= o.lots - lots;
     const actvPath = this.activity.path(a.account).map(hex);
     this.actv.set(a.account, nact);
     await this.activity.set(a.account, await M.activityHash(this.h, nact));
@@ -1253,7 +1273,7 @@ export class Engine {
     if (amount <= 0n || amount >= X.MAX_COLLATERAL) throw new Error('withdrawal amount out of range');
     const old = M.copyPriv(rec.priv);
     if (old.collateral < amount) throw new Error('collateral below the amount');
-    if (!X.exposureFresh(old, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old for a withdrawal');
+    if (!X.exposureFresh(old, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old to move collateral');
     if (!X.covers(X.equity(old, this.markets) - amount, X.initialMargin(old, act, this.markets, this.params))) throw new Error('insufficient margin');
     const acctPath = this.accounts.path(a.account).map(hex);
     const leaf = await this.writeAccount(rec, { ...old, collateral: old.collateral - amount }, daNonce);
@@ -1265,6 +1285,40 @@ export class Engine {
     this.actv.set(a.account, nact);
     await this.activity.set(a.account, await M.activityHash(this.h, nact));
     return { taker_acct_path: acctPath, taker_actv_path: actvPath };
+  }
+
+  /** Transfer (seg_trade `transfer`): the withdrawal's debit rules, then a credit to another user account. */
+  private async execTransfer(a: SignedAction, rec: AccountRecord, act: M.Activity, daNonce: bigint) {
+    const [amount, to] = a.p;
+    if (amount <= 0n || amount >= X.MAX_COLLATERAL) throw new Error('transfer amount out of range');
+    const dest = to < this.numAccounts ? this.accts.get(to) : undefined;
+    if (!dest) throw new Error('no such account');
+    if (to === a.account) throw new Error('transfer to the same account');
+    if (dest.pub.class !== M.CLASS.USER) throw new Error('transfers go to user accounts');
+    const old = M.copyPriv(rec.priv);
+    if (old.collateral < amount) throw new Error('collateral below the amount');
+    if (!X.exposureFresh(old, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old to move collateral');
+    if (!X.covers(X.equity(old, this.markets) - amount, X.initialMargin(old, act, this.markets, this.params))) throw new Error('insufficient margin');
+    if (dest.priv.collateral + amount >= X.MAX_COLLATERAL) throw new Error('collateral out of range');
+    const acctPath = this.accounts.path(a.account).map(hex);
+    const leaf = await this.writeAccount(rec, { ...old, collateral: old.collateral - amount }, daNonce);
+    await this.emitChange(rec, leaf, daNonce);
+    const destPriv = M.privToNoir(dest.priv);
+    const destPath = this.accounts.path(to).map(hex);
+    const destLeaf = await this.writeAccount(dest, { ...dest.priv, collateral: dest.priv.collateral + amount }, daNonce);
+    await this.emitChange(dest, destLeaf, daNonce);
+    const nact: M.Activity = M.copyActivity(act);
+    const actvPath = this.activity.path(a.account).map(hex);
+    this.actv.set(a.account, nact);
+    await this.activity.set(a.account, await M.activityHash(this.h, nact));
+    return {
+      taker_acct_path: acctPath,
+      taker_actv_path: actvPath,
+      dest_pub: M.pubToNoir(dest.pub),
+      dest_priv: destPriv,
+      dest_k_enc: hex(dest.kEnc),
+      dest_acct_path: destPath,
+    };
   }
 
   // ---- Liquidation (seg_liquidate, SPEC.md §8.5) ----

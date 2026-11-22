@@ -24,6 +24,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - Lane-P accounts, whose master authorization is a client circuit rather than a Schnorr key, grant and revoke session keys with client proofs. The Chonk IVC aggregates the proofs, and the tube applies exactly the actions they authorize.
 - **P2.6**: client-proof withdrawals. The tube withdraws under the same rules as a master-key withdrawal, through the same library routine. It publishes the account change and the withdrawal record.
 - **P2.7**: the client subtree. `agg_app` accepts any client circuit whose VK is in the VK tree's client subtree, so the configuration decides which circuits authorize lane-P actions. A P-256 client circuit joins the secret-knowledge one, for hardware keys.
+- **P2.8**: `ModifyOrder` reduces a resting order in place and keeps its queue position; `Transfer` moves collateral between user accounts under the withdrawal rules, revealing which accounts changed but not the amount.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -35,7 +36,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick |
 | `circuits/seg_priority` | X-segment: Register, Deposit and ForcedWithdraw requests in queue order (refunds for missing accounts) |
-| `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, Withdraw, AddKey, RevokeKey, signed by the master key or a session key |
+| `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
 | `circuits/seg_refresh` | X-segment (maintenance): sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
@@ -96,13 +97,14 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs six batches natively across markets 0–2. They cover:
+This runs seven batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
 - a 13% fall in market 0 followed by both liquidation waterfalls, one ending in an insurance takeover and deficit, the other in auto-deleveraging;
 - a session key's trading and refusals, a GTT order removed after expiry, and forced withdraw, close and cancel-all requests;
-- a lane-P account whose session key is granted and revoked, and whose collateral is withdrawn, by client proofs, and a second lane-P account authorizing with a P-256 key; each P-segment is proved through the Chonk IVC and the tube.
+- a lane-P account whose session key is granted and revoked, and whose collateral is withdrawn, by client proofs, and a second lane-P account authorizing with a P-256 key; each P-segment is proved through the Chonk IVC and the tube;
+- an order reduced in place that keeps its queue position, a session key's modification, and a transfer between accounts.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -160,7 +162,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.6: tests | Native batch 6 withdraws by client proof; 3 more adversarial tube witnesses (60 in all). |
 | P2.7: client subtree | `agg_app` checks each client VK's membership in the client subtree and outputs the VK tree root, which the tube binds to the configuration; `client_p256` for hardware P-256 keys. |
 | P2.7: tests | Native batch 6 aggregates proofs of both client circuits in one P-segment; 2 more adversarial tube witnesses (62 in all); VK substitution tests H and I for a rogue client circuit (9 in all). |
-| P2: next | C1 custody once the D7 token is specified; CancelAll, ModifyOrder, Transfer; WebAuthn passkeys. |
+| P2.8: modify, transfer | ModifyOrder reduces an order in place (session keys allowed); Transfer debits under the withdrawal rules and credits another user account, both republished. |
+| P2.8: tests | Native batch 7 shows a modified order keeping its place; 7 more adversarial witnesses (69 in all). |
+| P2: next | C1 custody once the D7 token is specified; CancelAll in constant time; WebAuthn passkeys. |
 
 ## Caveats
 

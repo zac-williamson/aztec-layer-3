@@ -18,6 +18,8 @@ pub global KIND_CANCEL: Field = 2;
 pub global KIND_WITHDRAW: Field = 3;
 pub global KIND_ADD_KEY: Field = 4;
 pub global KIND_REVOKE_KEY: Field = 5;
+pub global KIND_MODIFY: Field = 6;
+pub global KIND_TRANSFER: Field = 7;
 pub global TIF_GTC: Field = 0;
 pub global TIF_IOC: Field = 1;
 pub global TIF_FOK: Field = 2;
@@ -65,12 +67,55 @@ pub fn write_key_slot(keys_root: Field, old: Key, path: [Field; KEYS_HEIGHT], ad
     merkle_root(DS_KEY_NODE, new_key.leaf(), slot, path)
 }
 
+/// The debit side of a withdrawal or a transfer (SPEC.md §8.3): `amount` of the account's
+/// collateral leaves it. Requires the collateral, fresh indices wherever the account is exposed,
+/// and IM after the debit. Writes the account's new private part under a fresh blind and
+/// publishes it. Returns the new account leaf; the caller writes it, and the activity, to the trees.
+pub fn debit(
+    running: Running,
+    markets: [Market; MARKETS],
+    params: Params,
+    idx: u32,
+    acct_pub: AccountPub,
+    old: AccountPriv,
+    act: Activity,
+    k_enc: Field,
+    amount: u64,
+    da_nonce: Field,
+) -> (Field, Running) {
+    let mut r = running;
+    assert(old.collateral >= amount as i64, "collateral below the amount");
+    assert(exposure_fresh(old, act, markets, params.max_age, r.time), "index too old to move collateral");
+    let after = equity(old, markets) - amount as i64;
+    assert(covers(after, initial_margin(old, act, markets, params)), "insufficient margin");
+    assert(enc_commitment(k_enc) == acct_pub.enc_commitment, "k_enc does not open the commitment");
+    let mut np = old;
+    np.collateral = old.collateral - amount as i64;
+    np.blind = blind(k_enc, idx, da_nonce, r.da_len);
+    let new_leaf = account_leaf(acct_pub, np);
+    r = emit_change(r, idx, new_leaf, np, k_enc, da_nonce);
+    (new_leaf, r)
+}
+
+/// The credit side of a transfer: `amount` of collateral enters the account, which must stay in
+/// range. Writes and publishes the account's new private part. Returns the new account leaf.
+pub fn credit(running: Running, idx: u32, acct_pub: AccountPub, old: AccountPriv, k_enc: Field, amount: u64, da_nonce: Field) -> (Field, Running) {
+    let mut r = running;
+    let collateral = old.collateral + amount as i64;
+    assert(collateral < MAX_COLLATERAL as i64, "collateral out of range");
+    assert(enc_commitment(k_enc) == acct_pub.enc_commitment, "k_enc does not open the commitment");
+    let mut np = old;
+    np.collateral = collateral;
+    np.blind = blind(k_enc, idx, da_nonce, r.da_len);
+    let new_leaf = account_leaf(acct_pub, np);
+    r = emit_change(r, idx, new_leaf, np, k_enc, da_nonce);
+    (new_leaf, r)
+}
+
 /// Withdraw (SPEC.md §8.3, §10.4), p = (amount, recipient, …), authorized by the master key or a
-/// client proof: `amount` of the account's collateral to an Aztec `recipient`. Requires the
-/// collateral, fresh indices wherever the account is exposed, and IM after the withdrawal. Writes
-/// the account's new private part under a fresh blind, publishes it, and appends the withdrawal
-/// record to the batch's withdrawals chain and the DA. Returns the new account leaf; the caller
-/// writes it, and the activity, to the trees.
+/// client proof: debits `amount` (see `debit`) and appends the withdrawal record, which the vault
+/// pays to an Aztec `recipient` once the batch settles, to the batch's withdrawals chain and the
+/// DA. Returns the new account leaf.
 pub fn withdraw(
     running: Running,
     markets: [Market; MARKETS],
@@ -83,22 +128,11 @@ pub fn withdraw(
     p: [Field; ACTION_PAYLOAD],
     da_nonce: Field,
 ) -> (Field, Running) {
-    let mut r = running;
     let amount = p[0] as u64;
     let recipient = p[1];
     assert((amount as Field == p[0]) & (amount > 0) & (amount < MAX_COLLATERAL), "withdrawal amount out of range");
-    assert(old.collateral >= amount as i64, "collateral below the amount");
-    assert(exposure_fresh(old, act, markets, params.max_age, r.time), "index too old for a withdrawal");
-    let after = equity(old, markets) - amount as i64;
-    assert(covers(after, initial_margin(old, act, markets, params)), "insufficient margin");
-
-    assert(enc_commitment(k_enc) == acct_pub.enc_commitment, "k_enc does not open the commitment");
-    let mut np = old;
-    np.collateral = old.collateral - amount as i64;
-    np.blind = blind(k_enc, idx, da_nonce, r.da_len);
-    let new_leaf = account_leaf(acct_pub, np);
-    r = emit_change(r, idx, new_leaf, np, k_enc, da_nonce);
-
+    let (new_leaf, running2) = debit(running, markets, params, idx, acct_pub, old, act, k_enc, amount, da_nonce);
+    let mut r = running2;
     // The salt makes the record unguessable from public data (SPEC.md §10.4); the owner can
     // rebuild it from its key.
     let index = r.withdrawals_count;

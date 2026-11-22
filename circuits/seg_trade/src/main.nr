@@ -2,8 +2,8 @@ use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Key, master_auth_of},
     book::{Order, order_index, replace, Sibling, SIDE_ASK, SIDE_BID, walk},
     consts::{
-        ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, DS_KEY_NODE, KEY_SLOTS,
-        KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
+        ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_KEY_NODE, KEY_SLOTS,
+        KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_COLLATERAL, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
         MAX_PRICE, PPM,
     },
     da::{emit_change, open_segment, segment_nonce},
@@ -12,9 +12,10 @@ use l3x_exchange::{
     sig::{assert_signed, Signature},
     state::State,
     trade::{
-        abs, ACTION_PAYLOAD, action_msg, covers, equity, exposure_fresh, initial_margin, KIND_ADD_KEY,
-        KIND_CANCEL, KIND_PLACE, KIND_REVOKE_KEY, KIND_WITHDRAW, TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC,
-        TIF_POST_ONLY, withdraw as withdraw_collateral, worst, write_key_slot,
+        abs, ACTION_PAYLOAD, action_msg, covers, credit, debit, equity, exposure_fresh, initial_margin,
+        KIND_ADD_KEY, KIND_CANCEL, KIND_MODIFY, KIND_PLACE, KIND_REVOKE_KEY, KIND_TRANSFER, KIND_WITHDRAW,
+        TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC, TIF_POST_ONLY, withdraw as withdraw_collateral, worst,
+        write_key_slot,
     },
     tree::{merkle_root, update},
 };
@@ -50,17 +51,22 @@ struct Action {
     n_fills: u32,
     fills: [Fill; F],
     /// Place: the path of the resting slot (GTC, post-only) or of the no-crossing probe (IOC
-    /// remainder). Cancel: the path of the cancelled order.
+    /// remainder). Cancel and modify: the path of the order.
     rest_path: [Sibling; BOOK_HEIGHT],
-    /// Cancel: the cancelled order's remaining lots and expiry.
+    /// Cancel and modify: the order's remaining lots and expiry.
     cancel_lots: u64,
     cancel_expiry: u64,
+    /// Transfer: the destination account, its key and its path after the source's debit.
+    dest_pub: AccountPub,
+    dest_priv: AccountPriv,
+    dest_k_enc: Field,
+    dest_acct_path: [Field; ACCOUNTS_HEIGHT],
 }
 
 /// Trade segment (SPEC.md §6.5, §7.2, §8.1–§8.6, §10.4): executes up to TA signed PlaceOrder,
-/// CancelOrder, Withdraw, AddKey and RevokeKey actions in order, in any listed market. The master
-/// key may sign anything; a session key only places and cancels, within its markets, notional and
-/// expiry. An order matches the best
+/// CancelOrder, ModifyOrder, Withdraw, Transfer, AddKey and RevokeKey actions in order, in any
+/// listed market. The master key may sign anything; a session key only places, cancels and
+/// modifies, within its markets, notional and expiry. An order matches the best
 /// opposite orders, up to F steps, at the makers' prices, settling both sides' funding and
 /// charging maker and taker fees; then its remainder rests (GTC, post-only) or cancels (IOC) once
 /// no crossing liquidity is left. Only accounts whose balances change get DA entries: quoting and
@@ -130,7 +136,10 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         assert_signed(a.pk_x, a.pk_y, a.sig, msg);
         assert(a.key.nonce + 1 == a.nonce, "nonce");
         assert(running.time <= a.key.expiry, "session key expired");
-        assert((a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL), "session keys only place and cancel");
+        assert(
+            (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY),
+            "session keys only place, cancel and modify",
+        );
         let m = a.p[0] as u32;
         assert((m as Field == a.p[0]) & (m < MARKETS), "market");
         assert(a.key.allows_market(m), "market not allowed for the session key");
@@ -144,10 +153,12 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     }
     if a.kind == KIND_PLACE {
         place(state, running, a, act, da_nonce, params)
-    } else if a.kind == KIND_CANCEL {
+    } else if (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) {
         (cancel(state, a, act), running)
     } else if a.kind == KIND_WITHDRAW {
         withdraw(state, running, a, act, da_nonce, params)
+    } else if a.kind == KIND_TRANSFER {
+        transfer(state, running, a, act, da_nonce, params)
     } else {
         assert((a.kind == KIND_ADD_KEY) | (a.kind == KIND_REVOKE_KEY), "unknown action kind");
         (set_key(state, a, act), running)
@@ -194,6 +205,29 @@ fn withdraw(state: State, running: Running, a: Action, act: Activity, da_nonce: 
     );
     st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     (st, r)
+}
+
+/// Transfer (SPEC.md §7.3), p = (amount, destination, …), master key only: debits `amount` under
+/// the withdrawal rules and credits it to another user account. Both accounts are republished;
+/// the amount stays hidden (§4).
+fn transfer(state: State, running: Running, a: Action, act: Activity, da_nonce: Field, params: Params) -> (State, Running) {
+    let mut st = state;
+    let idx = a.account_index;
+    let amount = a.p[0] as u64;
+    assert((amount as Field == a.p[0]) & (amount > 0) & (amount < MAX_COLLATERAL), "transfer amount out of range");
+    let dest = a.p[1] as u32;
+    assert((dest as Field == a.p[1]) & (dest < st.num_accounts), "no such account");
+    assert(dest != idx, "transfer to the same account");
+    // Protocol accounts change only through the sweep and liquidation, never through a trade.
+    assert(a.dest_pub.class == CLASS_USER, "transfers go to user accounts");
+    let (leaf, r1) = debit(running, st.markets, params, idx, a.taker_pub, a.taker_priv, a.taker_actv, a.taker_k_enc, amount, da_nonce);
+    st.accounts_root =
+        update(DS_ACCT_NODE, st.accounts_root, idx, account_leaf(a.taker_pub, a.taker_priv), leaf, a.taker_acct_path);
+    let (dest_leaf, r2) = credit(r1, dest, a.dest_pub, a.dest_priv, a.dest_k_enc, amount, da_nonce);
+    st.accounts_root =
+        update(DS_ACCT_NODE, st.accounts_root, dest, account_leaf(a.dest_pub, a.dest_priv), dest_leaf, a.dest_acct_path);
+    st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
+    (st, r2)
 }
 
 fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce: Field, params: Params) -> (State, Running) {
@@ -318,6 +352,10 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
     (st, r)
 }
 
+/// CancelOrder, p = (market, side, price, seq), and ModifyOrder, p = (market, side, price, seq,
+/// lots): removes the account's resting order, or reduces it in place to `lots`, which keeps its
+/// place in the queue (SPEC.md §7.3). A modification that would add lots or move the price is a
+/// cancellation and a new order.
 fn cancel(state: State, a: Action, act_auth: Activity) -> State {
     let mut st = state;
     // The account's leaf authenticates the signing key.
@@ -331,17 +369,26 @@ fn cancel(state: State, a: Action, act_auth: Activity) -> State {
     assert((side == SIDE_BID) | (side == SIDE_ASK), "side");
     assert((price as Field == a.p[2]) & (seq as Field == a.p[3]), "order reference");
     assert(a.cancel_lots > 0, "no such order");
+    let modify = a.kind == KIND_MODIFY;
+    let lots = if modify { a.p[4] as u64 } else { 0 };
+    if modify {
+        assert((lots as Field == a.p[4]) & (lots > 0) & (lots < a.cancel_lots), "a modification only reduces an order");
+    }
     let index = order_index(side, price, seq);
     let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry };
-    let (root, _) = replace(st.markets[mid].book_root, index, o, Order::empty(), a.rest_path);
+    let kept = if modify { Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry } } else { Order::empty() };
+    let (root, _) = replace(st.markets[mid].book_root, index, o, kept, a.rest_path);
     st.markets[mid].book_root = root;
     let mut act = act_auth;
+    let removed = a.cancel_lots - lots;
     if side == SIDE_BID {
-        act.open_bid[mid] = a.taker_actv.open_bid[mid] - a.cancel_lots;
+        act.open_bid[mid] = a.taker_actv.open_bid[mid] - removed;
     } else {
-        act.open_ask[mid] = a.taker_actv.open_ask[mid] - a.cancel_lots;
+        act.open_ask[mid] = a.taker_actv.open_ask[mid] - removed;
     }
-    act.open_orders = a.taker_actv.open_orders - 1;
+    if !modify {
+        act.open_orders = a.taker_actv.open_orders - 1;
+    }
     st.activity_root =
         update(DS_ACTV_NODE, st.activity_root, a.account_index, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     st
