@@ -2,13 +2,14 @@ use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment},
     book::{Order, order_index, replace, Sibling, SIDE_BID},
     consts::{
-        ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_FEE, CLASS_INSURANCE, DS_ACCT_NODE, DS_ACTV_NODE, DS_CLEAN, FEE_INDEX,
-        INSURANCE_INDEX, LOG_CLEANUP, MARKETS, MAX_COLLATERAL, MICRO, PROTOCOL_ACCOUNTS, TAG_REFRESH,
+        ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_FEE, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_CLEAN,
+        FEE_INDEX, INSURANCE_INDEX, LOG_CLEANUP, MARKETS, MAX_COLLATERAL, MICRO, PROTOCOL_ACCOUNTS, TAG_REFRESH,
     },
     da::{emit_change, emit_full, open_segment, segment_nonce},
+    liq::below,
     params::Params,
     state::State,
-    trade::abs,
+    trade::{abs, equity, exposure_fresh, maintenance_margin},
     tree::{merkle_root, update},
 };
 use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
@@ -33,6 +34,9 @@ struct Item {
     priv_part: AccountPriv,
     path: [Field; ACCOUNTS_HEIGHT],
     k_enc: Field,
+    /// Refresh: the account's activity, for the risk check.
+    actv: Activity,
+    actv_path: [Field; ACCOUNTS_HEIGHT],
 }
 
 /// Maintenance segment (SPEC.md §6.5, §8.6, §9.5).
@@ -50,6 +54,11 @@ struct Item {
 /// around, each as its unchanged leaf with the full opening encrypted under a fresh keystream, and
 /// records the L3 time whenever the cursor wraps. The Bridge requires every batch to end within the
 /// refresh window W of the last wrap, so the DA of the last W rebuilds every account, active or not.
+///
+/// The refresh is also the risk sweep (SPEC.md §8.7): a user account whose exposure has fresh
+/// indices is refreshed only if it is not due for liquidation, so the operator must liquidate it
+/// first, and every due liquidation happens within W. A stale index exempts the account, so an
+/// oracle outage cannot halt the refresh.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -125,6 +134,13 @@ fn main(
             let w = items[i];
             let leaf = account_leaf(w.pub_part, w.priv_part);
             assert(merkle_root(DS_ACCT_NODE, leaf, cursor, w.path) == st.accounts_root, "account path");
+            if w.pub_part.class == CLASS_USER {
+                assert(merkle_root(DS_ACTV_NODE, w.actv.hash(), cursor, w.actv_path) == st.activity_root, "activity path");
+                if exposure_fresh(w.priv_part, w.actv, st.markets, params.max_age, end.time) {
+                    let due = below(equity(w.priv_part, st.markets), maintenance_margin(w.priv_part, st.markets, params));
+                    assert(!due, "account is due for liquidation");
+                }
+            }
             assert(enc_commitment(w.k_enc) == w.pub_part.enc_commitment, "k_enc does not open the commitment");
             end = emit_full(end, TAG_REFRESH, cursor, leaf, w.pub_part, w.priv_part, w.k_enc, da_nonce);
             if cursor + 1 == st.num_accounts {

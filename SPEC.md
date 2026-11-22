@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), and dead-order removal with live-only ticks (P2.10), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), and the risk sweep at refresh (P2.11), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -354,6 +354,8 @@ Maker and taker rates in hundredths of a basis point, by fee tier. Tiers are sto
 ### 8.7 Risk sweep (phase 3)
 
 Proofs show that every liquidation performed was justified, not that every due liquidation happened. A `risk_cursor` advancing over account indices obliges each batch to check `Q` accounts at current marks (proving `equity ≥ MM` or liquidating), so every account with a position is checked at least every `R` batches [M6].
+
+As built (P2.11, §15), the refresh cursor serves as the risk cursor and the refresh window as `R`: a refresh entry is also a risk check.
 
 ### 8.8 Conservation
 
@@ -828,6 +830,7 @@ P2 is built in increments, each leaving every test green.
 - P2.8: `ModifyOrder` and `Transfer`.
 - P2.9: `CancelAll` in constant time, through order epochs.
 - P2.10: dead-order removal, and ticks that read only live orders.
+- P2.11: the risk sweep (§8.7), checked at refresh.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1190,6 +1193,20 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - So the engine first opens the block without updates, then removes the orders, then ticks at the same time. Blocks may repeat a time.
 - **Cost.** `seg_block`: 188,143 gates, up 16% for eight activity proofs. `seg_refresh`: 141,339, up from about 48,000, at roughly 23,000 per removal.
 
+**Risk sweep** (P2.11, §8.7):
+
+- **The refresh is the sweep.** A refreshed user account also proves its activity. If its exposure has fresh indices, it must not be below maintenance margin. An account that is due for liquidation must be liquidated before the refresh cursor can pass it.
+- **Bound.** The refresh deadline (P2.4) brings every account up for refresh within the refresh window of each cycle's start. So a liquidation that is due at fresh marks happens within about two windows, or settlement halts, as for a missed refresh.
+- **Stale indices.** A stale index exempts the account. A liquidation needs fresh indices too (§8.5), and an oracle outage must not stall the refresh.
+- **Departure from §8.7.** There is no separate `risk_cursor` or per-batch `Q`. The refresh cursor and the refresh window take their roles, so `R` is the number of batches in a window.
+- **Scope.** Protocol accounts are never liquidated, and are not checked.
+- **Cost.** `seg_refresh`: 160,565 gates, up 19,000 for four checks.
+
+**Tests** (P2.11):
+
+- **Native:** every refresh across the eight batches passes the check. The engine refuses to refresh an account that is due for liquidation.
+- **Adversarial:** a refresh of an account due for liquidation, 74 witnesses in all.
+
 **Tests** (P2.10):
 
 - **Native**, batch 6: before its market-0 tick, a maintenance segment removes the two void asks left by batches 4 and 5. They are Eve's ask, voided by her liquidation's cancel step, and Dave's, voided by his forced cancel-all.
@@ -1236,7 +1253,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 1. C1 custody (§10.3), once the D7 token is specified.
 2. WebAuthn passkeys as a client circuit.
-3. From P3: the risk sweep (§8.7), so every due liquidation is shown to happen, and the ranking of ADL counterparties (§8.5).
+3. From P3: the ranking of ADL counterparties (§8.5).
 
 ## 16. Decisions
 

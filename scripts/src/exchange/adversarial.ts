@@ -265,6 +265,14 @@ async function main() {
       L.restore(snap);
     }
   };
+  // The risk sweep (SPEC.md §8.7): V is due for liquidation, so a refresh may not pass it.
+  const riskSnap = L.snapshot();
+  L.relax.add('liq');
+  await L.maintenance({ refresh: 4 });
+  L.relax.clear();
+  const riskRefresh = clone(L.segments.at(-1)!.inputs) as any;
+  L.restore(riskSnap);
+  await expectFail('refresh of an account due for liquidation', 'seg_refresh', riskRefresh, 'account is due for liquidation');
   await expectFail('liquidating a healthy account', 'seg_liquidate', await relaxed({ kind: 'cancel', account: P }), 'account is not liquidatable');
   await expectFail('closing before the orders are cancelled', 'seg_liquidate', await relaxed({ kind: 'close', account: V, market: 0 }), 'orders must be cancelled first');
   await L.liquidate([{ kind: 'cancel', account: V }]); // honest: voids all of V's orders

@@ -61,6 +61,7 @@ const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: b
 });
 const pad = <T>(xs: T[], n: number, f: () => T) => [...xs, ...Array.from({ length: n - xs.length }, f)];
 const emptyOwner = () => ({ owner_actv: M.activityToNoir(M.newActivity()), owner_actv_path: zeros(M.ACCOUNTS_HEIGHT) });
+const emptyOwnerActv = () => ({ actv: M.activityToNoir(M.newActivity()), actv_path: zeros(M.ACCOUNTS_HEIGHT) });
 
 export class Engine {
   readonly api: Barretenberg;
@@ -604,8 +605,26 @@ export class Engine {
   // ---- Maintenance: sweep and refresh (seg_refresh) ----
 
   private refreshItem(rec?: AccountRecord) {
-    if (!rec) return { pub_part: M.pubToNoir(M.zeroPub()), priv_part: M.privToNoir(M.emptyPriv()), path: zeros(M.ACCOUNTS_HEIGHT), k_enc: hex(0n) };
-    return { pub_part: M.pubToNoir(rec.pub), priv_part: M.privToNoir(rec.priv), path: this.accounts.path(rec.index).map(hex), k_enc: hex(rec.kEnc) };
+    if (!rec) return { pub_part: M.pubToNoir(M.zeroPub()), priv_part: M.privToNoir(M.emptyPriv()), path: zeros(M.ACCOUNTS_HEIGHT), k_enc: hex(0n), ...emptyOwnerActv() };
+    return {
+      pub_part: M.pubToNoir(rec.pub),
+      priv_part: M.privToNoir(rec.priv),
+      path: this.accounts.path(rec.index).map(hex),
+      k_enc: hex(rec.kEnc),
+      actv: M.activityToNoir(this.actv.get(rec.index)!),
+      actv_path: this.activity.path(rec.index).map(hex),
+    };
+  }
+
+  /**
+   * The risk sweep at refresh (seg_refresh, SPEC.md §8.7): a user account whose exposure has fresh
+   * indices and that is below maintenance margin must be liquidated before it is refreshed.
+   */
+  dueForLiquidation(index: bigint) {
+    const rec = this.accts.get(index)!;
+    const act = this.actv.get(index)!;
+    if (rec.pub.class !== M.CLASS.USER || !X.exposureFresh(rec.priv, act, this.markets, this.params.maxAge, this.running.time)) return false;
+    return X.below(X.equity(rec.priv, this.markets), X.maintenanceMargin(rec.priv, this.markets, this.params));
   }
 
   /**
@@ -683,6 +702,7 @@ export class Engine {
     const indices: bigint[] = [];
     for (let i = 0; i < n; i++) {
       const rec = this.accts.get(this.refreshCursor)!;
+      if (!this.relax.has('liq') && this.dueForLiquidation(rec.index)) throw new Error(`account ${rec.index} is due for liquidation`);
       items.push(this.refreshItem(rec));
       await this.emitFull(M.TAG.REFRESH, rec, await M.accountLeaf(this.h, rec.pub, rec.priv), daNonce);
       indices.push(rec.index);
@@ -729,6 +749,8 @@ export class Engine {
       insurancePending: this.insurancePending,
       insuranceMicro: this.insuranceMicro,
       lastSeq: this.lastSeq,
+      refreshCursor: this.refreshCursor,
+      cycleStart: this.cycleStart,
       receipts: [...this.receipts],
       running: copyRunning(this.running),
       daPayload: [...this.daPayload],
@@ -754,6 +776,8 @@ export class Engine {
     this.insurancePending = s.insurancePending;
     this.insuranceMicro = s.insuranceMicro;
     this.lastSeq = s.lastSeq;
+    this.refreshCursor = s.refreshCursor;
+    this.cycleStart = s.cycleStart;
     this.receipts = s.receipts;
     this.running = s.running;
     this.daPayload = s.daPayload;

@@ -27,6 +27,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.8**: `ModifyOrder` reduces a resting order in place and keeps its queue position; `Transfer` moves collateral between user accounts under the withdrawal rules, revealing which accounts changed but not the amount.
 - **P2.9**: `CancelAll` in constant time. Orders record their owner's order epoch; cancelling all advances the epoch, and matching removes void orders when it meets them. Forced cancel-all and liquidation use the same step.
 - **P2.10**: dead orders. Maintenance removes void and expired orders, and a tick proves its top-of-book orders live, so an order that cannot fill never moves the mark.
+- **P2.11**: the risk sweep. A refreshed account must not be due for liquidation at fresh marks, so with the refresh deadline every due liquidation happens within about two refresh windows.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -171,7 +172,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.9: tests | Native batch 8 voids orders three ways and shows them removed without fills; 2 new adversarial witnesses (70 in all). |
 | P2.10: dead orders | Maintenance removes up to four void or expired orders, each logged; ticks prove their top-of-book orders live and unexpired. |
 | P2.10: tests | Native batch 6 clears two void asks before ticking; 3 more adversarial witnesses (73 in all). |
-| P2: next | C1 custody once the D7 token is specified; WebAuthn passkeys; from P3, the risk sweep and ADL ranking. |
+| P2.11: risk sweep | The refresh checks each user account at fresh marks (equity ≥ MM, or liquidate first); stale indices exempt an account so an oracle outage cannot stall refresh. |
+| P2.11: tests | Every native refresh passes the check; 1 more adversarial witness (74 in all). |
+| P2: next | C1 custody once the D7 token is specified; WebAuthn passkeys; from P3, ADL ranking. |
 
 ## Caveats
 
