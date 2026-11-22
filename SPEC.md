@@ -1418,9 +1418,15 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Native**, batch 6: Grace's second P-segment revokes her session key and withdraws 100,000 by client proof. The engine refuses a third proof, for a withdrawal beyond her collateral. Conservation holds with the withdrawal, and the DA reopens her account after it.
 - **Adversarial:** 3 more tube witnesses, 60 in all: a withdrawal sent to another recipient, a withdrawal above the collateral, and a withdrawal published under another key. The case of a proof whose action kind is not allowed now uses an order.
 
-**Next increments:**
+**Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
-1. From P3: the ranking of ADL counterparties (§8.5).
+1. Fee tiers (§8.6): the tier table, and the operator action that sets an account's tier.
+2. `SetMasterAuth` and `RotateEncKey` (§7.3): which paths may rotate an account's authorization (the master key, a client proof, the owner's Aztec account through a priority request) and how a new `k_enc` reaches the operator.
+3. Per-order display of size [D1]: how displayed orders are published.
+4. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
+5. Resting reduce-only orders with trimming, and stop orders that open a position.
+
+From P3: the ranking of ADL counterparties (§8.5).
 
 P2's remaining exit criteria are outside this repository: a load test at the §14 targets on a testnet, and an external audit.
 
