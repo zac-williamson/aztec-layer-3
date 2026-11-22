@@ -9,6 +9,8 @@
 //   E. rogue_segment as a merge child, borrowing seg_block's slot.
 //   F. two valid segments that do not chain.
 //   G. a valid segment proved under other exchange parameters.
+//   H. rogue_client (authorizes anything) in agg_app, borrowing client_auth's VK tree slot.
+//   I. rogue_client in agg_app with its VK hash replaced by client_auth's.
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { AztecClientBackend } from '@aztec-foundation/bb.js';
@@ -71,10 +73,10 @@ async function main() {
   // A. Rogue app in the IVC. The rogue output claims 10 actions that were never authorized.
   results.push(
     await expectRejected('A: rogue app under init_kernel', async () => {
-      const forged = { actions_hash: hex(randomField()), count: SHAPE.MAX_CLIENT_PROOFS };
+      const forged = { actions_hash: hex(randomField()), count: SHAPE.MAX_CLIENT_PROOFS, vk_tree_root: hex(prover.vkTreeRoot) };
       const pkgs = ['rogue_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'];
       const [rogue, init, tail, hiding] = pkgs.map(readCircuit);
-      const w0 = await new Noir(rogue as any).execute({ actions_hash: forged.actions_hash, count: forged.count });
+      const w0 = await new Noir(rogue as any).execute(forged);
       const out = w0.returnValue as any;
       const w1 = await new Noir(init as any).execute({ app_output: out, app_vk: readVkJson('rogue_app').vk });
       const w2 = await new Noir(tail as any).execute({ prev: out, prev_vk: readVkJson('init_kernel').vk });
@@ -123,7 +125,7 @@ async function main() {
       'D: rogue segment listed in the client subtree (root)',
       async () => {
         const leaves = manifest.vkTree.leaves.map((x: string) => BigInt(x));
-        const slot = ROLE.CLIENT * SHAPE.VK_ROLE_SLOTS + 1;
+        const slot = ROLE.CLIENT * SHAPE.VK_ROLE_SLOTS + SHAPE.VK_ROLE_SLOTS - 1; // an empty client slot
         leaves[slot] = BigInt(manifest.vkHashByPkg.rogue_segment);
         const layers = await vkTree(api, leaves);
         const altRoot = layers[layers.length - 1][0];
@@ -184,6 +186,51 @@ async function main() {
       },
       'left child config mismatch',
     ),
+  );
+
+  // A rogue client proof authorizing an action on an account it does not control, in slot 0 of an
+  // aggregation whose other slots carry honest dummies.
+  const rogueClient = await prover.proveClient('rogue_client', { msg: hex(randomField()), account_index: hex(2n), auth_binding: hex(randomField()) });
+  const dummy = await prover.dummyClientProof();
+  const rogueAgg = (vkHash: string) => {
+    const inputs = prover.aggInputs(Array(SHAPE.MAX_CLIENT_PROOFS).fill(dummy), 1);
+    inputs.client_vks[0] = readVkJson('rogue_client').vk;
+    inputs.vk_hashes[0] = vkHash;
+    inputs.memberships[0] = prover.membership('client_auth');
+    inputs.proofs[0] = rogueClient.proof;
+    inputs.public_inputs[0] = rogueClient.publicInputs;
+    return inputs;
+  };
+
+  results.push(
+    await expectRejected(
+      'H: rogue client in a borrowed VK tree slot (agg_app)',
+      async () => {
+        await new Noir(readCircuit('agg_app') as any).execute(rogueAgg(manifest.vkHashByPkg.rogue_client) as any);
+        return true;
+      },
+      'client VK not in VK tree',
+    ),
+  );
+
+  results.push(
+    await expectRejected('I: rogue client with a forged VK hash (agg_app)', async () => {
+      const pkgs = ['agg_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'];
+      const [app, init, tail, hiding] = pkgs.map(readCircuit);
+      const w0 = await new Noir(app as any).execute(rogueAgg(manifest.vkHashByPkg.client_auth) as any);
+      const out = w0.returnValue as any;
+      const w1 = await new Noir(init as any).execute({ app_output: out, app_vk: readVkJson('agg_app').vk });
+      const w2 = await new Noir(tail as any).execute({ prev: out, prev_vk: readVkJson('init_kernel').vk });
+      const w3 = await new Noir(hiding as any).execute({ prev: out, prev_vk: readVkJson('tail_kernel').vk });
+      const chonk = new AztecClientBackend(
+        [app, init, tail, hiding].map((c) => new Uint8Array(gunzipSync(Buffer.from(c.bytecode, 'base64')))),
+        api,
+        pkgs,
+        [CircuitKind.App, CircuitKind.Kernel, CircuitKind.Kernel, CircuitKind.HidingKernel],
+      );
+      const res = await chonk.prove([w0, w1, w2, w3].map((w) => new Uint8Array(gunzipSync(w.witness))), pkgs.map(readVkBinary));
+      return chonk.verify(res.proof, res.vk);
+    }),
   );
 
   for (const r of results) console.log(`${r.rejected ? 'PASS' : 'FAIL'}  ${r.test}  (${r.how})`);

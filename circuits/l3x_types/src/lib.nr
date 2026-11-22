@@ -44,17 +44,23 @@ pub global DS_VK_NODE: Field = 12;
 pub global DS_DA_SPONGE: Field = 13;
 pub global DS_RECEIPT: Field = 14;
 pub global DS_RECEIPT_NODE: Field = 15;
+pub global DS_P256: Field = 16;
 
 /// Carried through the Chonk IVC on the databus: app return_data -> kernel call_data -> ...
-/// The hiding kernel exposes it as its public output; the tube consumes it.
+/// The hiding kernel exposes it as its public output; the tube consumes it. `vk_tree_root` is the
+/// VK tree whose client subtree held every client proof's VK; the tube requires it to be the
+/// configuration's (SPEC.md §7.4, §9.3).
 pub struct AggOutput {
     pub actions_hash: Field,
     pub count: u32,
+    pub vk_tree_root: Field,
 }
 
+pub global AGG_OUTPUT_LEN: u32 = 3;
+
 impl AggOutput {
-    pub fn to_fields(self) -> [Field; 2] {
-        [self.actions_hash, self.count as Field]
+    pub fn to_fields(self) -> [Field; AGG_OUTPUT_LEN] {
+        [self.actions_hash, self.count as Field, self.vk_tree_root]
     }
 }
 

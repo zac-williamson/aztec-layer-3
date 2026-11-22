@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), and client-proof withdrawals (P2.6), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.10, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), and the client subtree with a P-256 client circuit (P2.7), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -68,7 +68,7 @@ Gaps that MUST be closed before the pipeline secures value:
 | # | Gap | Change |
 | --- | --- | --- |
 | G1 | The tube is proved with `noir-rollup` (RollupHonk: carries an IPA claim and proof), but `verify_batch` calls `verify_honk_proof`, which accepts only UltraHonk ZK proofs. `prove_e2e.ts` never deploys or calls the contract. | Add a root circuit that verifies the tube with `verify_root_rolluphonk_proof` (new in v6 `bb_proof_verification`; closes the IPA accumulator), proved as UltraHonk ZK for `verify_honk_proof`. bb requires the root to accumulate exactly two IPA claims ("Root rollup must accumulate two IPA proofs"), so the root verifies two RollupHonk proofs. A single-segment batch pairs its tube with a padding segment (§9.2). Implemented in P0. |
-| G2 | Verification keys are free witnesses at every inner layer: the client VK in `batch_app`, `app_vk` in `init_kernel`, `kernel_vk` in `tail_kernel` and `hiding_kernel`, and the Chonk VK in `tube`. Only the tube's VK hash is fixed (in the contract). A prover can substitute any inner circuit and emit any `batch_hash`. | Every recursive verification MUST pin the child VK hash, by a circuit constant or by membership in a role-specific VK subtree whose root the Bridge checks (§9.3). Implemented in P0: the Chonk chain and the tube pin constants; merges and the root check membership in the VK tree. |
+| G2 | Verification keys are free witnesses at every inner layer: the client VK in `batch_app`, `app_vk` in `init_kernel`, `kernel_vk` in `tail_kernel` and `hiding_kernel`, and the Chonk VK in `tube`. Only the tube's VK hash is fixed (in the contract). A prover can substitute any inner circuit and emit any `batch_hash`. | Every recursive verification MUST pin the child VK hash, by a circuit constant or by membership in a role-specific VK subtree whose root the Bridge checks (§9.3). Implemented in P0: the Chonk chain and the tube pin constants; merges and the root check membership in the VK tree. Since P2.7 `agg_app` checks each client VK's membership in the client subtree. |
 | G3 | The contract keeps no state: no state root, no replay protection, public inputs bound to nothing on-chain. | Bridge contract (§10). |
 | G4 | Fixed shape: exactly 10 proofs of one circuit, no padding, one sequential IVC. | Variable occupancy with VK membership and dummy padding; segment and merge tree (§9.2). Implemented in P0: any number of segments, merged pairwise, with padding for a single segment. The client subtree still has one member, pinned as a constant in `agg_app`. |
 | G5 | Version drift. v6.1 renumbered proof types (`HN = 2`, `HN_FINAL = 7`, `CHONK = 8`; `HN_TAIL` no longer exists), so the PoC's `HN_TAIL = 8` would now select Chonk and its `CHONK = 9` is undefined. Sizes changed: Mega app and kernel VKs are 151 fields, the Chonk VK is 119 (PoC: 127), a Chonk proof is 1,193 fields plus the hiding kernel's public IO (PoC: 1935; README: 1632), and an UltraHonk ZK recursive proof is 458. The contract comment also says Poseidon2 where the circuits use Pedersen. | Regenerate every constant from v6.1 `constants.nr`; use Poseidon2 throughout (§6.1). |
@@ -714,7 +714,7 @@ P0 status (2026-11-21): complete on Aztec 6.0.0 rather than 6.1, which had not y
 - The Bridge's checks are covered by TXE tests: replay, priority-queue forgeries, `T_force`, time bounds, halt and resume, and delayed configuration and operator changes.
 - M1, M4, M5 and M7 are measured (§14); M2 and M3 are the IVC and tube figures from the same runs.
 
-Left for later phases: a client subtree with more than one circuit, and the custody paths of C1 (P2).
+Left for later phases: a client subtree with more than one circuit (built in P2.7), and the custody paths of C1 (P2).
 
 ### P1 profile (as built, 2026-11-21)
 
@@ -824,6 +824,7 @@ P2 is built in increments, each leaving every test green.
 - P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
 - P2.5: receipts and accountability (first part), then client-proof actions (second part).
 - P2.6: client-proof withdrawals.
+- P2.7: the client subtree, with a P-256 client circuit.
 
 These are built. Where they narrow the design, the full design remains normative.
 
@@ -1076,7 +1077,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Client-proof actions** (P2.5 and P2.6, §7.1, §7.4):
 
-- **P-segment.** A P-segment's leaf is the tube. It verifies the segment's Chonk proof against the pinned Chonk VK. Inside the IVC, `agg_app` verified ten client proofs of the pinned client circuit and folded the first `count` proofs' public inputs: `acc = H(DS_AGG, acc, client_vk_hash, msg, account_index, auth_binding)`.
+- **P-segment.** A P-segment's leaf is the tube. It verifies the segment's Chonk proof against the pinned Chonk VK. Inside the IVC, `agg_app` verified ten client proofs and folded the first `count` proofs' VK hashes and public inputs: `acc = H(DS_AGG, acc, vk_hash, msg, account_index, auth_binding)`. The client circuit was pinned by a constant in P2.5, and is a member of the client subtree since P2.7.
 - **Binding actions to proofs.** The tube takes the actions as witnesses, recomputes that fold from them and requires it to equal the IVC's output. So it applies exactly the actions client proofs authorized, in the order they were aggregated, and drops none.
 - **Checks.** For each action, in order:
   - the account exists;
@@ -1091,12 +1092,11 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - A withdrawal publishes the account's change entry under a fresh blind and appends its record to the batch's withdrawals chain and the DA, as a master-key withdrawal does. Its record is claimed from the Bridge in the same way.
   - The tube's `receipts_root` is 0, because receipts number the operator's sequenced signed actions (§11).
   - The engine builds a P-segment in two passes. The segment nonce, and so every withdrawal's blind, depends on which actions apply. So a dry run first decides which actions apply, and only then is the segment logged, opened and executed.
-- **Lane-P accounts.** An account registers with `master_auth = H(DS_MAUTH_P, client_vk_hash, H(DS_AUTH, secret))`.
+- **Lane-P accounts.** An account registers with `master_auth = H(DS_MAUTH_P, client_vk_hash, auth_binding)` for one of the client circuits (P2.7).
   - No Schnorr key can sign as its master key, so its master actions travel as client proofs.
   - It trades through session keys that a client proof grants. One proof authorizes many fast signed actions (§7.4).
   - It withdraws by client proof (P2.6), or through `ForcedWithdraw` from its owner's Aztec account.
 - **Narrowing.**
-  - There is one client circuit: the P0 circuit, which proves knowledge of the secret behind `auth_binding`. Its VK hash is a constant in `agg_app` and the tube, not a member of a client subtree as §7.4 describes.
   - Of §7.4's default uses, session-key grants and revocations and withdrawals are built. Credentials, and changes of master authorization or `k_enc`, are not.
 - **Cost.** The tube applies ten actions. Each has a 32-level account update, a 32-level activity update, an 8-level key-slot update and, for a withdrawal, the margin check, the change entry and the withdrawal record.
   - Key changes (P2.5) took the tube from 1,473,742 gates to 1,592,466 (+8%).
@@ -1123,6 +1123,33 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - a proof applied to a lane-S account.
 - `EXECUTE_ONLY=1 npm run native` executes the tube without its Chonk proof, since witness generation does not check recursive proofs.
 
+**Client circuits** (P2.7, §7.4, §9.3):
+
+- **Client subtree.** `agg_app` verifies each slot's proof against that slot's own VK. barretenberg binds the VK to the slot's VK hash, and `agg_app` requires that hash to be a leaf of the VK tree's client subtree (role 0).
+  - The VK tree root is a third field of `AggOutput`, and so of the Chonk proof's public inputs.
+  - The tube requires that root to be the one its configuration commits to.
+  - So the configuration, changed only by delayed upgrade (§10.1), decides which client circuits may authorize lane-P actions. Adding one changes the VK tree, not `agg_app` or the tube.
+- **Binding.** The aggregation folds each proof's VK hash with its public inputs, and a lane-P master authorization names its circuit: `H(DS_MAUTH_P, vk_hash, auth_binding)`. A proof of one circuit therefore never acts for an account bound to another.
+- **Circuits**, both with public inputs `(msg, account_index, auth_binding)`:
+
+  | Slot | Circuit | Authorization | `auth_binding` |
+  | --- | --- | --- | --- |
+  | 0 | `client_auth` | knowledge of a secret | `H(DS_AUTH, secret)` |
+  | 1 | `client_p256` | an ECDSA P-256 signature on the message's 32 bytes | `H(DS_P256, x_hi, x_lo, y_hi, y_lo, salt)`: the key's coordinates in 16-byte halves, and a salt the client keeps so the key is not a public identifier |
+
+- **P-256 keys.** `client_p256` suits hardware keys that sign a digest, such as a Secure Enclave or a TPM. The message is already a domain-separated hash, so it is the digest. Signers use RFC 6979 nonces and low `s`.
+  - WebAuthn passkeys sign `authenticatorData ‖ SHA-256(clientDataJSON)` instead. Supporting them means rebuilding that preimage in the circuit, with the message as the challenge. That is deferred.
+- **Narrowing.** Every circuit in the subtree may authorize every lane-P kind. §7.1's per-kind permission is not built.
+- **Cost.** `client_p256` is 46,551 gates and proves in about 250 ms on the reference laptop, against 29 ms for `client_auth`. A VK hash and a 6-level membership path per slot take `agg_app` from 109,564 to 113,267 Mega gates (+3.4%). The tube is unchanged in size.
+
+**Tests** (P2.7):
+
+- **Native**, batch 6: Heidi registers in lane P with a P-256 key. Her session-key grant is aggregated in one P-segment with Grace's, each proof under its own circuit, and she later withdraws by P-256 proof. The DA reopens her account.
+- **Adversarial:** 2 more tube witnesses, 62 in all: a proof applied under another client circuit's VK hash, and an aggregation over another VK tree.
+- **VK substitution:** 2 more, 9 in all. `rogue_client` authorizes anything without a secret.
+  - H: placed in `agg_app` in `client_auth`'s slot, it fails membership at witness generation.
+  - I: placed in `agg_app` with `client_auth`'s VK hash, it passes witness generation, but barretenberg refuses the forged VK hash when the Chonk IVC proves.
+
 **Tests** (P2.6):
 
 - **Native**, batch 6: Grace's second P-segment revokes her session key and withdraws 100,000 by client proof. The engine refuses a third proof, for a withdrawal beyond her collateral. Conservation holds with the withdrawal, and the DA reopens her account after it.
@@ -1131,8 +1158,8 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments:**
 
 1. C1 custody (§10.3), once the D7 token is specified.
-2. The client subtree of §7.4 in place of the single pinned client circuit.
-3. The remaining kinds of §7.3: `CancelAll`, `ModifyOrder`, `Transfer`.
+2. The remaining kinds of §7.3: `CancelAll`, `ModifyOrder`, `Transfer`.
+3. WebAuthn passkeys as a client circuit.
 
 ## 16. Decisions
 

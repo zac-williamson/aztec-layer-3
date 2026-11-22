@@ -3,6 +3,7 @@ members = [
     "l3x_types",
     "l3x_exchange",
     "client_auth",
+    "client_p256",
     "agg_app",
     "init_kernel",
     "tail_kernel",
@@ -19,5 +20,6 @@ members = [
     "root",
     "rogue_app",
     "rogue_segment",
+    "rogue_client",
     "agg_ultra",
 ]

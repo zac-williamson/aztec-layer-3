@@ -10,7 +10,7 @@ import { Noir } from '@aztec-foundation/noir-noir_js';
 import { Engine } from './exchange/engine.ts';
 import * as M from './exchange/model.ts';
 import { protocolAccounts, testParams } from './exchange/params.ts';
-import { OUT, SHAPE, readCircuit, readJson, readVkJson, timed, writeJson } from './lib.ts';
+import { OUT, SHAPE, readCircuit, readJson, timed, writeJson } from './lib.ts';
 import { Prover, assert, newApi, ultraGates } from './pipeline.ts';
 
 async function main() {
@@ -24,7 +24,7 @@ async function main() {
   // Chonk path: IVC over n client proofs, then the tube, for a P-segment at genesis. agg_app
   // verifies all n proof slots and the tube's circuit is fixed, so the cost does not depend on how
   // many of the proofs carry actions; this segment applies none.
-  const engine = await Engine.create(api, params, prover.vkTreeRoot, await protocolAccounts(h), prover.clientVkHash);
+  const engine = await Engine.create(api, params, prover.vkTreeRoot, await protocolAccounts(h), prover.clientVks);
   await engine.beginBatch(1n, 0n, 0n, 0n);
   await engine.provenSegment([], true);
   const tube = await prover.proveTube(engine.segments[0].inputs, []);
@@ -39,14 +39,9 @@ async function main() {
   console.log(`chonk path: IVC ${chonk.ivc_ms} ms + tube ${chonk.tube_ms} ms = ${chonk.total_ms} ms`);
 
   // UltraHonk path: the same verification in one circuit.
-  const { proofs, publicInputs } = await prover.randomClientProofs();
+  const { proofs } = await prover.randomClientProofs();
   const c = readCircuit('agg_ultra');
-  const { witness } = await new Noir(c as any).execute({
-    client_vk: readVkJson('client_auth').vk,
-    proofs,
-    public_inputs: publicInputs,
-    count: n,
-  });
+  const { witness } = await new Noir(c as any).execute(prover.aggInputs(proofs, n));
   const backend = new UltraHonkBackend(c.bytecode, api);
   const [pd, ms] = await timed(() => backend.generateProof(witness, { verifierTarget: 'noir-rollup-no-zk' }));
   assert(await backend.verifyProof(pd, { verifierTarget: 'noir-rollup-no-zk' }), 'agg_ultra proof does not verify');

@@ -1,0 +1,6 @@
+[package]
+name = "rogue_client"
+type = "bin"
+authors = [""]
+
+[dependencies]

@@ -29,6 +29,7 @@ import {
   vkPath,
   vkTree,
 } from './lib.ts';
+import { type P256Key, bytes32, halves, p256Sign } from './exchange/p256.ts';
 
 const CircuitKind = { App: 0, Kernel: 1, HidingKernel: 2 } as const;
 const IVC = ['agg_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'] as const;
@@ -155,14 +156,20 @@ export async function newApi(): Promise<Barretenberg> {
 }
 
 /**
- * A client proof (SPEC.md §7.4): an UltraHonk ZK proof of the client circuit, as fields, with its
- * public inputs (msg, account_index, auth_binding).
+ * A client proof (SPEC.md §7.4): an UltraHonk ZK proof of one of the client circuits (`pkg`), as
+ * fields, with its public inputs (msg, account_index, auth_binding).
  */
-export type ClientProof = { proof: string[]; publicInputs: string[] };
+export type ClientProof = { pkg: string; proof: string[]; publicInputs: string[] };
 const CLIENT_PROOF_FIELDS = 458;
+/** The client circuits of the VK tree's client subtree. */
+export const CLIENT_CIRCUITS = ['client_auth', 'client_p256'] as const;
+/** Fields of AggOutput, the Chonk proof's public inputs: actions_hash, count, vk_tree_root. */
+const AGG_OUTPUT_LEN = 3;
+
+export type AggOut = { actions_hash: string; count: string; vk_tree_root: string };
 
 export type ChonkSegment = {
-  aggOut: { actions_hash: string; count: string };
+  aggOut: AggOut;
   chonkVk: bigint[];
   chonkProof: bigint[];
   ms: Record<string, number>;
@@ -238,34 +245,63 @@ export class Prover {
     return { pkg, proof: bytesToFields(pd.proof), out, ms };
   }
 
-  private clientCircuit?: { noir: Noir; backend: UltraHonkBackend };
+  private clientCircuits = new Map<string, { noir: Noir; backend: UltraHonkBackend }>();
   private dummy?: ClientProof;
 
-  /** The client VK hash pinned in agg_app and the tube: lane-P master authorizations commit to it. */
+  /** The client_auth VK hash: secret-knowledge lane-P master authorizations commit to it. */
   get clientVkHash(): bigint {
-    return BigInt(this.manifest.hashes.CLIENT_VK_HASH);
+    return BigInt(this.manifest.vkHashByPkg.client_auth);
+  }
+
+  /** Every client circuit's VK hash, by package: what an engine needs to build P-segments. */
+  get clientVks(): Record<string, bigint> {
+    return Object.fromEntries(CLIENT_CIRCUITS.map((p) => [p, BigInt(this.manifest.vkHashByPkg[p])]));
+  }
+
+  /** Proves a client circuit (UltraHonk ZK, recursive target), as the client does. */
+  async proveClient(pkg: string, inputs: Record<string, unknown>): Promise<ClientProof & { ms: number }> {
+    let c = this.clientCircuits.get(pkg);
+    if (!c) {
+      const circuit = readCircuit(pkg);
+      c = { noir: new Noir(circuit as any), backend: new UltraHonkBackend(circuit.bytecode, this.api) };
+      this.clientCircuits.set(pkg, c);
+    }
+    const { witness } = await c.noir.execute(inputs as any);
+    const [pd, ms] = await timed(() => c.backend.generateProof(witness, RECURSIVE));
+    const proof = bytesToFields(pd.proof).map(hex);
+    assert(proof.length === CLIENT_PROOF_FIELDS, `${pkg} proof has ${proof.length} fields, expected ${CLIENT_PROOF_FIELDS}`);
+    return { pkg, proof, publicInputs: pd.publicInputs, ms };
   }
 
   /**
-   * A client proof, as the client makes it: it knows `secret` behind the account's auth binding
+   * A client_auth proof: the client knows `secret` behind the account's auth binding
    * (hash(DS_AUTH, secret), which client_auth asserts) and authorizes `msg` for `account`.
    */
-  async clientProof(secret: bigint, msg: bigint, account: bigint): Promise<ClientProof & { ms: number }> {
-    if (!this.clientCircuit) {
-      const c = readCircuit('client_auth');
-      this.clientCircuit = { noir: new Noir(c as any), backend: new UltraHonkBackend(c.bytecode, this.api) };
-    }
-    const { noir, backend } = this.clientCircuit;
-    const { witness } = await noir.execute({
+  async clientProof(secret: bigint, msg: bigint, account: bigint) {
+    return this.proveClient('client_auth', {
       secret: hex(secret),
       msg: hex(msg),
       account_index: hex(account),
       auth_binding: hex(await l3xHash(this.api, [DS.AUTH, secret])),
     });
-    const [pd, ms] = await timed(() => backend.generateProof(witness, RECURSIVE));
-    const proof = bytesToFields(pd.proof).map(hex);
-    assert(proof.length === CLIENT_PROOF_FIELDS, `client proof has ${proof.length} fields, expected ${CLIENT_PROOF_FIELDS}`);
-    return { proof, publicInputs: pd.publicInputs, ms };
+  }
+
+  /**
+   * A client_p256 proof: a P-256 key signs `msg`'s 32 bytes, and the auth binding commits to the
+   * key and `salt` (hash(DS_P256, x_hi, x_lo, y_hi, y_lo, salt)).
+   */
+  async clientProofP256(key: P256Key, salt: bigint, msg: bigint, account: bigint) {
+    const [xh, xl] = halves(key.pk.x);
+    const [yh, yl] = halves(key.pk.y);
+    return this.proveClient('client_p256', {
+      pk_x: bytes32(key.pk.x),
+      pk_y: bytes32(key.pk.y),
+      salt: hex(salt),
+      signature: [...p256Sign(key, new Uint8Array(bytes32(msg)))],
+      msg: hex(msg),
+      account_index: hex(account),
+      auth_binding: hex(await l3xHash(this.api, [DS.P256, xh, xl, yh, yl, salt])),
+    });
   }
 
   /** A valid proof of a random message, for the slots of a P-segment beyond its actions (agg_app verifies every slot). */
@@ -274,18 +310,32 @@ export class Prover {
     return this.dummy;
   }
 
-  /** MAX_CLIENT_PROOFS proofs, each authorizing a random message (M1). */
+  /** MAX_CLIENT_PROOFS client_auth proofs, each authorizing a random message (M1). */
   async randomClientProofs() {
-    const proofs: string[][] = [];
-    const publicInputs: string[][] = [];
+    const proofs: ClientProof[] = [];
     const ms: number[] = [];
     for (let i = 0; i < SHAPE.MAX_CLIENT_PROOFS; i++) {
       const p = await this.clientProof(randomField(), randomField(), BigInt(i + 1));
-      proofs.push(p.proof);
-      publicInputs.push(p.publicInputs);
+      proofs.push(p);
       ms.push(p.ms);
     }
-    return { proofs, publicInputs, meanMs: ms.reduce((a, b) => a + b, 0) / ms.length };
+    return { proofs, meanMs: ms.reduce((a, b) => a + b, 0) / ms.length };
+  }
+
+  /**
+   * The aggregation inputs over ten proof slots, as agg_app and agg_ultra take them: each slot's
+   * VK, VK hash and place in the client subtree, under this deployment's VK tree.
+   */
+  aggInputs(slots: ClientProof[], count: number) {
+    return {
+      vk_tree_root: hex(this.vkTreeRoot),
+      client_vks: slots.map((p) => readVkJson(p.pkg).vk),
+      vk_hashes: slots.map((p) => this.manifest.vkHashByPkg[p.pkg]),
+      memberships: slots.map((p) => this.membership(p.pkg)),
+      proofs: slots.map((p) => p.proof),
+      public_inputs: slots.map((p) => p.publicInputs),
+      count,
+    };
   }
 
   /**
@@ -304,13 +354,8 @@ export class Prover {
     sizes.client_proof_fields = CLIENT_PROOF_FIELDS;
 
     const circuits = Object.fromEntries(IVC.map((p) => [p, readCircuit(p)]));
-    const agg = await new Noir(circuits.agg_app as any).execute({
-      client_vk: readVkJson('client_auth').vk,
-      proofs: slots.map((p) => p.proof),
-      public_inputs: slots.map((p) => p.publicInputs),
-      count,
-    });
-    const aggOut = agg.returnValue as { actions_hash: string; count: string };
+    const agg = await new Noir(circuits.agg_app as any).execute(this.aggInputs(slots, count));
+    const aggOut = agg.returnValue as AggOut;
     const init = await new Noir(circuits.init_kernel as any).execute({ app_output: aggOut, app_vk: readVkJson('agg_app').vk });
     const tail = await new Noir(circuits.tail_kernel as any).execute({ prev: aggOut, prev_vk: readVkJson('init_kernel').vk });
     const hiding = await new Noir(circuits.hiding_kernel as any).execute({ prev: aggOut, prev_vk: readVkJson('tail_kernel').vk });
@@ -332,16 +377,17 @@ export class Prover {
     ms.chonk_prove = chonkMs;
     assert(await chonk.verify(res.proof, res.vk), 'Chonk proof does not verify natively');
     const fields = res.proofFields.map(fromBytes32);
-    assert(fields.length === SHAPE.CHONK_PROOF_LENGTH + 2, `Chonk proof has ${fields.length} fields`);
+    assert(fields.length === SHAPE.CHONK_PROOF_LENGTH + AGG_OUTPUT_LEN, `Chonk proof has ${fields.length} fields`);
     assert(
-      fields[0] === BigInt(aggOut.actions_hash) && fields[1] === BigInt(aggOut.count),
+      fields[0] === BigInt(aggOut.actions_hash) && fields[1] === BigInt(aggOut.count) && fields[2] === BigInt(aggOut.vk_tree_root),
       'Chonk public inputs are not the leading fields',
     );
+    assert(fields[2] === this.vkTreeRoot, "the IVC's VK tree is not this deployment's");
     const chonkVk = bytesToFields(res.vk);
     const hidingVk = readVkJson('hiding_kernel').vk.map((x) => BigInt(x));
     assert(chonkVk.length === hidingVk.length && chonkVk.every((x, i) => x === hidingVk[i]), 'Chonk VK != hiding kernel VK');
     log(`  chonk: ${count} client proof(s) + ${SHAPE.MAX_CLIENT_PROOFS - count} dummies, IVC ${chonkMs.toFixed(0)} ms`);
-    return { aggOut, chonkVk, chonkProof: fields.slice(2), ms, sizes };
+    return { aggOut, chonkVk, chonkProof: fields.slice(AGG_OUTPUT_LEN), ms, sizes };
   }
 
   /**
@@ -351,9 +397,11 @@ export class Prover {
    */
   async proveTube(inputs: Record<string, unknown>, clientProofs: ClientProof[], log = console.log) {
     const seg = await this.chonkSegment(clientProofs, log);
-    const agg = inputs.agg as { actions_hash: string; count: string | number };
+    const agg = inputs.agg as { actions_hash: string; count: string | number; vk_tree_root: string };
     assert(
-      BigInt(agg.actions_hash) === BigInt(seg.aggOut.actions_hash) && BigInt(agg.count) === BigInt(seg.aggOut.count),
+      BigInt(agg.actions_hash) === BigInt(seg.aggOut.actions_hash) &&
+        BigInt(agg.count) === BigInt(seg.aggOut.count) &&
+        BigInt(agg.vk_tree_root) === BigInt(seg.aggOut.vk_tree_root),
       "the engine's aggregation != the IVC's",
     );
     const node = await this.proveNode('tube', { ...inputs, chonk_vk: seg.chonkVk.map(hex), chonk_proof: seg.chonkProof.map(hex) });

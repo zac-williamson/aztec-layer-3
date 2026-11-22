@@ -371,7 +371,7 @@ async function main() {
   // grants S two session keys and withdraws 1,000 of its collateral; the tampered tube witnesses are
   // what an operator would need to apply actions no client proof authorized. The tube runs without its Chonk proof here (witness
   // generation does not check it), so each case shows the check the tube itself makes.
-  const PE = await Engine.create(api, params, prover.vkTreeRoot, protocol, prover.clientVkHash);
+  const PE = await Engine.create(api, params, prover.vkTreeRoot, protocol, prover.clientVks);
   const pSecret = randomField();
   const pu = await Promise.all([41n, 42n].map((x) => keysFromSeed(h, x)));
   const [S, U] = [2n, 3n];
@@ -410,7 +410,7 @@ async function main() {
     let acc = 0n;
     for (let i = 0; i < Number(t.agg.count); i++) {
       const a = t.actions[i];
-      acc = await h([M.DS.AGG, acc, prover.clientVkHash, BigInt(a.msg), BigInt(a.account_index), BigInt(a.auth_binding)]);
+      acc = await h([M.DS.AGG, acc, BigInt(a.vk_hash), BigInt(a.msg), BigInt(a.account_index), BigInt(a.auth_binding)]);
     }
     t.agg.actions_hash = hex(acc);
     return t;
@@ -443,6 +443,12 @@ async function main() {
   t = clone(tube);
   t.agg.count = 11;
   await expectFail('more client actions than proof slots', 'tube', runTube(t), 'too many client proofs');
+  t = clone(tube);
+  t.actions[0].vk_hash = hex(prover.clientVks.client_p256);
+  await expectFail('client proof under another client circuit', 'tube', runTube(await reaggregate(t)), 'client proof does not control the account');
+  t = clone(tube);
+  t.agg.vk_tree_root = hex(randomField());
+  await expectFail('client proofs under another VK tree', 'tube', runTube(t), 'client proofs verified under another VK tree');
   t = clone(tube);
   t.actions[0].key_path[0] = hex(1n);
   await expectFail('client action on a forged key slot', 'tube', runTube(t), 'key slot path');

@@ -187,6 +187,11 @@ export const accountLeaf = async (h: H, p: AccountPub, q: AccountPriv) => h([DS.
 export const masterAuthOf = (h: H, x: bigint, y: bigint) => h([DS.MAUTH, x, y]);
 /** A client's auth binding: the client circuit proves knowledge of `secret` behind it (SPEC.md §7.4). */
 export const authBinding = (h: H, secret: bigint) => h([DS.AUTH, secret]);
+/** A P-256 key's auth binding (client_p256): the key's coordinates in 16-byte halves and the client's salt. */
+export const p256Binding = (h: H, pk: { x: bigint; y: bigint }, salt: bigint) => {
+  const lo = (1n << 128n) - 1n;
+  return h([DS.P256, pk.x >> 128n, pk.x & lo, pk.y >> 128n, pk.y & lo, salt]);
+};
 /** Lane-P master authorization (SPEC.md §7.1): the client circuit, with the account's auth binding. */
 export const masterAuthP = (h: H, clientVkHash: bigint, binding: bigint) => h([DS.MAUTH_P, clientVkHash, binding]);
 export const encCommitment = (h: H, k: bigint) => h([DS.ENC, k]);

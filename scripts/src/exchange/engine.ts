@@ -6,6 +6,7 @@ import type { Barretenberg } from '@aztec-foundation/bb.js';
 import { DS as DS0, R, SHAPE, daAbsorb, hex } from '../lib.ts';
 import { type BatchWitness, type ClientProof, type Prover, type Running, type SegmentWitness, assert, batchStart, copyRunning, runningToNoir } from '../pipeline.ts';
 import { type Point, type Sig, sigToNoir, verify, zeroSig } from './grumpkin.ts';
+import type { P256Key } from './p256.ts';
 import * as M from './model.ts';
 import type { ProtocolAccount } from './params.ts';
 import * as X from './rules.ts';
@@ -64,8 +65,11 @@ export class Engine {
   readonly h: M.H;
   readonly params: M.Params;
   readonly vkTreeRoot: bigint;
-  /** The pinned client circuit's VK hash, which lane-P master authorizations commit to (SPEC.md §7.1). */
-  readonly clientVkHash: bigint;
+  /**
+   * The VK hash of every client circuit in the VK tree's client subtree, by package: lane-P master
+   * authorizations commit to one of them (SPEC.md §7.1, §7.4).
+   */
+  readonly clientVks: Map<string, bigint>;
   domain = 0n;
   accounts!: MerkleTree;
   activity!: MerkleTree;
@@ -106,20 +110,20 @@ export class Engine {
   wdRecords: bigint[] = [];
   segments: SegmentWitness[] = [];
 
-  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, clientVkHash: bigint) {
+  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, clientVks: Record<string, bigint>) {
     this.api = api;
     this.h = M.hasher(api);
     this.params = params;
     this.vkTreeRoot = vkTreeRoot;
-    this.clientVkHash = clientVkHash;
+    this.clientVks = new Map(Object.entries(clientVks));
   }
 
   /**
    * An engine at genesis, holding the protocol accounts (insurance at 0, fee at 1). Client-proof
-   * actions need the build's client VK hash (Prover.clientVkHash).
+   * actions need the build's client circuits (Prover.clientVks).
    */
-  static async create(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, protocol: ProtocolAccount[], clientVkHash = 0n): Promise<Engine> {
-    const e = new Engine(api, params, vkTreeRoot, clientVkHash);
+  static async create(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, protocol: ProtocolAccount[], clientVks: Record<string, bigint> = {}): Promise<Engine> {
+    const e = new Engine(api, params, vkTreeRoot, clientVks);
     await M.initModel(e.h);
     e.accounts = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACCT_NODE).init();
     e.activity = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACTV_NODE).init();
@@ -821,7 +825,7 @@ export class Engine {
    * `emitEmpty`.
    */
   async provenSegment(queue: ProvenAction[], emitEmpty = false) {
-    assert(this.clientVkHash !== 0n, 'client-proof actions need the client VK hash (Engine.create)');
+    assert(this.clientVks.size > 0, 'client-proof actions need the client circuits (Engine.create)');
     const start = copyRunning(this.running);
     const before = this.state();
     const dry = this.snapshot();
@@ -840,7 +844,7 @@ export class Engine {
     this.restore(dry);
     if (!applied.length && !emitEmpty) return;
     let acc = 0n;
-    for (const a of applied) acc = await this.h([DS0.AGG, acc, this.clientVkHash, ...a.proof.publicInputs.map((x) => BigInt(x))]);
+    for (const a of applied) acc = await this.h([DS0.AGG, acc, this.clientVks.get(a.proof.pkg)!, ...a.proof.publicInputs.map((x) => BigInt(x))]);
     const r = this.running;
     r.actionLog = await M.logAppend(this.h, r.actionLog, acc, BigInt(applied.length));
     const daNonce = await M.segmentNonce(this.h, start.batch, r.actionLog, start.daLen);
@@ -855,7 +859,7 @@ export class Engine {
       `proven [${applied.map(name).join(', ')}]`,
       {
         ...this.base(start, before),
-        agg: { actions_hash: hex(acc), count: applied.length },
+        agg: { actions_hash: hex(acc), count: applied.length, vk_tree_root: hex(this.vkTreeRoot) },
         actions: pad(items, CLIENT_PER_SEGMENT, () => this.emptyClientAction()),
       },
       undefined,
@@ -865,12 +869,14 @@ export class Engine {
 
   /** The tube's checks, in its order, then the key slot write or the withdrawal (shared with seg_trade). */
   private async execProven(a: ProvenAction, daNonce: bigint) {
+    const vkHash = this.clientVks.get(a.proof.pkg);
+    if (vkHash === undefined) throw new Error('client circuit not in the VK tree');
     const [msg, account, binding] = a.proof.publicInputs.map((x) => BigInt(x));
     if (account !== a.account) throw new Error('the proof is for another account');
     const rec = this.accts.get(account);
     const oldAct = this.actv.get(account);
     if (!rec || !oldAct) throw new Error('account');
-    if (!this.relax.has('client-auth') && (await M.masterAuthP(this.h, this.clientVkHash, binding)) !== rec.pub.masterAuth) {
+    if (!this.relax.has('client-auth') && (await M.masterAuthP(this.h, vkHash, binding)) !== rec.pub.masterAuth) {
       throw new Error('client proof does not control the account');
     }
     if (msg !== (await X.actionMsg(this.h, this.domain, a.kind, account, M.MASTER_KEY, a.nonce, a.p))) throw new Error('proof authorizes another action');
@@ -885,6 +891,7 @@ export class Engine {
         ? { key: M.keyToNoir(M.emptyKey()), key_path: zeros(M.KEYS_HEIGHT), ...(await this.execWithdraw(a, rec, act, daNonce)) }
         : await this.execSetKey(a, act);
     return {
+      vk_hash: hex(vkHash),
       msg: hex(msg),
       account_index: hex(account),
       auth_binding: hex(binding),
@@ -904,6 +911,7 @@ export class Engine {
 
   private emptyClientAction() {
     return {
+      vk_hash: hex(0n),
       msg: hex(0n),
       account_index: hex(0n),
       auth_binding: hex(0n),
@@ -1603,17 +1611,27 @@ export async function signAction(h: M.H, domain: bigint, keys: { sk: bigint; pk:
   return { kind, account, keyId, nonce, p: payload, sig: await sign(h, keys.sk, msg), pk: { x: keys.pk!.x, y: keys.pk!.y } };
 }
 
+/** How a lane-P client authorizes: the secret behind its auth binding (client_auth), or a P-256 key and salt (client_p256). */
+export type ClientAuth = bigint | { key: P256Key; salt: bigint };
+
 /**
  * A client's proof of a master action (SPEC.md §7.4): the client circuit authorizes the action's
- * message under the master key id, for an account whose auth binding is hash(DS_AUTH, secret).
- * With a prover the client circuit is proved; without one the action carries only the proof's
- * public inputs, which is enough to execute (not prove) a batch.
+ * message under the master key id. With a prover the client circuit is proved; without one the
+ * action carries only the proof's public inputs, which is enough to execute (not prove) a batch.
  */
-export async function proveAction(h: M.H, domain: bigint, secret: bigint, kind: bigint, account: bigint, nonce: bigint, p: bigint[], prover?: Prover): Promise<ProvenAction> {
+export async function proveAction(h: M.H, domain: bigint, auth: ClientAuth, kind: bigint, account: bigint, nonce: bigint, p: bigint[], prover?: Prover): Promise<ProvenAction> {
   const payload = [...p, ...Array<bigint>(X.ACTION_PAYLOAD - p.length).fill(0n)];
   const msg = await X.actionMsg(h, domain, kind, account, M.MASTER_KEY, nonce, payload);
-  const proof = prover ? await prover.clientProof(secret, msg, account) : { proof: [], publicInputs: [msg, account, await M.authBinding(h, secret)].map(hex) };
-  return { kind, account, nonce, p: payload, proof: { proof: proof.proof, publicInputs: proof.publicInputs } };
+  const pkg = typeof auth === 'bigint' ? 'client_auth' : 'client_p256';
+  let proof: ClientProof;
+  if (prover) {
+    const made = typeof auth === 'bigint' ? await prover.clientProof(auth, msg, account) : await prover.clientProofP256(auth.key, auth.salt, msg, account);
+    proof = { pkg: made.pkg, proof: made.proof, publicInputs: made.publicInputs };
+  } else {
+    const binding = typeof auth === 'bigint' ? await M.authBinding(h, auth) : await M.p256Binding(h, auth.key.pk, auth.salt);
+    proof = { pkg, proof: [], publicInputs: [msg, account, binding].map(hex) };
+  }
+  return { kind, account, nonce, p: payload, proof };
 }
 
 /** Oracle side: the publishers with the given indices sign an index update (SPEC.md §8.4). */

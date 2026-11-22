@@ -36,6 +36,7 @@ export const DS = {
   DA_SPONGE: 13n,
   RECEIPT: 14n,
   RECEIPT_NODE: 15n,
+  P256: 16n,
 } as const;
 
 /** Shape parameters; must match circuits/l3x_types/src/{lib,merge}.nr. */

@@ -23,6 +23,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - Signed actions carry sequence numbers and receipt leaves, rolled up along the merge tree into each batch header. A receipt challenge on the Bridge must be answered with a path, or the operator's bond pays the challenger.
   - Lane-P accounts, whose master authorization is a client circuit rather than a Schnorr key, grant and revoke session keys with client proofs. The Chonk IVC aggregates the proofs, and the tube applies exactly the actions they authorize.
 - **P2.6**: client-proof withdrawals. The tube withdraws under the same rules as a master-key withdrawal, through the same library routine. It publishes the account change and the withdrawal record.
+- **P2.7**: the client subtree. `agg_app` accepts any client circuit whose VK is in the VK tree's client subtree, so the configuration decides which circuits authorize lane-P actions. A P-256 client circuit joins the secret-knowledge one, for hardware keys.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -38,15 +39,16 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/seg_refresh` | X-segment (maintenance): sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
-| `circuits/client_auth` | P-lane client circuit: knowledge of the secret behind an account's auth binding, authorizing `msg` |
-| `circuits/agg_app` | Chonk app: verifies 10 client proofs against the pinned client VK and folds the first `count` |
+| `circuits/client_auth` | P-lane client circuit (client slot 0): knowledge of the secret behind an account's auth binding, authorizing `msg` |
+| `circuits/client_p256` | P-lane client circuit (client slot 1): an ECDSA P-256 signature on `msg` by the key the auth binding commits to |
+| `circuits/agg_app` | Chonk app: verifies 10 client proofs, each against a VK in the VK tree's client subtree, and folds the first `count` with their VK hashes |
 | `circuits/{init,tail,hiding}_kernel` | IVC kernels: OINK, HN, HN_FINAL, each pinning its predecessor's VK hash |
 | `circuits/tube` | P-segment leaf: verifies the Chonk proof against the pinned Chonk VK, checks the segment's actions against the proofs' aggregation, and applies them (AddKey, RevokeKey, Withdraw) |
 | `circuits/padding` | Identity segment, so a single-segment batch still gives the root two children |
 | `circuits/merge` | Verifies two merge-tree nodes against the VK tree, checks they chain, outputs the combined transition |
 | `circuits/root` | Top merge: closes IPA, opens the end state, builds the withdrawals tree, binds the batch header |
 | `circuits/agg_ultra` | M1 measurement: `agg_app`'s checks in plain UltraHonk |
-| `circuits/rogue_app`, `circuits/rogue_segment` | Adversarial fixtures for the VK tests; never deployed |
+| `circuits/rogue_app`, `circuits/rogue_segment`, `circuits/rogue_client` | Adversarial fixtures for the VK tests; never deployed |
 | `circuits/vendor/bb_proof_verification` | Vendored from aztec-packages v6.0.0 (Apache-2.0) |
 | `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C0 deposits, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
 | `contracts/token` | Minimal public collateral token for C0 (not the D7 token) |
@@ -82,7 +84,7 @@ This proves one synthetic batch natively, `root(merge(block, priority), priority
 npm run vk-substitution
 ```
 
-This runs the negative tests: a rogue IVC app, rogue segments outside the VK tree or in a borrowed slot or the wrong role, segments that do not chain, and a segment under another configuration. All must be rejected.
+This runs the negative tests: a rogue IVC app, rogue segments outside the VK tree or in a borrowed slot or the wrong role, segments that do not chain, a segment under another configuration, and a rogue client circuit in a borrowed client slot or under a forged VK hash. All must be rejected.
 
 ```bash
 npm run m1
@@ -100,7 +102,7 @@ This runs six batches natively across markets 0–2. They cover:
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
 - a 13% fall in market 0 followed by both liquidation waterfalls, one ending in an insurance takeover and deficit, the other in auto-deleveraging;
 - a session key's trading and refusals, a GTT order removed after expiry, and forced withdraw, close and cancel-all requests;
-- a lane-P account whose session key is granted and revoked, and whose collateral is withdrawn, by client proofs, each P-segment proved through the Chonk IVC and the tube.
+- a lane-P account whose session key is granted and revoked, and whose collateral is withdrawn, by client proofs, and a second lane-P account authorizing with a P-256 key; each P-segment is proved through the Chonk IVC and the tube.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -156,7 +158,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.5: tests | Native batch 6 proves two P-segments with real client proofs; 8 more adversarial tube witnesses (57 in all). |
 | P2.6: client-proof withdrawals | The tube opens a DA segment and withdraws under seg_trade's rules (shared `withdraw`), publishing the change entry and the withdrawal record. |
 | P2.6: tests | Native batch 6 withdraws by client proof; 3 more adversarial tube witnesses (60 in all). |
-| P2: next | C1 custody once the D7 token is specified; the client subtree; CancelAll, ModifyOrder, Transfer. |
+| P2.7: client subtree | `agg_app` checks each client VK's membership in the client subtree and outputs the VK tree root, which the tube binds to the configuration; `client_p256` for hardware P-256 keys. |
+| P2.7: tests | Native batch 6 aggregates proofs of both client circuits in one P-segment; 2 more adversarial tube witnesses (62 in all); VK substitution tests H and I for a rogue client circuit (9 in all). |
+| P2: next | C1 custody once the D7 token is specified; CancelAll, ModifyOrder, Transfer; WebAuthn passkeys. |
 
 ## Caveats
 
@@ -164,4 +168,4 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 - TXE does not prove, so the Bridge's TXE tests use a dummy root proof; the proof binding is tested in the end-to-end test.
 - Timings come from one laptop run each and are not benchmarks.
 - The local network's sequencer builds each block at the next slot, so the end-to-end test moves L2 time with the node's debug API instead of waiting.
-- The P-segment lane accepts one client circuit, the P0 circuit, pinned by constant, and executes only AddKey, RevokeKey and Withdraw.
+- The P-segment lane executes only AddKey, RevokeKey and Withdraw, and any client circuit in the subtree may authorize any of them. The P-256 circuit takes a raw digest, so it suits hardware keys but not yet WebAuthn passkeys.

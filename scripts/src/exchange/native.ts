@@ -8,6 +8,7 @@ import { type BatchWitness, type ProvedBatch, Prover, assert, executeBatch, fold
 import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
+import { p256Key } from './p256.ts';
 import * as M from './model.ts';
 import { genesisState, protocolAccounts, testParams } from './params.ts';
 import * as X from './rules.ts';
@@ -55,7 +56,7 @@ async function main() {
     return b;
   };
   const protocol = await protocolAccounts(h);
-  const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol, prover.clientVkHash);
+  const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), protocol, prover.clientVks);
   // Execute-only runs may use circuits newer than the manifest, so they check genesis directly.
   const genesis = EXECUTE_ONLY ? await genesisState(api, protocol) : { trees: BigInt(manifest.genesisTrees), stateRoot: BigInt(manifest.genesisStateRoot) };
   assert((await engine.trees()) === genesis.trees, 'engine genesis != manifest genesis');
@@ -267,26 +268,39 @@ async function main() {
   // P-segment, one proof revokes it and another withdraws 100,000. The engine refuses a proof
   // applied to Alice's account (lane S), a replayed nonce, a withdrawal any Schnorr key signs for
   // Grace's account, a proven withdrawal beyond her collateral, and the revoked key's next order.
+  // Heidi registers in lane P with a P-256 key (client_p256): her key grant is aggregated with
+  // Grace's in one P-segment, under the other client circuit, and she withdraws by P-256 proof.
   const grace = { secret: randomField(), addr: randomField(), keys: await keysFromSeed(h, 707n) };
   const G = 8n;
   const graceAuth = await M.masterAuthP(h, prover.clientVkHash, await M.authBinding(h, grace.secret));
   const graceEnc = await M.encCommitment(h, grace.keys.kEnc);
   engine.keyring.set(graceEnc, grace.keys.kEnc);
+  const heidi = { key: p256Key(), salt: randomField(), addr: randomField(), keys: await keysFromSeed(h, 808n) };
+  const Hd = 9n;
+  const heidiAuth = await M.masterAuthP(h, prover.clientVks.client_p256, await M.p256Binding(h, heidi.key.pk, heidi.salt));
+  const heidiEnc = await M.encCommitment(h, heidi.keys.kEnc);
+  engine.keyring.set(heidiEnc, heidi.keys.kEnc);
   await engine.beginBatch(6n, b5.end.priorityHead, b5.end.priorityCursor, b5.end.time);
   const t6 = now + 4000n;
   await engine.block(t6, [await update(0n, 1750n, 1750n, t6 - 1n)]);
   await engine.priority([
     { kind: M.KIND.REGISTER, a: graceAuth, b: graceEnc, sender: grace.addr, time: t6 },
     { kind: M.KIND.DEPOSIT, a: G, b: 500_000n, sender: grace.addr, time: t6 },
+    { kind: M.KIND.REGISTER, a: heidiAuth, b: heidiEnc, sender: heidi.addr, time: t6 },
+    { kind: M.KIND.DEPOSIT, a: Hd, b: 300_000n, sender: heidi.addr, time: t6 },
   ]);
-  netDeposits += 500_000n;
+  netDeposits += 800_000n;
   // The client proves each action; without proving, the actions carry only the proofs' public inputs.
   const byProof = (account: bigint, nonce: bigint, kind: bigint, p: bigint[]) =>
     proveAction(h, engine.domain, grace.secret, kind, account, nonce, p, EXECUTE_ONLY ? undefined : prover);
+  const byKey = (nonce: bigint, kind: bigint, p: bigint[]) =>
+    proveAction(h, engine.domain, { key: heidi.key, salt: heidi.salt }, kind, Hd, nonce, p, EXECUTE_ONLY ? undefined : prover);
+  const hSess = await keysFromSeed(h, 8008n);
   const gSess = await keysFromSeed(h, 7007n);
   const bySessG = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, gSess, kind, G, nonce, p, 0n);
   await engine.proven([
     await byProof(G, 1n, ADD_KEY, [0n, gSess.pk.x, gSess.pk.y, 0b0001n, 400_000n, t6 + 1000n]),
+    await byKey(1n, ADD_KEY, [5n, hSess.pk.x, hSess.pk.y, 0b0011n, 200_000n, t6 + 1000n]),
     await byProof(A, 7n, ADD_KEY, [1n, gSess.pk.x, gSess.pk.y, 0b0001n, 400_000n, t6 + 1000n]), // Alice's account is lane S
     await byProof(G, 1n, REVOKE_KEY, [0n]), // replayed nonce
   ]);
@@ -299,8 +313,9 @@ async function main() {
     await byProof(G, 2n, REVOKE_KEY, [0n]),
     await byProof(G, 3n, WITHDRAW, [100_000n, grace.addr]),
     await byProof(G, 4n, WITHDRAW, [10_000_000n, grace.addr]), // more than her collateral
+    await byKey(2n, WITHDRAW, [50_000n, heidi.addr]),
   ]);
-  netDeposits -= 100_000n;
+  netDeposits -= 150_000n;
   await engine.trade([await bySessG(2n, PLACE, [0n, BID, 1700n, 1n, GTC, 0n])]); // revoked
   const reasons6 = engine.rejected.slice(9).map((r) => r.reason);
   log(`engine refused: ${reasons6.join('; ')}`);
@@ -310,7 +325,8 @@ async function main() {
     'unexpected batch 6 rejections',
   );
   assert(engine.accts.get(G)!.priv.positions[0].size === 20n && engine.keyOf(G, 0).pkX === 0n && engine.actv.get(G)!.nonce === 3n, 'lane-P key grant, trade, revocation and withdrawal');
-  assert(engine.wdRecords.length === 1, 'the proven withdrawal is the batch\'s only record');
+  assert(engine.keyOf(Hd, 5).pkX === hSess.pk.x && engine.actv.get(Hd)!.nonce === 2n, 'P-256 key grant and withdrawal');
+  assert(engine.wdRecords.length === 2, 'the proven withdrawals are the batch\'s only records');
   await engine.maintenance({ sweep: true, refresh: 4 });
   checkConservation(engine, netDeposits, 'batch 6');
   const w6 = await engine.endBatch();
@@ -331,6 +347,8 @@ async function main() {
   }
   const graceOpened = await openAccount(h, rebuilt, grace.keys.kEnc, graceAuth);
   assert(graceOpened.index === G && show(graceOpened.priv) === show(engine.accts.get(G)!.priv), 'lane-P account opened from DA differs from the engine');
+  const heidiOpened = await openAccount(h, rebuilt, heidi.keys.kEnc, heidiAuth);
+  assert(heidiOpened.index === Hd && show(heidiOpened.priv) === show(engine.accts.get(Hd)!.priv), 'P-256 account opened from DA differs from the engine');
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);

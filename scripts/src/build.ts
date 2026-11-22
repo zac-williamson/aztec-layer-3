@@ -38,11 +38,12 @@ const ROLLUP = { scheme: 'ultra_honk', target: 'noir-rollup-no-zk' } as const;
 // `pinned` lists the hash names (from earlier steps) written into this package before it compiles.
 const STEPS: Step[] = [
   { pkg: 'client_auth', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
-  { pkg: 'agg_app', vk: { scheme: 'chonk', kind: 'app' }, pinned: ['CLIENT_VK_HASH'] },
+  { pkg: 'client_p256', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
+  { pkg: 'agg_app', vk: { scheme: 'chonk', kind: 'app' } },
   { pkg: 'init_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['AGG_APP_VK_HASH'] },
   { pkg: 'tail_kernel', vk: { scheme: 'chonk', kind: 'kernel' }, pinned: ['INIT_KERNEL_VK_HASH'] },
   { pkg: 'hiding_kernel', vk: { scheme: 'chonk', kind: 'hiding' }, pinned: ['TAIL_KERNEL_VK_HASH'] },
-  { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH', 'CLIENT_VK_HASH'] },
+  { pkg: 'tube', vk: ROLLUP, pinned: ['CHONK_VK_HASH'] },
   { pkg: 'padding', vk: ROLLUP },
   { pkg: 'seg_block', vk: ROLLUP },
   { pkg: 'seg_priority', vk: ROLLUP },
@@ -54,12 +55,14 @@ const STEPS: Step[] = [
   { pkg: 'root', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'rogue_app', vk: { scheme: 'chonk', kind: 'app' } },
   { pkg: 'rogue_segment', vk: ROLLUP },
-  { pkg: 'agg_ultra', vk: ROLLUP, pinned: ['CLIENT_VK_HASH'] },
+  { pkg: 'rogue_client', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
+  { pkg: 'agg_ultra', vk: ROLLUP },
 ];
 
 // The hash name each package's VK is published under.
 const PUBLISHES: Record<string, string> = {
   client_auth: 'CLIENT_VK_HASH',
+  client_p256: 'CLIENT_P256_VK_HASH',
   agg_app: 'AGG_APP_VK_HASH',
   init_kernel: 'INIT_KERNEL_VK_HASH',
   tail_kernel: 'TAIL_KERNEL_VK_HASH',
@@ -76,6 +79,7 @@ const PUBLISHES: Record<string, string> = {
   root: 'ROOT_VK_HASH',
   rogue_app: 'ROGUE_APP_VK_HASH',
   rogue_segment: 'ROGUE_SEGMENT_VK_HASH',
+  rogue_client: 'ROGUE_CLIENT_VK_HASH',
   agg_ultra: 'AGG_ULTRA_VK_HASH',
 };
 
@@ -84,6 +88,7 @@ const PUBLISHES: Record<string, string> = {
 const S = SHAPE.VK_ROLE_SLOTS;
 const VK_SLOTS: Record<string, number> = {
   client_auth: ROLE.CLIENT * S + 0,
+  client_p256: ROLE.CLIENT * S + 1,
   agg_app: ROLE.CHONK * S + 0,
   init_kernel: ROLE.CHONK * S + 1,
   tail_kernel: ROLE.CHONK * S + 2,
