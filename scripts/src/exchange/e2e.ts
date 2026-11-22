@@ -19,8 +19,8 @@
 //     seed, rebuilds the frozen accounts tree from the deployment event and the DA logs and opens
 //     the user's leaf. Each registers a claim valued at the frozen indices with funding accrued to
 //     the freeze; Alice's unprocessed deposit is refunded; after the claim window both withdraw.
-//     What remains in the vault is the fee account's balance plus funding rounding, which the
-//     protocol accounts claim later (not yet built).
+//     The operator then claims the fee account from the DA in the same way; it is paid only from
+//     the residual and only t_late after the window, which leaves the vault with funding rounding.
 //
 // Writes scripts/out/e2e.json.
 import { homedir } from 'node:os';
@@ -38,12 +38,14 @@ import * as X from './rules.ts';
 import { exitFromDa, withdrawalPath } from './exit.ts';
 import { keysFromSeed } from './grumpkin.ts';
 import * as M from './model.ts';
-import { protocolAccounts, testParams } from './params.ts';
+import { TEST_FEE_SEED, protocolAccounts, testParams } from './params.ts';
 
 const log = (m: string) => console.log(`[e2e] ${m}`);
 const T_FORCE = 3600n;
 const T_CLAIM = 86_400n;
 const REQUEST_FEE = 100n;
+const T_REFRESH = 14n * 86_400n;
+const T_LATE = 3600n;
 const ALICE_SEED = 0xa11cen;
 const BOB_SEED = 0xb0bn;
 
@@ -95,6 +97,8 @@ async function main() {
       token.address,
       T_FORCE,
       T_CLAIM,
+      T_REFRESH,
+      T_LATE,
       REQUEST_FEE,
       [operator, operator],
       protocol.map((p) => p.pub.masterAuth),
@@ -296,15 +300,30 @@ async function main() {
     assert(paid.alice === 5_000n + exits.alice.equity, `alice received ${paid.alice}`);
     assert(paid.bob === exits.bob.equity, `bob received ${paid.bob}`);
     // What remains is the fee account's swept balance plus the funding rounding the users' claims
-    // gave up (at most one unit per position): the protocol accounts' share, claimable later.
+    // gave up (at most one unit per position).
     const vault = await balance(bridge.address);
     const fees = engine.accts.get(M.FEE_INDEX)!.priv.collateral + engine.accts.get(M.INSURANCE_INDEX)!.priv.collateral;
     assert(vault >= fees && vault - fees <= 4n, `vault left with ${vault}, protocol balances ${fees}`);
     log(`alice received 5000 refund + ${exits.alice.equity}; bob received ${exits.bob.equity}; the vault keeps ${vault} (fees ${fees} + rounding)`);
+    // The operator claims the fee account from the DA like any user, and is paid last: only from
+    // the residual, and only t_late after the window (SPEC.md §12).
+    const feeExit = await exitFromDa(h, node, bridge.address, TEST_FEE_SEED, frozen);
+    assert(feeExit.index === M.FEE_INDEX && feeExit.equity === fees, `fee account claim ${feeExit.equity}`);
+    await asOf(operator)
+      .methods.exit_register(feeExit.index, operator, feeExit.pub.masterAuth, feeExit.pub.encCommitment, feeExit.pub.class, feeExit.plaintext, feeExit.path, feeExit.marketData)
+      .send({ from: operator, wait });
+    await (node as any).warpL2TimeAtLeastBy(Number(T_LATE + 60n));
+    const opBefore2 = await balance(operator);
+    await asOf(operator).methods.exit_withdraw(feeExit.index).send({ from: operator, wait });
+    const feePaid = (await balance(operator)) - opBefore2;
+    const residual = await balance(bridge.address);
+    assert(feePaid === fees && residual <= 4n, `fee account paid ${feePaid}, vault left with ${residual}`);
+    log(`after t_late the operator claimed the fee account's ${feePaid}; the vault keeps ${residual} of funding rounding`);
+    report.feeClaim = feePaid;
     report.exit = Object.fromEntries(
       Object.entries(exits).map(([k, e]) => [k, { batches: e.batches, ms: e.ms, positions: e.priv.positions, collateral: e.priv.collateral, equity: e.equity }]),
     );
-    report.vaultResidual = vault;
+    report.vaultResidual = residual;
     report.paid = paid;
     report.status = 'passed';
   } catch (e) {

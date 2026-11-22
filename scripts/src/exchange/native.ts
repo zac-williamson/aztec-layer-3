@@ -239,6 +239,9 @@ async function main() {
   log(`forced: carol withdrew ${forcedOut}; bob closed to ${engine.accts.get(B)!.priv.positions[0].size} in market 0; dave has ${engine.actv.get(D)!.openOrders} open orders`);
   assert(forcedOut > 0n && engine.accts.get(B)!.priv.positions[0].size === 0n && engine.actv.get(D)!.openOrders === 0n, 'forced requests');
   await engine.maintenance({ sweep: true, refresh: 4 });
+  // Eight accounts, four refreshed per batch from batch 2: the cursor wrapped in batches 3 and 5,
+  // so the current cycle began at batch 5's last block.
+  assert(engine.cycleStart === t5 + 10n && engine.refreshCursor === 0n, `cycle start ${engine.cycleStart}, cursor ${engine.refreshCursor}`);
   checkConservation(engine, netDeposits, 'batch 5');
   const w5 = await engine.endBatch();
   log(`batch 5: ${w5.segments.map((s) => s.label).join(' | ')}; ${w5.daPayload.length} DA fields`);

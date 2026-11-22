@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.7, 2026-11-21. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), and session keys, GTT orders and forced requests (P2.3), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.8, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), and refresh enforcement with the desert seniority rules (P2.4), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -821,8 +821,9 @@ P2 is built in increments, each leaving every test green.
 - P2.1: multiple markets, oracles with mark and funding ticks, fees, and the protocol accounts.
 - P2.2: liquidation and the insurance backstop.
 - P2.3: session keys, GTT orders and forced priority requests.
+- P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
 
-All three are built. Where they narrow the design, the full design remains normative.
+All four are built. Where they narrow the design, the full design remains normative.
 
 **State** (§6):
 
@@ -996,6 +997,37 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - a liquidation on a stale index.
 - `EXECUTE_ONLY=1 npm run native` executes every segment and compares it with the engine without proving, in about 10 s.
 
+**Refresh deadline** (P2.4, §9.5):
+
+- The state gains `cycle_start`: the L3 time at which the refresh cursor last wrapped past the last account, recorded by the maintenance segment at the wrap. The batch header carries it, so `HEADER_LEN` is now 18.
+- The Bridge requires, for every batch:
+  - `cycle_start` never decreases;
+  - it is no later than the batch's `max_time`;
+  - `max_time ≤ max(cycle_start, deployment time) + t_refresh`.
+- So every batch ends within `t_refresh` of the start of the current cycle. An operator who falls behind must complete the cycle in its next batch, and missing the deadline halts settlement, after which desert mode follows its usual course.
+- Each account's latest refresh entry is therefore at most two windows old. The cycle it belongs to began within `t_refresh` of the last settled batch, and it took up to one more window to complete.
+- A first version counted completed cycles and restarted the clock at the start of a completing batch. It was replaced, because a batch's start says nothing about when within it the cursor wrapped: for a first batch it is L3 time 0, and after a halt it is the pre-halt time.
+- `t_refresh` is set at deployment and must leave a margin below the DA's retention (§9.5).
+
+**Desert claims** (P2.4, §12):
+
+- An account may register its claim after the window closes (a late claim). The protocol accounts may register too.
+- Claims registered within the window share `min(1, V/U)` as before, and the ratio is 1 if no claim was registered in the window. `V` is the vault less the senior obligations when the ratio is fixed, at the first payout. `U` is the total of the window's claims.
+- Late claims and protocol claims are paid `min(ratio·equity, residual)`. The residual is the vault less the senior obligations and less what the window's claims are still owed. A late claim can therefore never take from a window claim.
+- Protocol claims are payable only `t_late` after the window closes, and `t_late` is set at deployment (default one year). Triggering desert mode cannot profit the operator.
+
+**Tests** (P2.4):
+
+- **TXE**, 57 tests:
+  - a late claim paid from the residual;
+  - a late claim that gets nothing while a window claim reserves the vault;
+  - a protocol claim refused before `t_late` and paid from the residual after it;
+  - a refresh-overdue batch rejected;
+  - a completed cycle restarting the clock at the wrap;
+  - a cycle that starts after its batch, or goes backwards, rejected.
+- **Native:** the five batches wrap the refresh cursor twice, and the last wrap's time is the cycle start.
+- **Exit test:** after the users exit, the operator opens the fee account from the DA like any user and claims it. It is paid after `t_late`, which leaves the vault holding only funding rounding.
+
 **Tests** (P2.3):
 
 - **Native**, batch 5:
@@ -1013,9 +1045,8 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments:**
 
-1. P2.4: refresh-rate enforcement, late desert claims and protocol-account seniority.
-2. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
-3. C1 custody (§10.3), once the D7 token is specified.
+1. P2.5: receipts and accountability (§11), and client-proof actions (§7.4).
+2. C1 custody (§10.3), once the D7 token is specified.
 
 ## 16. Decisions
 

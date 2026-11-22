@@ -20,7 +20,7 @@ pub global CHONK_PROOF_LENGTH: u32 = 1221;
 pub global MAX_CLIENT_PROOFS: u32 = 10;
 pub global CLIENT_PUBLIC_INPUTS: u32 = 3;
 pub global MAX_PRIORITY: u32 = 8;
-pub global HEADER_LEN: u32 = 17;
+pub global HEADER_LEN: u32 = 18;
 /// DA fields one settlement carries. Aztec allows FLAT_PUBLIC_LOGS_PAYLOAD_LENGTH = 4096 fields of
 /// public logs per transaction, each log costing 2 header fields. The Bridge emits the DA log
 /// (2 + tag + payload) and the BatchSettled event (2 + tag + 5), leaving 4085; 4080 keeps slack.
@@ -167,6 +167,9 @@ pub struct BatchHeader {
     pub da_hash: Field,
     pub market_data_hash: Field,
     pub config_hash: Field,
+    /// L3 time at which the current refresh cycle began, the last time the refresh cursor wrapped
+    /// (SPEC.md §9.5). The Bridge requires every batch to end within the refresh window of it.
+    pub cycle_start: u64,
 }
 
 fn to_u64_checked(x: Field) -> u64 {
@@ -195,6 +198,7 @@ impl BatchHeader {
             self.da_hash,
             self.market_data_hash,
             self.config_hash,
+            self.cycle_start as Field,
         ]
     }
 
@@ -217,6 +221,7 @@ impl BatchHeader {
             da_hash: f[14],
             market_data_hash: f[15],
             config_hash: f[16],
+            cycle_start: to_u64_checked(f[17]),
         }
     }
 
@@ -225,7 +230,7 @@ impl BatchHeader {
         hash(
             [
                 DS_HEADER, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
-                f[12], f[13], f[14], f[15], f[16],
+                f[12], f[13], f[14], f[15], f[16], f[17],
             ],
         )
     }
@@ -310,6 +315,7 @@ fn test_header_roundtrip() {
         da_hash: 14,
         market_data_hash: 15,
         config_hash: 16,
+        cycle_start: 18,
     };
     let g = BatchHeader::from_fields(h.to_fields());
     assert(g.hash() == h.hash());

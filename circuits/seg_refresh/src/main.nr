@@ -28,9 +28,9 @@ struct Item {
 /// out of every trade's witness (SPEC.md §8.8).
 ///
 /// It then republishes the next `n` accounts after refresh_cursor, in index order and wrapping
-/// around, each as its unchanged leaf with the full opening encrypted under a fresh keystream. Run
-/// often enough, refresh makes the DA of the last window W sufficient to rebuild every account,
-/// active or not.
+/// around, each as its unchanged leaf with the full opening encrypted under a fresh keystream, and
+/// records the L3 time whenever the cursor wraps. The Bridge requires every batch to end within the
+/// refresh window W of the last wrap, so the DA of the last W rebuilds every account, active or not.
 fn main(
     vk_tree_root: Field,
     params: Params,
@@ -78,7 +78,14 @@ fn main(
             assert(merkle_root(DS_ACCT_NODE, leaf, cursor, w.path) == st.accounts_root, "account path");
             assert(enc_commitment(w.k_enc) == w.pub_part.enc_commitment, "k_enc does not open the commitment");
             end = emit_full(end, TAG_REFRESH, cursor, leaf, w.pub_part, w.priv_part, w.k_enc, da_nonce);
-            cursor = if cursor + 1 == st.num_accounts { 0 } else { cursor + 1 };
+            if cursor + 1 == st.num_accounts {
+                // The cycle is complete: every account has a refresh entry since the last wrap, and
+                // the next cycle starts now.
+                cursor = 0;
+                st.cycle_start = end.time;
+            } else {
+                cursor += 1;
+            }
         }
     }
     st.refresh_cursor = cursor;

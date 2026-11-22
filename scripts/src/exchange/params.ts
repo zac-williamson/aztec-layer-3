@@ -87,6 +87,7 @@ export async function genesisState(api: Barretenberg, protocol?: ProtocolAccount
     activityRoot: activity.root,
     markets: Array.from({ length: M.MARKETS }, () => M.genesisMarket(book.root)),
     refreshCursor: 0n,
+    cycleStart: 0n,
     numAccounts: BigInt(accts.length),
     feesPending: 0n,
     insurancePending: 0n,

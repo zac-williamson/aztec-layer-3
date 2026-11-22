@@ -75,6 +75,7 @@ fn main(
         da_hash: da_finalize(e.da, e.da_len),
         market_data_hash: market_data_hash(market_data(end_state.markets)),
         config_hash: config,
+        cycle_start: end_state.cycle_start,
     };
     header.hash()
 }

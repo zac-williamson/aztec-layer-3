@@ -22,6 +22,8 @@ global CONFIG: Field = 0x5678;
 global T_FORCE: u64 = 1000;
 global T_CLAIM: u64 = 500;
 global REQUEST_FEE: u128 = 25;
+global T_REFRESH: u64 = 100_000;
+global T_LATE: u64 = 300;
 global T_LAG: u64 = 15 * 60;
 global UPGRADE_DELAY: u64 = 21 * 24 * 60 * 60;
 global TEST_DA_LEN: u32 = 8;
@@ -65,6 +67,8 @@ unconstrained fn setup() -> Env {
             token,
             T_FORCE,
             T_CLAIM,
+            T_REFRESH,
+            T_LATE,
             REQUEST_FEE,
             [operator, operator],
             PROTOCOL_MAUTH,
@@ -113,6 +117,7 @@ unconstrained fn next_header(e: Env, now: u64, consume: u64) -> BatchHeader {
     let (state_root, accounts_root, batch_number, last_time, cursor, _) = tip(e);
     let (head_start, _, _) = e.env.view_public(L3XBridge::at(e.bridge).get_priority(cursor));
     let (head_end, _, _) = e.env.view_public(L3XBridge::at(e.bridge).get_priority(cursor + consume));
+    let (cycle_start, _) = e.env.view_public(L3XBridge::at(e.bridge).get_refresh());
     BatchHeader {
         prev_state_root: state_root,
         new_state_root: state_root + 1,
@@ -131,6 +136,7 @@ unconstrained fn next_header(e: Env, now: u64, consume: u64) -> BatchHeader {
         da_hash: da_hash_flat(payload(), TEST_DA_LEN),
         market_data_hash: market_data_hash(md(PRICE, now, 0)),
         config_hash: CONFIG,
+        cycle_start,
     }
 }
 
@@ -599,12 +605,140 @@ unconstrained fn desert_accrues_funding_to_the_freeze() {
     assert(total == 250);
 }
 
-#[test(should_fail_with = "protocol accounts claim from the residual")]
+#[test(should_fail_with = "protocol accounts are paid after t_late")]
 unconstrained fn desert_defers_protocol_accounts() {
     let (e, pubv, privv, path) = desert_world_with(1000, Position::empty(), CLASS_INSURANCE, 0);
     let (_, _, _, settled_time, _, _) = tip(e);
     activate(e);
     exit_register(e, pubv, privv, path, PRICE, settled_time);
+    e.env.advance_next_block_timestamp_by(T_CLAIM + 10);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
+}
+
+#[test]
+unconstrained fn desert_pays_protocol_accounts_after_t_late() {
+    let (e, pubv, privv, path) = desert_world_with(1000, Position::empty(), CLASS_INSURANCE, 0);
+    let (_, _, _, settled_time, _, _) = tip(e);
+    activate(e);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).desert_refund(1, 0, 50, e.alice));
+    exit_register(e, pubv, privv, path, PRICE, settled_time);
+    e.env.advance_next_block_timestamp_by(T_CLAIM + T_LATE + 10);
+    let before = balance(e, e.alice);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
+    // The protocol account's claim is paid from the residual: here the whole vault.
+    assert(balance(e, e.alice) == before + 1000);
+    assert(balance(e, e.bridge) == 0);
+}
+
+#[test]
+unconstrained fn desert_late_claim_paid_from_the_residual() {
+    let (e, pubv, privv, path) = desert_world(1000, 0, 0);
+    let (_, _, _, settled_time, _, _) = tip(e);
+    activate(e);
+    // Registered after the window: no window claims, so the ratio is 1 and the residual pays it,
+    // after the unprocessed deposit's refund, which stays reserved.
+    e.env.advance_next_block_timestamp_by(T_CLAIM + 10);
+    exit_register(e, pubv, privv, path, PRICE, settled_time);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
+    assert(balance(e, e.alice) == 10_000 - 1050 + 1000);
+    assert(balance(e, e.bridge) == 50);
+}
+
+#[test]
+unconstrained fn desert_late_claim_waits_for_window_claims() {
+    // Alice (index 0, 1000) claims in the window; Bob (index 1, 500) registers late and withdraws
+    // first. The window claim reserves the whole vault after the refund, so Bob gets nothing.
+    let e = setup();
+    let alice_pub = AccountPub { owner: e.alice.to_field(), master_auth: master_auth_of(1, 2), enc_commitment: enc_commitment(3), class: CLASS_USER };
+    let bob_pub = AccountPub { owner: e.bob.to_field(), master_auth: master_auth_of(4, 5), enc_commitment: enc_commitment(6), class: CLASS_USER };
+    let mut alice_priv = AccountPriv::empty(0x77);
+    alice_priv.collateral = 1000;
+    let mut bob_priv = AccountPriv::empty(0x78);
+    bob_priv.collateral = 500;
+    let leaf0 = account_leaf(alice_pub, alice_priv);
+    let leaf1 = account_leaf(bob_pub, bob_priv);
+    let mut path0: [Field; ACCOUNTS_HEIGHT] = [0; ACCOUNTS_HEIGHT];
+    let mut empty = 0;
+    for i in 0..ACCOUNTS_HEIGHT {
+        path0[i] = empty;
+        empty = hash([DS_ACCT_NODE, empty, empty]);
+    }
+    let mut path1 = path0;
+    path0[0] = leaf1;
+    path1[0] = leaf0;
+    let root = merkle_root(DS_ACCT_NODE, leaf0, 0, path0);
+    deposit(e, e.alice, 0, 1000);
+    let now = now_plus(e, 10);
+    let mut h = next_header(e, now, 1);
+    h.new_accounts_root = root;
+    settle(e, e.operator, h, now);
+    deposit(e, e.alice, 0, 50);
+    activate(e);
+    let data = md(PRICE, now, 0);
+    let _ = e.env.call_public(
+        e.bob,
+        L3XBridge::at(e.bridge).exit_register(0, e.alice, alice_pub.master_auth, alice_pub.enc_commitment, CLASS_USER, alice_priv.plaintext(), path0, data),
+    );
+    e.env.advance_next_block_timestamp_by(T_CLAIM + 10);
+    let _ = e.env.call_public(
+        e.bob,
+        L3XBridge::at(e.bridge).exit_register(1, e.bob, bob_pub.master_auth, bob_pub.enc_commitment, CLASS_USER, bob_priv.plaintext(), path1, data),
+    );
+    let bob_before = balance(e, e.bob);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(1));
+    assert(balance(e, e.bob) == bob_before);
+    let alice_before = balance(e, e.alice);
+    let _ = e.env.call_public(e.bob, L3XBridge::at(e.bridge).exit_withdraw(0));
+    assert(balance(e, e.alice) == alice_before + 1000);
+}
+
+// ---- Refresh deadline (SPEC.md §9.5) ----
+
+#[test(should_fail_with = "refresh overdue")]
+unconstrained fn refresh_overdue_blocks_settlement() {
+    let e = setup();
+    let now = now_plus(e, T_REFRESH + 10);
+    settle(e, e.operator, next_header(e, now, 0), now);
+}
+
+#[test]
+unconstrained fn completing_the_refresh_cycle_restarts_the_clock() {
+    let e = setup();
+    let now = now_plus(e, 10);
+    settle(e, e.operator, next_header(e, now, 0), now);
+    // Past the deadline, a batch whose refresh cursor wraps settles and restarts the clock at the
+    // L3 time of the wrap.
+    let later = now_plus(e, T_REFRESH + 10);
+    let mut h = next_header(e, later, 0);
+    h.cycle_start = later;
+    settle(e, e.operator, h, later);
+    let (start, _) = e.env.view_public(L3XBridge::at(e.bridge).get_refresh());
+    assert(start == later);
+    // The next batch is inside the new window.
+    let next = now_plus(e, 10);
+    settle(e, e.operator, next_header(e, next, 0), next);
+}
+
+#[test(should_fail_with = "refresh cycle starts after its batch")]
+unconstrained fn refresh_cycle_cannot_start_after_its_batch() {
+    let e = setup();
+    let now = now_plus(e, 10);
+    let mut h = next_header(e, now, 0);
+    h.cycle_start = now + 1;
+    settle(e, e.operator, h, now);
+}
+
+#[test(should_fail_with = "refresh cycle regressed")]
+unconstrained fn refresh_cycle_cannot_regress() {
+    let e = setup();
+    let now = now_plus(e, 10);
+    let mut h = next_header(e, now, 0);
+    h.cycle_start = now;
+    settle(e, e.operator, h, now);
+    let later = now_plus(e, 10);
+    let mut g = next_header(e, later, 0);
+    g.cycle_start = now - 5;
+    settle(e, e.operator, g, later);
 }
 
 #[test(should_fail_with = "no priority request is overdue")]
@@ -690,8 +824,11 @@ unconstrained fn upgrade_takes_effect_only_after_delay() {
     e.env.mine_block();
     let (_, root_vk, config) = e.env.view_public(L3XBridge::at(e.bridge).get_config());
     assert((root_vk, config) == (ROOT_VK, CONFIG));
+    // Past the refresh window, the first batch must complete a refresh cycle.
     let now = now_plus(e, 10);
-    settle(e, e.operator, next_header(e, now, 0), now);
+    let mut first = next_header(e, now, 0);
+    first.cycle_start = now;
+    settle(e, e.operator, first, now);
     e.env.advance_next_block_timestamp_by(120);
     e.env.mine_block();
     let (_, root_vk, config) = e.env.view_public(L3XBridge::at(e.bridge).get_config());
@@ -737,8 +874,11 @@ unconstrained fn operator_change_is_delayed() {
     e.env.mine_block();
     let (current, _, _) = e.env.view_public(L3XBridge::at(e.bridge).get_config());
     assert(current == e.bob);
+    // Past the refresh window, the first batch must complete a refresh cycle.
     let now = now_plus(e, 10);
-    settle(e, e.bob, next_header(e, now, 0), now);
+    let mut h = next_header(e, now, 0);
+    h.cycle_start = now;
+    settle(e, e.bob, h, now);
 }
 
 #[test(should_fail_with = "not operator")]

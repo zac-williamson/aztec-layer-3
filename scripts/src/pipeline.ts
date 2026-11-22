@@ -375,6 +375,8 @@ export type BatchWitness = {
   /** The state at the end of the batch, as Noir input, and the header values it determines. */
   endState: unknown;
   endAccountsRoot: bigint;
+  /** L3 time at which the current refresh cycle began (SPEC.md §9.5). */
+  cycleStart: bigint;
   /** Every market's public data (SPEC.md §8.4) and its hash, which the header carries. */
   marketData: bigint[];
   marketDataHash: bigint;
@@ -507,6 +509,7 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
     await daFinalize(api, e.da, e.daLen),
     w.marketDataHash,
     prover.configHash,
+    w.cycleStart,
   ];
   const headerHash = await l3xHash(api, [DS.HEADER, ...header]);
   assert(headerHash === root.headerHash, 'TS header hash != root circuit output');

@@ -144,13 +144,17 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        t_refresh: u64,
+        t_late: u64,
         request_fee: u128,
+        deployed_at: u64,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
         protocol_enc_commitments: [Field; PROTOCOL_ACCOUNTS],
     }
 
-    /// The exchange tip, the priority cursor and count, and settled but unpaid withdrawals.
+    /// The exchange tip, the priority cursor and count, settled but unpaid withdrawals, and the L3
+    /// time at which the current refresh cycle began.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Tip {
         state_root: Field,
@@ -161,6 +165,7 @@ pub contract L3XBridge {
         priority_cursor: u64,
         priority_count: u64,
         withdrawals_owed: u128,
+        cycle_start: u64,
     }
 
     /// Priority queue slot n: the hash-chain head after n entries (zero for n = 0), entry n and its
@@ -179,8 +184,9 @@ pub contract L3XBridge {
         time: u64,
     }
 
-    /// Desert mode (SPEC.md §12): frozen values, the claim window, and the payout ratio
-    /// payout_num / payout_den, fixed at the first payout after the window closes.
+    /// Desert mode (SPEC.md §12): frozen values, the claim window, the total of claims registered
+    /// in the window, the payout ratio payout_num / payout_den fixed at the first payout after the
+    /// window closes, and what the window's claims are still owed at that ratio.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Desert {
         active: bool,
@@ -191,12 +197,17 @@ pub contract L3XBridge {
         total_claims: u128,
         payout_num: u128,
         payout_den: u128,
+        window_owed: u128,
     }
 
+    /// An account's exit claim. `late` claims were registered after the window; `protocol`
+    /// claims belong to the insurance or fee account.
     #[derive(Deserialize, Eq, Packable, Serialize)]
     pub struct Claim {
         registered: bool,
         paid: bool,
+        late: bool,
+        protocol: bool,
         equity: u128,
         owner: AztecAddress,
     }
@@ -228,6 +239,8 @@ pub contract L3XBridge {
         token: AztecAddress,
         t_force: u64,
         t_claim: u64,
+        t_refresh: u64,
+        t_late: u64,
         request_fee: u128,
         protocol_owners: [AztecAddress; PROTOCOL_ACCOUNTS],
         protocol_master_auths: [Field; PROTOCOL_ACCOUNTS],
@@ -241,7 +254,10 @@ pub contract L3XBridge {
                 token,
                 t_force,
                 t_claim,
+                t_refresh,
+                t_late,
                 request_fee,
+                deployed_at: self.context.timestamp(),
                 protocol_owners,
                 protocol_master_auths,
                 protocol_enc_commitments,
@@ -274,6 +290,7 @@ pub contract L3XBridge {
                 priority_cursor: 0,
                 priority_count: 0,
                 withdrawals_owed: 0,
+                cycle_start: 0,
             },
         );
     }
@@ -425,6 +442,16 @@ pub contract L3XBridge {
         assert(h.max_time <= now, "batch time in the future");
         assert(h.max_time + T_LAG >= now, "batch time lags Aztec time");
 
+        // 5. Refresh (SPEC.md §9.5): every batch ends within t_refresh of the current refresh
+        // cycle's start, the L3 time the refresh cursor last wrapped (the deployment, before the
+        // first wrap). An operator who falls behind must complete a cycle in its next batch.
+        assert(h.cycle_start >= tip.cycle_start, "refresh cycle regressed");
+        assert(h.cycle_start <= h.max_time, "refresh cycle starts after its batch");
+        let config = self.storage.config.read();
+        let cycle_start = if h.cycle_start > config.deployed_at { h.cycle_start } else { config.deployed_at };
+        assert(h.max_time <= cycle_start + config.t_refresh, "refresh overdue");
+        tip.cycle_start = h.cycle_start;
+
         tip.state_root = h.new_state_root;
         tip.accounts_root = h.new_accounts_root;
         tip.batch_number = batch_number;
@@ -435,7 +462,7 @@ pub contract L3XBridge {
         self.storage.tip.write(tip);
         self.storage.settled.at(batch_number).write(Settled { withdrawals_root: h.withdrawals_root, time: now });
 
-        // 5. Mode R DA (SPEC.md §9.5): [DA_LOG_TAG, batch_number, payload[0..da_len]].
+        // 6. Mode R DA (SPEC.md §9.5): [DA_LOG_TAG, batch_number, payload[0..da_len]].
         let mut log = [DA_LOG_TAG, batch_number as Field].as_vector();
         for i in 0..da_len {
             log = log.push_back(da_payload[i]);
@@ -534,11 +561,12 @@ pub contract L3XBridge {
         self.call(L3XToken::at(self.storage.config.read().token).transfer(depositor, amount));
     }
 
-    /// Registers a user account's exit claim from its leaf in the frozen accounts root. Positions are
-    /// valued at the frozen index prices, with funding accrued to the frozen cumulative indices;
-    /// negative equity counts as zero. The claim pays only the leaf's owner. The opening comes from
-    /// the account's DA entries (SPEC.md §9.5) and the market data from the last BatchSettled event.
-    /// Protocol accounts are paid last, from the residual (SPEC.md §12; not yet built).
+    /// Registers an account's exit claim from its leaf in the frozen accounts root (SPEC.md §12).
+    /// Positions are valued at the frozen index prices, with funding accrued to the frozen
+    /// cumulative indices; negative equity counts as zero. The claim pays only the leaf's owner.
+    /// The opening comes from the account's DA entries (SPEC.md §9.5) and the market data from the
+    /// last BatchSettled event. A user claim registered within the window shares the vault pro
+    /// rata; a later one, and any protocol account's, is paid from the residual.
     #[external("public")]
     fn exit_register(
         account_index: u32,
@@ -552,9 +580,9 @@ pub contract L3XBridge {
     ) {
         let mut d = self.storage.desert.read();
         assert(d.active, "not in desert mode");
-        assert(self.context.timestamp() <= d.claim_close, "claim window closed");
         assert(market_data_hash(market_data) == d.market_data_hash, "market data");
-        assert(class == CLASS_USER, "protocol accounts claim from the residual");
+        let late = self.context.timestamp() > d.claim_close;
+        let protocol = class != CLASS_USER;
         let pubv = AccountPub { owner: owner.to_field(), master_auth, enc_commitment: enc_key_commitment, class };
         let privv = from_plaintext(plaintext);
         assert(
@@ -566,33 +594,61 @@ pub contract L3XBridge {
         let equity = equity_at(privv, prices, cums);
         let value: u128 = if equity > 0 { (equity as u64) as u128 } else { 0 };
         self.storage.claims.at(account_index).write(
-            Claim { registered: true, paid: false, equity: value, owner },
+            Claim { registered: true, paid: false, late, protocol, equity: value, owner },
         );
-        d.total_claims += value;
-        self.storage.desert.write(d);
+        if !late & !protocol {
+            d.total_claims += value;
+            self.storage.desert.write(d);
+        }
         self.emit(ExitClaimed { account_index, owner, equity: value });
     }
 
-    /// After the claim window, pays a registered claim to its owner at min(1, V/U), where V is the
-    /// vault less the senior obligations (unpaid withdrawals and refunds) and U the total claims.
+    /// After the claim window, pays a registered claim to its owner (SPEC.md §12).
+    /// - A window claim gets min(1, V/U) of its equity, where V is the vault less the senior
+    ///   obligations (unpaid withdrawals and refunds) when the ratio is fixed, at the first payout,
+    ///   and U the window's total claims.
+    /// - A late claim gets the same ratio at best, paid from the residual: the vault less the
+    ///   senior obligations and what the window's claims are still owed.
+    /// - A protocol account's claim is paid the same way, and only t_late after the window, so
+    ///   triggering desert mode cannot profit the operator.
     #[external("public")]
     fn exit_withdraw(account_index: u32) {
         let mut d = self.storage.desert.read();
         assert(d.active, "not in desert mode");
-        assert(self.context.timestamp() > d.claim_close, "claim window still open");
+        let now = self.context.timestamp();
+        assert(now > d.claim_close, "claim window still open");
         let mut claim = self.storage.claims.at(account_index).read();
         assert(claim.registered, "no claim");
         assert(!claim.paid, "already paid");
-        let token = self.storage.config.read().token;
-        if d.payout_den == 0 {
-            let vault = self.view(L3XToken::at(token).balance_of(self.address));
-            let senior = self.storage.tip.read().withdrawals_owed + d.refunds_owed;
-            let v = if vault > senior { vault - senior } else { 0 };
-            d.payout_num = if v < d.total_claims { v } else { d.total_claims };
-            d.payout_den = if d.total_claims == 0 { 1 } else { d.total_claims };
-            self.storage.desert.write(d);
+        let config = self.storage.config.read();
+        if claim.protocol {
+            assert(now > d.claim_close + config.t_late, "protocol accounts are paid after t_late");
         }
-        let amount = claim.equity * d.payout_num / d.payout_den;
+        let token = config.token;
+        let vault = self.view(L3XToken::at(token).balance_of(self.address));
+        let senior = self.storage.tip.read().withdrawals_owed + d.refunds_owed;
+        if d.payout_den == 0 {
+            // ratio = min(1, V/U), and 1 when no claim was registered in the window.
+            let v = if vault > senior { vault - senior } else { 0 };
+            if d.total_claims == 0 {
+                d.payout_num = 1;
+                d.payout_den = 1;
+            } else {
+                d.payout_num = if v < d.total_claims { v } else { d.total_claims };
+                d.payout_den = d.total_claims;
+            }
+            d.window_owed = d.total_claims * d.payout_num / d.payout_den;
+        }
+        let pay = claim.equity * d.payout_num / d.payout_den;
+        let amount = if !claim.late & !claim.protocol {
+            d.window_owed = if d.window_owed > pay { d.window_owed - pay } else { 0 };
+            pay
+        } else {
+            let reserved = senior + d.window_owed;
+            let residual = if vault > reserved { vault - reserved } else { 0 };
+            if pay < residual { pay } else { residual }
+        };
+        self.storage.desert.write(d);
         claim.paid = true;
         self.storage.claims.at(account_index).write(claim);
         self.call(L3XToken::at(token).transfer(claim.owner, amount));
@@ -666,6 +722,13 @@ pub contract L3XBridge {
             if root_vk == 0 { genesis.genesis_root_vk_hash } else { root_vk },
             if config == 0 { genesis.genesis_config_hash } else { config },
         )
+    }
+
+    /// (L3 time the current refresh cycle began, deployment time).
+    #[external("public")]
+    #[view]
+    fn get_refresh() -> (u64, u64) {
+        (self.storage.tip.read().cycle_start, self.storage.config.read().deployed_at)
     }
 
     /// (active, frozen accounts root, frozen market data hash, claim close, total claims).

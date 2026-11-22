@@ -18,6 +18,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
   - The waterfall: cancel the account's orders, close against the book within a ratio-preserving limit, insurance takeover lowest PnL first, deficit absorption.
   - Auto-deleveraging at the bankruptcy price once the insurance account cannot absorb a position.
 - **P2.3**: session keys scoped by market, notional cap and expiry; GTT orders, removed when matching meets them expired; forced withdrawals, closes and cancellations submitted through the Bridge.
+- **P2.4**: a refresh deadline the Bridge enforces, late desert claims paid from the residual, and protocol accounts paid last, after `t_late`.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -142,7 +143,9 @@ P0 is complete, P1 is built, and P2 is in progress (SPEC.md §15 has the profile
 | P2.2: tests | Both liquidation waterfalls proved in the native run; 11 more adversarial witnesses (36 in all). |
 | P2.3: keys, GTT, forced requests | Session keys (256 slots, scoped by markets, notional and expiry, nonces never reset); GTT orders; forced withdraw, close and cancel-all through `Bridge.submit_forced`, consumed without effect unless valid and from the owner. |
 | P2.3: tests | Native batch 5; 11 more adversarial witnesses (47); 50 TXE tests; a forced withdrawal through the Bridge in the exit test. |
-| P2: next | P2.4 refresh-rate enforcement, late desert claims, protocol-account seniority; P2.5 receipts, client-proof actions; C1 custody once the D7 token is specified. |
+| P2.4: refresh, desert seniority | The Bridge rejects batches past the refresh deadline unless they complete a refresh cycle; late claims and protocol claims are paid from the residual at no better than the window ratio, protocol claims only after `t_late`. |
+| P2.4: tests | 57 TXE tests; the exit test's operator claims the fee account after `t_late`, leaving only funding rounding in the vault. |
+| P2: next | P2.5 receipts and accountability, client-proof actions; C1 custody once the D7 token is specified. |
 
 ## Caveats
 

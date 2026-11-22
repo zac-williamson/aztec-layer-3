@@ -60,6 +60,8 @@ export class Engine {
   actv = new Map<bigint, M.Activity>();
   markets: M.Market[] = [];
   refreshCursor = 0n;
+  /** L3 time at which the refresh cursor last wrapped (SPEC.md §9.5). */
+  cycleStart = 0n;
   numAccounts = 0n;
   feesPending = 0n;
   insurancePending = 0n;
@@ -125,6 +127,7 @@ export class Engine {
       activityRoot: this.activity.root,
       markets: this.markets.map((m, i) => ({ ...m, bookRoot: this.books[i].root })),
       refreshCursor: this.refreshCursor,
+      cycleStart: this.cycleStart,
       numAccounts: this.numAccounts,
       feesPending: this.feesPending,
       insurancePending: this.insurancePending,
@@ -154,6 +157,7 @@ export class Engine {
       segments: this.segments,
       endState: M.stateToNoir(st),
       endAccountsRoot: st.accountsRoot,
+      cycleStart: st.cycleStart,
       marketData,
       marketDataHash: await M.marketDataHash(this.h, marketData),
       withdrawalRecords: [...this.wdRecords],
@@ -591,7 +595,12 @@ export class Engine {
       items.push(this.refreshItem(rec));
       await this.emitFull(M.TAG.REFRESH, rec, await M.accountLeaf(this.h, rec.pub, rec.priv), daNonce);
       indices.push(rec.index);
-      this.refreshCursor = rec.index + 1n === this.numAccounts ? 0n : rec.index + 1n;
+      if (rec.index + 1n === this.numAccounts) {
+        this.refreshCursor = 0n;
+        this.cycleStart = this.running.time;
+      } else {
+        this.refreshCursor = rec.index + 1n;
+      }
     }
     const label = [opts.sweep ? `sweep (${swept.join(', ')})` : '', n ? `refresh [${indices.join(', ')}]` : ''].filter(Boolean).join(', ');
     await this.finishSegment('seg_refresh', label || 'maintenance', {
