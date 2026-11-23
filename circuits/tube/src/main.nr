@@ -115,7 +115,7 @@ fn apply(state: State, running: Running, a: ClientAction, domain: Field, da_nonc
     let mut act = a.actv;
     act.nonce = a.nonce;
     if is_key {
-        act.keys_root = write_key_slot(a.actv.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p);
+        act.keys_root = write_key_slot(a.actv.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p, a.actv.key_epoch);
     } else {
         let (leaf, r2) = withdraw(r, st.markets, params, idx, a.acct_pub, a.acct_priv, a.actv, a.k_enc, a.p, da_nonce);
         new_leaf = leaf;

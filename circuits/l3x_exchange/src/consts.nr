@@ -71,6 +71,10 @@ pub global KIND_FORCED_WITHDRAW: Field = 3;
 pub global KIND_FORCED_CLOSE: Field = 4;
 /// Cancel up to FORCED_CANCELS of the account's orders.
 pub global KIND_FORCED_CANCEL_ALL: Field = 5;
+/// The owner's rekey: b = new master authorization, c = new encryption-key commitment. The Bridge
+/// delivered the new key to the operator; the rekey revokes every session key and cancels every
+/// order.
+pub global KIND_REKEY: Field = 6;
 
 // Action-log entry kinds.
 pub global LOG_PRIORITY: Field = 1;

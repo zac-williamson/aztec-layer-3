@@ -142,6 +142,7 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
         assert_signed(a.pk_x, a.pk_y, a.sig, msg);
         assert(a.key.nonce + 1 == a.nonce, "nonce");
         assert(running.time <= a.key.expiry, "session key expired");
+        assert(a.key.epoch == a.taker_actv.key_epoch, "session key revoked by a rekey");
         assert(
             (a.kind == KIND_PLACE) | (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) | (a.kind == KIND_CANCEL_ALL)
                 | (a.kind == KIND_PLACE_TRIGGER)
@@ -189,7 +190,7 @@ fn set_key(state: State, a: Action, act_auth: Activity) -> State {
     let leaf = account_leaf(a.taker_pub, a.taker_priv);
     st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, leaf, leaf, a.taker_acct_path);
     let mut act = act_auth;
-    act.keys_root = write_key_slot(act_auth.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p);
+    act.keys_root = write_key_slot(act_auth.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p, act_auth.key_epoch);
     st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     st
 }
@@ -431,11 +432,7 @@ fn cancel_all(state: State, a: Action, act_auth: Activity) -> State {
     let mut st = state;
     let leaf = account_leaf(a.taker_pub, a.taker_priv);
     st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, a.account_index, leaf, leaf, a.taker_acct_path);
-    let mut act = act_auth;
-    act.epoch = act_auth.epoch + 1;
-    act.open_orders = 0;
-    act.open_bid = [0; MARKETS];
-    act.open_ask = [0; MARKETS];
+    let act = act_auth.cancel_all();
     st.activity_root =
         update(DS_ACTV_NODE, st.activity_root, a.account_index, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
     st

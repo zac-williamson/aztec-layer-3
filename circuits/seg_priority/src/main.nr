@@ -2,7 +2,8 @@ use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment},
     consts::{
         ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_WD_CHAIN, DS_WDSALT, KIND_DEPOSIT,
-        KIND_FORCED_WITHDRAW, KIND_REGISTER, LOG_PRIORITY, MAX_COLLATERAL, MAX_DEPOSIT, PPM, TAG_FULL, TAG_WD,
+        KIND_FORCED_WITHDRAW, KIND_REGISTER, KIND_REKEY, LOG_PRIORITY, MAX_COLLATERAL, MAX_DEPOSIT, PPM, TAG_FULL,
+        TAG_WD,
     },
     da::{absorb, emit_change, emit_full, open_segment, segment_nonce},
     params::Params,
@@ -19,18 +20,18 @@ global PR: u32 = 4;
 /// Witness for one priority request.
 struct Item {
     req: Request,
-    /// Register: the new account's index. Deposit: the credited account's index.
+    /// Register: the new account's index. Otherwise the named account's index.
     account_index: u32,
-    /// Deposit: the credited account's current leaf preimage.
+    /// Deposit, ForcedWithdraw, Rekey: the account's current leaf preimage.
     acct_pub: AccountPub,
     acct_priv: AccountPriv,
     acct_path: [Field; ACCOUNTS_HEIGHT],
-    /// Register: path of the empty activity slot. ForcedWithdraw: the account's activity, for its
-    /// margin, and its path.
+    /// Register: path of the empty activity slot. ForcedWithdraw and Rekey: the account's
+    /// activity and its path.
     actv: Activity,
     actv_path: [Field; ACCOUNTS_HEIGHT],
-    /// The account's encryption key. The Bridge checked it against the commitment at
-    /// registration and delivered it to the operator, so every request is processable.
+    /// The account's encryption key; for a Rekey, the new one. The Bridge checked it against its
+    /// commitment and delivered it to the operator, so every request is processable.
     k_enc: Field,
     /// Deposit: the amount and salt that open the request's amount commitment. The Bridge computed
     /// the commitment from this opening, checked the amount's range and delivered the opening to the
@@ -42,7 +43,8 @@ struct Item {
 /// Priority segment (SPEC.md §7.3, §12): executes the next `n` queued requests in order.
 /// Register creates the next account with zero collateral and no positions; Deposit credits an
 /// existing account or, if the account does not exist, refunds the depositor; ForcedWithdraw
-/// withdraws an account's free collateral when its owner asked. No request can be skipped, and a
+/// withdraws an account's free collateral when its owner asked; Rekey replaces an account's master
+/// authorization and encryption key when its owner asked. No request can be skipped, and a
 /// request's own fields can never make the segment unprovable: an invalid request is consumed
 /// without effect. Forced closes and cancellations go through seg_forced.
 fn main(
@@ -82,18 +84,10 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field, params: Param
     let req = w.req;
     let mut st = state;
     let mut r = running;
-    if req.kind == KIND_REGISTER {
-        let idx = st.num_accounts;
-        assert(w.account_index == idx, "register index");
-        assert(enc_commitment(w.k_enc) == req.b, "k_enc does not open the commitment");
-        let pubv =
-            AccountPub { owner: req.sender, master_auth: req.a, enc_commitment: req.b, class: CLASS_USER };
-        let privv = AccountPriv::empty(blind(w.k_enc, idx, da_nonce, r.da_len));
-        let leaf = account_leaf(pubv, privv);
-        st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, 0, leaf, w.acct_path);
-        st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, 0, Activity::new().hash(), w.actv_path);
-        st.num_accounts = idx + 1;
-        r = emit_full(r, TAG_FULL, idx, leaf, pubv, privv, w.k_enc, da_nonce);
+    if (req.kind == KIND_REGISTER) | (req.kind == KIND_REKEY) {
+        let (st2, r2) = republish(st, r, w, da_nonce);
+        st = st2;
+        r = r2;
     } else if req.kind == KIND_FORCED_WITHDRAW {
         let (st2, r2) = forced_withdraw(st, r, w, da_nonce, params);
         st = st2;
@@ -133,6 +127,61 @@ fn apply(state: State, running: Running, w: Item, da_nonce: Field, params: Param
             r.withdrawals = hash([DS_WD_CHAIN, r.withdrawals, record]);
             r.withdrawals_count += 1;
             r = absorb(absorb(r, TAG_WD), record);
+        }
+    }
+    (st, r)
+}
+
+/// Register and Rekey (SPEC.md §7.3) publish an account in full under a key the Bridge delivered to
+/// the operator, sharing one account update, one activity update and one full DA entry.
+/// - Register (a = master authorization, b = encryption-key commitment) creates the next account,
+///   owned by the request's sender, with zero collateral, no positions and a new activity.
+/// - Rekey (a = account index, b = master authorization, c = encryption-key commitment), if the
+///   account exists and the request came from its owner, replaces the two and advances the key and
+///   order epochs: every session key is revoked and every order cancelled at once. The account's
+///   collateral and positions are unchanged. A Rekey from anyone else is consumed without effect.
+fn republish(state: State, running: Running, w: Item, da_nonce: Field) -> (State, Running) {
+    let req = w.req;
+    let mut st = state;
+    let mut r = running;
+    let register = req.kind == KIND_REGISTER;
+    let idx = if register { st.num_accounts } else { req.a as u32 };
+    let exists = register | ((idx as Field == req.a) & (idx < st.num_accounts));
+    if exists {
+        assert(w.account_index == idx, "account index");
+        let old_leaf = if register { 0 } else { account_leaf(w.acct_pub, w.acct_priv) };
+        let old_actv = if register { 0 } else { w.actv.hash() };
+        let applies = register | (w.acct_pub.owner == req.sender);
+        let pubv = if register {
+            AccountPub { owner: req.sender, master_auth: req.a, enc_commitment: req.b, class: CLASS_USER }
+        } else {
+            AccountPub { owner: w.acct_pub.owner, master_auth: req.b, enc_commitment: req.c, class: w.acct_pub.class }
+        };
+        let mut privv = if register { AccountPriv::empty(0) } else { w.acct_priv };
+        let mut act = if register {
+            Activity::new()
+        } else {
+            let mut revoked = w.actv.cancel_all();
+            revoked.key_epoch = w.actv.key_epoch + 1;
+            revoked
+        };
+        let mut leaf = old_leaf;
+        let mut actv_hash = old_actv;
+        if applies {
+            assert(enc_commitment(w.k_enc) == pubv.enc_commitment, "k_enc does not open the commitment");
+            privv.blind = blind(w.k_enc, idx, da_nonce, r.da_len);
+            leaf = account_leaf(pubv, privv);
+            actv_hash = act.hash();
+        }
+        // A Rekey that does not apply still proves the account's leaf and activity, so the owner
+        // it was checked against is the account's.
+        st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, old_leaf, leaf, w.acct_path);
+        st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, old_actv, actv_hash, w.actv_path);
+        if register {
+            st.num_accounts = idx + 1;
+        }
+        if applies {
+            r = emit_full(r, TAG_FULL, idx, leaf, pubv, privv, w.k_enc, da_nonce);
         }
     }
     (st, r)

@@ -20,14 +20,15 @@
 //     answers with its path in batch 2's receipts root; a receipt for an action the operator
 //     dropped goes unanswered and the bond pays Bob.
 //     Bob then forces a withdrawal of his free collateral through the Bridge, paying the request
-//     fee. Batch 3, an hour of L2 time later: new indices, so funding is applied; the forced
-//     withdrawal is processed; fees are swept and the accounts refreshed. A custody transaction
+//     fee, and rekeys his account to a new master key and encryption key. Batch 3, an hour of L2
+//     time later: new indices, so funding is applied; the forced withdrawal and the rekey are
+//     processed; fees are swept and the accounts refreshed. A custody transaction
 //     pays the forced withdrawal and sweeps a new deposit of Alice's, netting the two.
 //  4. The operator stops: Alice's swept deposit is queued but never processed, and a second one is
 //     never swept. After t_force anyone can activate desert mode.
 //  5. For each user, a fresh exit client, given only the node, the Bridge address and the user's
-//     seed, rebuilds the frozen accounts tree from the deployment event and the DA logs and opens
-//     the user's leaf. Each registers a claim valued at the frozen indices with funding accrued to
+//     seed (Bob's new one: his old seed no longer opens his account), rebuilds the frozen accounts
+//     tree from the deployment event and the DA logs and opens the user's leaf. Each registers a claim valued at the frozen indices with funding accrued to
 //     the freeze. Alice's queued deposit is refunded from the vault and her unswept one returns to
 //     her as a credit; after the claim window both users withdraw.
 //     The operator then claims the fee account from the DA in the same way; it is paid only from
@@ -73,6 +74,8 @@ const SLASH = 4000n;
 const BOND = 10_000n;
 const ALICE_SEED = 0xa11cen;
 const BOB_SEED = 0xb0bn;
+/** Bob's keys after his rekey (SPEC.md §7.3). */
+const BOB_SEED2 = 0xb0b2n;
 
 async function main() {
   const manifest = readJson(join(OUT, 'manifest.json'));
@@ -416,9 +419,20 @@ async function main() {
     const opBefore = await balance(operator);
     await asOf(bob).methods.submit_forced(M.KIND.FORCED_WITHDRAW, B, bob, 0n).send({ from: bob, wait });
     assert((await balance(operator)) === opBefore + REQUEST_FEE, 'request fee not paid to the operator');
+    // Bob also rotates his keys through the Bridge (SPEC.md §7.3): a new master key and encryption
+    // key, the latter delivered to the operator, as at registration. From batch 3 on, his old keys
+    // neither sign for his account nor open it.
+    const bob2 = await keysFromSeed(h, BOB_SEED2);
+    const bob2Enc = await M.encCommitment(h, bob2.kEnc);
+    await asOf(bob).methods.rekey(B, await M.masterAuthOf(h, bob2.pk!.x, bob2.pk!.y), bob2Enc, bob2.kEnc).send({ from: bob, wait });
+    for (const ev of await (wallet as any).getPrivateEvents(await eventMeta(raw, 'KeyDelivered'), { contractAddress: bridge.address, scopes: [operator] })) {
+      engine.keyring.set(big(ev.event.enc_commitment), big(ev.event.k_enc));
+    }
+    assert(engine.keyring.get(bob2Enc) === bob2.kEnc, "the operator did not receive bob's new key");
     const forced = await queuedFrom(requests.length);
     requests.push(...forced);
-    log(`bob queued a forced withdrawal (fee ${REQUEST_FEE} to the operator)`);
+    assert(forced.map((r) => r.kind).join() === [M.KIND.FORCED_WITHDRAW, M.KIND.REKEY].join(), 'queued requests');
+    log(`bob queued a forced withdrawal and a rekey (fee ${REQUEST_FEE} each to the operator); his new encryption key reached the operator by constrained delivery`);
 
     // An hour of L2 time later funding is due; the next indices apply it.
     await (node as any).warpL2TimeAtLeastBy(Number(params.fundingInterval + 60n));
@@ -470,7 +484,12 @@ async function main() {
     const frozen = { accountsRoot: big(d[1]), marketDataHash: big(d[2]) };
     const before = { alice: await balance(alice), bob: await balance(bob) };
     const exits: Record<string, any> = {};
-    for (const [name, seed, addr] of [['alice', ALICE_SEED, alice], ['bob', BOB_SEED, bob]] as const) {
+    const oldKeysOpen = await exitFromDa(h, node, bridge.address, BOB_SEED, frozen).then(
+      () => true,
+      () => false,
+    );
+    assert(!oldKeysOpen, "bob's keys from before his rekey still open his account");
+    for (const [name, seed, addr] of [['alice', ALICE_SEED, alice], ['bob', BOB_SEED2, bob]] as const) {
       const [exit, exitMs] = await timed(() => exitFromDa(h, node, bridge.address, seed, frozen));
       const ps = exit.priv.positions.map((p, m) => `m${m} ${p.size}`).filter((x) => !x.endsWith(' 0'));
       log(`${name}: exit client rebuilt the frozen tree from ${exit.batches} DA logs in ${exitMs.toFixed(0)} ms; positions ${ps.join(', ')}, collateral ${exit.priv.collateral}; equity at the frozen indices: ${exit.equity}`);

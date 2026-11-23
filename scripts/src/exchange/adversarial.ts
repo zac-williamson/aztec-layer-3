@@ -657,6 +657,52 @@ async function main() {
   Object.assign(t, { n_fills: 0, probe_path: probePath });
   await expectFail('firing drops the stop with bids left within its limit', 'seg_trigger', t, 'crossing bids remain');
 
+  // Rekey (SPEC.md §7.3). A fresh exchange: account R0 grants a session key, then its owner rekeys
+  // it through the Bridge, which delivered the new encryption key to the operator.
+  const R = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  const rKeys = await Promise.all([31n, 32n].map((s) => keysFromSeed(h, s)));
+  const rOwners = [randomField(), randomField()];
+  const rReqs: M.Request[] = [];
+  for (const [i, k] of rKeys.entries()) {
+    const encC = await M.encCommitment(h, k.kEnc);
+    R.keyring.set(encC, k.kEnc);
+    rReqs.push({ kind: M.KIND.REGISTER, a: await M.masterAuthOf(h, k.pk!.x, k.pk!.y), b: encC, sender: rOwners[i], time: now });
+    rReqs.push(await M.depositRequest(h, idx(i), 1_000_000n, rOwners[i], now));
+  }
+  await R.beginBatch(1n, 0n, 0n, 0n);
+  await R.block(now, [await update(R, 0n, 2000n, now)]);
+  await R.priority(rReqs);
+  const rSession = await keysFromSeed(h, 33n);
+  const R0 = idx(0);
+  await R.trade([await signAction(h, R.domain, rKeys[0], X.KIND_ACT.ADD_KEY, R0, 1n, [0n, rSession.pk.x, rSession.pk.y, 0b1n, 1_000_000n, now + 1000n])]);
+  const rNext = await keysFromSeed(h, 34n);
+  const rNextC = await M.encCommitment(h, rNext.kEnc);
+  R.keyring.set(rNextC, rNext.kEnc);
+  const rekeyFrom = async (sender: bigint): Promise<M.Request> => ({ kind: M.KIND.REKEY, a: R0, b: await M.masterAuthOf(h, rNext.pk!.x, rNext.pk!.y), c: rNextC, sender, time: now });
+  // The operator applies a rekey that R1's owner sent for R0: the circuit consumes it without
+  // effect, so the state the operator claims is not the one the segment proves.
+  const beforeRekey = R.snapshot();
+  R.relax.add('rekey-owner');
+  await R.priority([await rekeyFrom(rOwners[1])]);
+  R.relax.delete('rekey-owner');
+  const foreign = R.segments.at(-1)!;
+  R.restore(beforeRekey);
+  {
+    const { returnValue } = (await execute('seg_priority', foreign.inputs)) as any;
+    const proved = BigInt(returnValue.end.state);
+    results.push({ name: "a rekey of someone else's account applied", pass: proved !== foreign.expectedEnd.state, how: proved !== foreign.expectedEnd.state ? 'consumed without effect: the proved state differs from the claimed one' : 'APPLIED' });
+  }
+  await R.priority([await rekeyFrom(rOwners[0])]);
+  t = clone(R.segments.at(-1)!.inputs);
+  t.items[0].k_enc = hex(424242n);
+  await expectFail('rekey published under a key the operator was not given', 'seg_priority', t, 'k_enc does not open the commitment');
+  // A relaxed engine lets the session key act after the rekey.
+  R.relax.add('revoked-keys');
+  await R.trade([await signAction(h, R.domain, rSession, X.KIND_ACT.PLACE, R0, 1n, [0n, M.SIDE.BID, 1990n, 1n, X.TIF.GTC, 0n], 0n)]);
+  R.relax.delete('revoked-keys');
+  assert(R.rejected.length === 0, `rekey setup rejected: ${R.rejected.map((r) => r.reason)}`);
+  await expectFail('session key acts after a rekey', 'seg_trade', R.segments.at(-1)!.inputs, 'session key revoked by a rekey');
+
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);
   await api.destroy();

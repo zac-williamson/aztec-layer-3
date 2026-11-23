@@ -56,7 +56,7 @@ export const KEYS_HEIGHT = 8;
 export const KEY_SLOTS = 256;
 /** The key id of actions the master key signs. */
 export const MASTER_KEY = 256n;
-export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n } as const;
+export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n, REKEY: 6n } as const;
 export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n, TRIGGER: 7n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
@@ -83,10 +83,14 @@ const TWO_128 = 1n << 128n;
 export type AccountPub = { owner: bigint; masterAuth: bigint; encCommitment: bigint; class: bigint };
 export type Position = { size: bigint; entry: bigint; funding: bigint };
 export type AccountPriv = { collateral: bigint; positions: Position[]; blind: bigint };
-/** An account's activity leaf (SPEC.md §6.4); `epoch` is its order epoch, which CancelAll advances (§6.5). */
-export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[]; epoch: bigint };
+/**
+ * An account's activity leaf (SPEC.md §6.4); `epoch` is its order epoch, which CancelAll advances
+ * (§6.5), and `keyEpoch` its key epoch, which a rekey advances (§7.3).
+ */
+export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[]; epoch: bigint; keyEpoch: bigint };
 /** A session key (SPEC.md §7.2). */
-export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint };
+/** A session key; `epoch` is the account's key epoch when it was added, and it is live only while that holds. */
+export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint; epoch: bigint };
 export type Market = {
   bookRoot: bigint;
   /** The market's trigger tree, and whether a trigger is due at the mark (SPEC.md §6.5). */
@@ -166,11 +170,13 @@ export async function initModel(h: H) {
 }
 export const newActivity = (): Activity => {
   if (EMPTY_KEYS_ROOT === 0n) throw new Error('initModel was not called');
-  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n), epoch: 0n };
+  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n), epoch: 0n, keyEpoch: 0n };
 };
-export const emptyKey = (): Key => ({ pkX: 0n, pkY: 0n, marketMask: 0n, maxNotional: 0n, expiry: 0n, nonce: 0n });
+export const emptyKey = (): Key => ({ pkX: 0n, pkY: 0n, marketMask: 0n, maxNotional: 0n, expiry: 0n, nonce: 0n, epoch: 0n });
 export const keyLeaf = (h: H, k: Key) =>
-  k.pkX === 0n && k.pkY === 0n && k.nonce === 0n ? Promise.resolve(0n) : h([DS.KEY, k.pkX, k.pkY, k.marketMask, k.maxNotional, k.expiry, k.nonce]);
+  k.pkX === 0n && k.pkY === 0n && k.nonce === 0n && k.epoch === 0n
+    ? Promise.resolve(0n)
+    : h([DS.KEY, k.pkX, k.pkY, k.marketMask, k.maxNotional, k.expiry, k.nonce + k.epoch * TWO_64]);
 export const copyPriv = (q: AccountPriv): AccountPriv => ({ ...q, positions: q.positions.map((p) => ({ ...p })) });
 export const copyActivity = (a: Activity): Activity => ({ ...a, openBid: [...a.openBid], openAsk: [...a.openAsk] });
 export const genesisMarket = (emptyRoot: bigint): Market => ({
@@ -248,7 +254,7 @@ export const blindOf = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number
 export const keystream = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number, i: number) =>
   h([DS.KS, k, idx, nonce, BigInt(pos + i)]);
 export const activityHash = (h: H, a: Activity) =>
-  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64), a.epoch]);
+  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64), a.epoch + a.keyEpoch * TWO_64]);
 
 export const marketHash = (h: H, m: Market) =>
   h([
@@ -383,6 +389,7 @@ export const activityToNoir = (a: Activity) => ({
   open_bid: a.openBid.map(String),
   open_ask: a.openAsk.map(String),
   epoch: a.epoch.toString(),
+  key_epoch: a.keyEpoch.toString(),
 });
 export const marketToNoir = (m: Market) => ({
   book_root: hex(m.bookRoot),
@@ -450,6 +457,7 @@ export const keyToNoir = (k: Key) => ({
   max_notional: k.maxNotional.toString(),
   expiry: k.expiry.toString(),
   nonce: k.nonce.toString(),
+  epoch: k.epoch.toString(),
 });
 export const requestToNoir = (r: Request) => ({
   kind: hex(r.kind),

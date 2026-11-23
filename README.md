@@ -36,6 +36,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.14**: the token's bridge to L1. Aztec's standard escrow portal holds the ERC-20 on L1; the L2 bridge, the token's minter, claims deposits into public balances or straight into credits and burns exits from either.
 - **P2.15**: stop and take-profit triggers. Each market keeps a trigger tree beside its book; every mark tick proves whether a trigger is due and, while one is, the market takes no new orders until the operator fires the due triggers in price-time order as reduce-only IOC orders.
 - **P2.16**: public market data per D1. Each batch publishes, per market, the last, VWAP, high and low of its fills, and its volume and the open interest rounded down to a power of two.
+- **P2.17**: key rotation. An account's owner rekeys it through the Bridge: a new master authorization and encryption key, the key delivered to the operator as at registration. A rekey revokes every session key and cancels every order at once, and is the way back for a lost or compromised master key.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -46,7 +47,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/l3x_types` | Shared constants, Poseidon2 sponge, running values and node output, VK tree, DA sponge, `BatchHeader` |
 | `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick that also flags due triggers |
-| `circuits/seg_priority` | X-segment: Register, Deposit and ForcedWithdraw requests in queue order (refunds for missing accounts) |
+| `circuits/seg_priority` | X-segment: Register, Deposit, ForcedWithdraw and Rekey requests in queue order (refunds for missing accounts) |
 | `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, PlaceTrigger, CancelTrigger, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
 | `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
@@ -64,7 +65,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/agg_ultra` | M1 measurement: `agg_app`'s checks in plain UltraHonk |
 | `circuits/rogue_app`, `circuits/rogue_segment`, `circuits/rogue_client` | Adversarial fixtures for the VK tests; never deployed |
 | `circuits/vendor/bb_proof_verification` | Vendored from aztec-packages v6.0.0 (Apache-2.0) |
-| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration with key delivery, C1 deposits, custody and reclaim, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
+| `contracts/bridge` | `L3XBridge`: genesis with the protocol accounts, registration and rekeys with key delivery, C1 deposits, custody and reclaim, forced requests, settlement, withdrawal claims, desert mode, delayed upgrades; TXE tests |
 | `contracts/ctoken` | `ConfidentialToken`, the D7 collateral token: public balances and hidden-amount credits, with every payment's parties public; TXE tests |
 | `contracts/ctbridge` | `ConfidentialTokenBridge`, the token's minter and the L2 half of its bridge to L1 (Aztec's `TokenPortal` is the L1 half); TXE tests |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
@@ -112,7 +113,7 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs eight batches natively across markets 0–2. They cover:
+This runs ten batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
@@ -120,7 +121,9 @@ This runs eight batches natively across markets 0–2. They cover:
 - a session key's trading and refusals, a GTT order removed after expiry, and forced withdraw, close and cancel-all requests;
 - a lane-P account whose session key is granted and revoked, and whose collateral is withdrawn, by client proofs, and a second lane-P account authorizing with a P-256 key; each P-segment is proved through the Chonk IVC and the tube;
 - an order reduced in place that keeps its queue position, a session key's modification, and a transfer between accounts;
-- cancel-all by a session key, a master key and a forced request, with the void orders removed by later sells instead of filled.
+- cancel-all by a session key, a master key and a forced request, with the void orders removed by later sells instead of filled;
+- stop and take-profit triggers fired in price-time order, and the batch's prints;
+- an owner's rekey, after which the account's session key and old master key are refused and its resting bid is void.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -138,6 +141,7 @@ npm run e2e
 
 This runs the exit test on an in-process 6.0.0 local network, with real client-side proofs:
 - Users register, shield token balances into credits, and deposit them; the operator's custody transactions sweep deposits into the vault and pay withdrawals and refunds as credits. They trade in two markets over three settled batches; funding applies an hour of L2 time later. One withdrawal custody leaves unpaid is claimed from the vault after `t_payout`, with the DA alone.
+- Bob rekeys his account through the Bridge, and his exit later works only with his new keys.
 - The operator stops and desert mode starts. A deposit custody queued is refunded from the vault, and one it never swept returns as a credit.
 - Each user exits with a fresh client that holds only the node, the Bridge address and the user's seed, valued at the frozen indices with funding accrued to the freeze.
 
@@ -223,6 +227,8 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.15: tests | Native batch 9 fires a stop, removes a void stop and partly fills a take-profit; 8 more adversarial witnesses (87 in all). |
 | P2.16: market data | Per-batch print summary (last, VWAP, high, low) and bucketed volume and open interest in the header's market data, published at the head of the DA log. |
 | P2.16: tests | Native batch 9 checks market 0's prints and buckets; every root proof binds them; exit clients read the frozen market data from the DA log. |
+| P2.17: key rotation | `Bridge.rekey` queues the owner's new master authorization and encryption key and delivers the key to the operator; `seg_priority` applies it, advancing the account's key and order epochs, and republishes the account under the new key. |
+| P2.17: tests | Native batch 10 rekeys an account with a session key and a resting bid; 3 more adversarial witnesses (90 in all); 4 more Bridge TXE tests (86); the exit test's Bob exits with his rotated keys. |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats

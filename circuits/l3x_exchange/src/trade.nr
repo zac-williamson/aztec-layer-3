@@ -52,7 +52,14 @@ pub fn action_msg(domain: Field, kind: Field, account_index: u32, key_id: u32, n
 /// AddKey (`add`) or RevokeKey on a session-key slot (SPEC.md §7.2), p = (slot, pk_x, pk_y,
 /// market_mask, max_notional, expiry, …): proves the slot's current key under `keys_root` and
 /// returns the new root. The slot keeps its nonce, so a replaced key's signatures never replay.
-pub fn write_key_slot(keys_root: Field, old: Key, path: [Field; KEYS_HEIGHT], add: bool, p: [Field; ACTION_PAYLOAD]) -> Field {
+pub fn write_key_slot(
+    keys_root: Field,
+    old: Key,
+    path: [Field; KEYS_HEIGHT],
+    add: bool,
+    p: [Field; ACTION_PAYLOAD],
+    key_epoch: u64,
+) -> Field {
     let slot = p[0] as u32;
     assert((slot as Field == p[0]) & (slot < KEY_SLOTS), "key slot");
     assert(merkle_root(DS_KEY_NODE, old.leaf(), slot, path) == keys_root, "key slot path");
@@ -65,9 +72,9 @@ pub fn write_key_slot(keys_root: Field, old: Key, path: [Field; KEYS_HEIGHT], ad
             "key parameters out of range",
         );
         assert((p[1] != 0) | (p[2] != 0), "empty key");
-        Key { pk_x: p[1], pk_y: p[2], market_mask: mask, max_notional, expiry, nonce: old.nonce }
+        Key { pk_x: p[1], pk_y: p[2], market_mask: mask, max_notional, expiry, nonce: old.nonce, epoch: key_epoch }
     } else {
-        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: old.nonce }
+        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: old.nonce, epoch: old.epoch }
     };
     merkle_root(DS_KEY_NODE, new_key.leaf(), slot, path)
 }

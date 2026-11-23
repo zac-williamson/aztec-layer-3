@@ -499,14 +499,68 @@ async function main() {
   assert(md9.oiBucket === M.bucket(engine.markets[0].oiLong) && M.decodeMarketData(w9.marketData)[1].last === 0n, 'batch 9 open interest and quiet market');
   log(`batch 9 market 0 prints: last ${md9.last}, VWAP ${md9.vwap}, high ${md9.high}, low ${md9.low}, volume ~${md9.volumeBucket}, open interest ~${md9.oiBucket}`);
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the nine
-  // batches, then open every user's account and compare with the engine.
+  // Batch 10 (P2.17): Alice's owner rekeys her account through the Bridge (SPEC.md §7.3).
+  // - Alice's master key grants a session key, which rests a bid of 2 at 1790 in market 0.
+  // - The queue carries a rekey of Alice's account from Bob's address, consumed without effect,
+  //   then her owner's rekey to a new master key and encryption key.
+  // - After it, the session key and the old master key are refused and the new master key trades.
+  //   Carol's sell at 1785 meets Alice's bid, void since the rekey, and removes it without a fill.
+  await engine.beginBatch(10n, b9.end.priorityHead, b9.end.priorityCursor, b9.end.time);
+  const t10 = t9 + 100n;
+  await engine.block(t10, [await update(0n, 1800n, 1800n, t10 - 1n), await update(1n, 30_010n, 30_010n, t10 - 1n)]);
+  const sess10 = await keysFromSeed(h, 9002n);
+  const slotNonce = engine.keyOf(A, Number(SLOT)).nonce;
+  const bySession10 = (nonce: bigint, kind: bigint, p: bigint[]) => signAction(h, engine.domain, sess10, kind, A, nonce, p, SLOT);
+  await engine.trade([
+    await act(alice, A, nx(A), ADD_KEY, [SLOT, sess10.pk.x, sess10.pk.y, 0b0001n, 100_000n, t10 + 1000n]),
+    await bySession10(slotNonce + 1n, PLACE, [0n, BID, 1790n, 2n, GTC, 0n]),
+  ]);
+  const restingA = () => [...engine.orders[0].values()].filter((o) => o.account === A).length;
+  assert(restingA() === 1 && engine.rejected.length === rejected9 + 2, "alice's session key did not rest her bid");
+  const alice2 = await keysFromSeed(h, 111n); // Alice's new master key and encryption key
+  const auth2 = await M.masterAuthOf(h, alice2.pk.x, alice2.pk.y);
+  const enc2 = await M.encCommitment(h, alice2.kEnc);
+  engine.keyring.set(enc2, alice2.kEnc); // delivered by Bridge.rekey
+  await engine.priority([
+    { kind: M.KIND.REKEY, a: A, b: auth2, c: enc2, sender: users[1].addr, time: t10 - 3n }, // Bob's address: no effect
+    { kind: M.KIND.REKEY, a: A, b: auth2, c: enc2, sender: users[0].addr, time: t10 - 2n },
+  ]);
+  assert(engine.accts.get(A)!.pub.masterAuth === auth2 && engine.actv.get(A)!.keyEpoch === 1n, "alice's account was not rekeyed");
+  const rejected10 = engine.rejected.length;
+  await engine.trade([
+    await bySession10(slotNonce + 2n, PLACE, [0n, BID, 1795n, 1n, GTC, 0n]), // revoked by the rekey
+    await act(alice, A, nx(A), PLACE, [0n, BID, 1795n, 1n, GTC, 0n]), // the old master key
+  ]);
+  await engine.trade([
+    await act(alice2, A, nx(A), PLACE, [0n, ASK, 1830n, 1n, GTC, 0n]), // the new master key
+    await act(carol, C, nx(C), PLACE, [0n, ASK, 1785n, 2n, IOC, 0n]), // meets Alice's void bid
+  ]);
+  const reasons10 = engine.rejected.slice(rejected10).map((r) => r.reason).join('|');
+  assert(reasons10 === "session key revoked by a rekey|signing key is not the account's", `batch 10 rejections: ${reasons10}`);
+  assert(restingA() === 1 && engine.accts.get(C)!.priv.positions[0].size === 34n, "alice's void bid was filled, or her new ask did not rest");
+  log(`rekey: alice's session key and old master key refused, her void bid removed without a fill; her new key rests an ask`);
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 10');
+  const w10 = await engine.endBatch();
+  log(`batch 10: ${w10.segments.map((s) => s.label).join(' | ')}; ${w10.daPayload.length} DA fields`);
+  const b10 = await settle(w10);
+  assert(b10.header[0] === b9.header[1], 'batch 10 does not chain from batch 9');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the ten
+  // batches, then open every user's account and compare with the engine. Alice opens hers with
+  // the keys her owner rekeyed it to; her old keys no longer open it.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b9.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b10.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  const oldKeysOpen = await openAccount(h, rebuilt, alice.kEnc, await M.masterAuthOf(h, alice.pk!.x, alice.pk!.y)).then(
+    () => true,
+    () => false,
+  );
+  assert(!oldKeysOpen, "alice's old keys still open her account");
   for (const [i, u] of users.entries()) {
-    const opened = await openAccount(h, rebuilt, u.keys.kEnc, await M.masterAuthOf(h, u.keys.pk!.x, u.keys.pk!.y));
+    const k = i === 0 ? alice2 : u.keys;
+    const opened = await openAccount(h, rebuilt, k.kEnc, await M.masterAuthOf(h, k.pk!.x, k.pk!.y));
     const want = engine.accts.get(BigInt(2 + i))!.priv;
     assert(show(opened.priv) === show(want), `account ${2 + i} opened from DA differs from the engine`);
   }
@@ -522,13 +576,13 @@ async function main() {
   assert(pos(A).positions[0].size === 11n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 9 ${hex(b9.headerHash)}`);
+  log(`header of batch 10 ${hex(b10.headerHash)}`);
   await api.destroy();
 }
 

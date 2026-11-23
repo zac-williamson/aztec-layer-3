@@ -121,7 +121,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers' | 'rekey-owner' | 'revoked-keys'>();
 
   // The batch being built.
   running!: Running;
@@ -466,7 +466,9 @@ export class Engine {
     await this.absorb(daNonce);
     const items: unknown[] = [];
     for (const q of reqs) items.push(await this.applyRequest(q, daNonce));
-    const kinds = reqs.map((q) => (q.kind === M.KIND.REGISTER ? 'register' : q.kind === M.KIND.DEPOSIT ? 'deposit' : 'forced withdraw')).join(', ');
+    const label = (q: M.Request) =>
+      q.kind === M.KIND.REGISTER ? 'register' : q.kind === M.KIND.DEPOSIT ? 'deposit' : q.kind === M.KIND.REKEY ? 'rekey' : 'forced withdraw';
+    const kinds = reqs.map(label).join(', ');
     await this.finishSegment('seg_priority', `priority [${kinds}]`, {
       ...this.base(start, before),
       n: reqs.length,
@@ -513,6 +515,7 @@ export class Engine {
       return item;
     }
     if (q.kind === M.KIND.FORCED_WITHDRAW) return this.applyForcedWithdraw(q, item, daNonce);
+    if (q.kind === M.KIND.REKEY) return this.applyRekey(q, item, daNonce);
     assert(q.kind === M.KIND.DEPOSIT, 'unknown request kind');
     // The queue holds a commitment to the amount; the opening came to the operator by constrained
     // delivery at deposit time (SPEC.md §10.3).
@@ -542,6 +545,39 @@ export class Engine {
     priv.collateral += amount;
     const leaf = await this.writeAccount(rec!, priv, daNonce);
     await this.emitChange(rec!, leaf, daNonce);
+    return item;
+  }
+
+  /**
+   * Rekey (seg_priority `republish`, SPEC.md §7.3): from the account's owner, a new master
+   * authorization (b) and encryption key (c, delivered through the Bridge); the key and order
+   * epochs advance, so every session key is revoked and every order void. The account is
+   * republished in full under the new key. A rekey from anyone else is consumed without effect.
+   */
+  private async applyRekey(q: M.Request, item: any, daNonce: bigint) {
+    if (q.a >= this.numAccounts) return item;
+    const rec = this.accts.get(q.a)!;
+    const act = this.actv.get(q.a)!;
+    const c = q.c ?? 0n;
+    const kEnc = this.keyring.get(c);
+    Object.assign(item, {
+      account_index: q.a.toString(),
+      acct_pub: M.pubToNoir(rec.pub),
+      acct_priv: M.privToNoir(rec.priv),
+      acct_path: this.accounts.path(q.a).map(hex),
+      actv: M.activityToNoir(act),
+      actv_path: this.activity.path(q.a).map(hex),
+      k_enc: hex(kEnc ?? 0n),
+    });
+    if (rec.pub.owner !== q.sender && !this.relax.has('rekey-owner')) return item;
+    assert(kEnc !== undefined, `no encryption key delivered for commitment ${hex(c)}`);
+    rec.pub = { ...rec.pub, masterAuth: q.b, encCommitment: c };
+    rec.kEnc = kEnc;
+    const leaf = await this.writeAccount(rec, rec.priv, daNonce);
+    const nact = { ...this.voidOrders(act), keyEpoch: act.keyEpoch + 1n };
+    this.actv.set(q.a, nact);
+    await this.activity.set(q.a, await M.activityHash(this.h, nact));
+    await this.emitFull(M.TAG.FULL, rec, leaf, daNonce);
     return item;
   }
 
@@ -1156,6 +1192,7 @@ export class Engine {
       if (!(await verify(this.h, a.pk, a.sig, msg))) throw new Error('bad signature');
       if (key.nonce + 1n !== a.nonce) throw new Error('nonce');
       if (this.running.time > key.expiry) throw new Error('session key expired');
+      if (key.epoch !== oldAct.keyEpoch && !this.relax.has('revoked-keys')) throw new Error('session key revoked by a rekey');
       const { PLACE, CANCEL, MODIFY, CANCEL_ALL, PLACE_TRIGGER, CANCEL_TRIGGER } = X.KIND_ACT;
       if (![PLACE, CANCEL, MODIFY, CANCEL_ALL, PLACE_TRIGGER, CANCEL_TRIGGER].includes(a.kind as any)) throw new Error('session keys only place, cancel, modify and cancel all');
       if (a.kind !== CANCEL_ALL && (a.p[0] >= BigInt(M.MARKETS) || ((key.marketMask >> a.p[0]) & 1n) !== 1n)) throw new Error('market not allowed for the session key');
@@ -1345,9 +1382,9 @@ export class Engine {
     if (a.kind === X.KIND_ACT.ADD_KEY) {
       if (a.p[3] >= 1n << 32n || a.p[4] >= 1n << 64n || a.p[5] >= 1n << 64n) throw new Error('key parameters out of range');
       if (a.p[1] === 0n && a.p[2] === 0n) throw new Error('empty key');
-      k = { pkX: a.p[1], pkY: a.p[2], marketMask: a.p[3], maxNotional: a.p[4], expiry: a.p[5], nonce: old.nonce };
+      k = { pkX: a.p[1], pkY: a.p[2], marketMask: a.p[3], maxNotional: a.p[4], expiry: a.p[5], nonce: old.nonce, epoch: act.keyEpoch };
     } else {
-      k = { ...M.emptyKey(), nonce: old.nonce };
+      k = { ...M.emptyKey(), nonce: old.nonce, epoch: old.epoch };
     }
     const acctPath = this.accounts.path(a.account).map(hex);
     act.keysRoot = await this.writeKey(a.account, slot, k);

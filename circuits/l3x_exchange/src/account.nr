@@ -157,7 +157,9 @@ pub fn keystream(k_enc: Field, account_index: u32, da_nonce: Field, pos: u32, i:
 
 /// A session key (SPEC.md §6.4, §7.2): a Grumpkin key that may place and cancel orders in the
 /// markets of `market_mask`, each order's notional at most `max_notional`, until L3 time `expiry`.
-/// `nonce` is the slot's action nonce; it is never reset when the slot's key changes.
+/// `nonce` is the slot's action nonce; it is never reset when the slot's key changes. `epoch` is
+/// the account's key epoch when the key was added: the key is live only while the account's key
+/// epoch is unchanged, so a rekey revokes every session key at once (SPEC.md §7.3).
 pub struct Key {
     pub pk_x: Field,
     pub pk_y: Field,
@@ -165,22 +167,23 @@ pub struct Key {
     pub max_notional: u64,
     pub expiry: u64,
     pub nonce: u64,
+    pub epoch: u64,
 }
 
 impl Key {
     pub fn empty() -> Self {
-        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: 0 }
+        Key { pk_x: 0, pk_y: 0, market_mask: 0, max_notional: 0, expiry: 0, nonce: 0, epoch: 0 }
     }
 
     /// A slot that was never used is the empty leaf, so a fresh keys tree is the empty tree.
     pub fn leaf(self) -> Field {
-        if (self.pk_x == 0) & (self.pk_y == 0) & (self.nonce == 0) {
+        if (self.pk_x == 0) & (self.pk_y == 0) & (self.nonce == 0) & (self.epoch == 0) {
             0
         } else {
             hash(
                 [
                     DS_KEY, self.pk_x, self.pk_y, self.market_mask as Field, self.max_notional as Field,
-                    self.expiry as Field, self.nonce as Field,
+                    self.expiry as Field, self.nonce as Field + (self.epoch as Field) * TWO_64,
                 ],
             )
         }
@@ -206,6 +209,9 @@ pub struct Activity {
     /// The account's order epoch (SPEC.md §6.5). Orders record the epoch they were placed in, and
     /// CancelAll advances it, which voids every order placed before at once.
     pub epoch: u64,
+    /// The account's key epoch (SPEC.md §7.3). Session keys record the epoch they were added in,
+    /// and a rekey advances it, which revokes every session key at once.
+    pub key_epoch: u64,
 }
 
 impl Activity {
@@ -217,7 +223,18 @@ impl Activity {
             open_bid: [0; MARKETS],
             open_ask: [0; MARKETS],
             epoch: 0,
+            key_epoch: 0,
         }
+    }
+
+    /// Cancels every order (CancelAll, SPEC.md §6.5): a new order epoch, no open lots.
+    pub fn cancel_all(self) -> Self {
+        let mut act = self;
+        act.epoch = self.epoch + 1;
+        act.open_orders = 0;
+        act.open_bid = [0; MARKETS];
+        act.open_ask = [0; MARKETS];
+        act
     }
 
     pub fn hash(self) -> Field {
@@ -229,7 +246,7 @@ impl Activity {
         for m in 0..MARKETS {
             inputs[4 + m] = (self.open_bid[m] as Field) + (self.open_ask[m] as Field) * TWO_64;
         }
-        inputs[4 + MARKETS] = self.epoch as Field;
+        inputs[4 + MARKETS] = (self.epoch as Field) + (self.key_epoch as Field) * TWO_64;
         hash(inputs)
     }
 }

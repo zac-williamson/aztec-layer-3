@@ -110,10 +110,7 @@ fn main(
         }
 
         if authorized & (req.kind == KIND_FORCED_CANCEL_ALL) {
-            act.epoch = actv.epoch + 1;
-            act.open_orders = 0;
-            act.open_bid = [0; MARKETS];
-            act.open_ask = [0; MARKETS];
+            act = actv.cancel_all();
         }
 
         st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, actv.hash(), act.hash(), actv_path);

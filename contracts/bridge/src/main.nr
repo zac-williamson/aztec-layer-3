@@ -35,7 +35,7 @@ pub contract L3XBridge {
         account::{account_leaf, AccountPub, enc_commitment, from_plaintext},
         consts::{
             ACCOUNTS_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_RECEIPT_SIG, DS_WD_NODE, KIND_DEPOSIT,
-            KIND_FORCED_CANCEL_ALL, KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, MAX_DEPOSIT,
+            KIND_FORCED_CANCEL_ALL, KIND_FORCED_CLOSE, KIND_FORCED_WITHDRAW, KIND_REGISTER, KIND_REKEY, MAX_DEPOSIT,
             PLAINTEXT_LEN, PROTOCOL_ACCOUNTS, RECEIPT_DEPTH, WD_HEIGHT,
         },
         deposit_blind, deposit_commitment,
@@ -453,7 +453,30 @@ pub contract L3XBridge {
             operator,
             MessageDelivery::onchain_constrained(),
         );
-        self.enqueue_self._queue(KIND_REGISTER, master_auth, enc_key_commitment, self.msg_sender());
+        self.enqueue_self._queue(KIND_REGISTER, master_auth, enc_key_commitment, 0, self.msg_sender());
+    }
+
+    /// Queues a rekey (SPEC.md §7.3) on behalf of the caller, who must own the account for it to
+    /// take effect: the account's master authorization and encryption key are replaced, every
+    /// session key is revoked and every order cancelled. As at registration, the new encryption key
+    /// is checked against its commitment here and delivered to the operator by constrained on-chain
+    /// delivery. It pays `request_fee` to the operator, as a forced request does. This is how an owner
+    /// recovers an account whose master key is lost or compromised.
+    #[external("private")]
+    fn rekey(account_index: Field, master_auth: Field, enc_key_commitment: Field, k_enc: Field) {
+        assert(enc_commitment(k_enc) == enc_key_commitment, "k_enc does not open the commitment");
+        let config = self.storage.config.read();
+        let operator = self.storage.operator.get_current_value();
+        let operator = if operator.is_zero() { config.genesis_operator } else { operator };
+        self.emit(KeyDelivered { enc_commitment: enc_key_commitment, k_enc }).deliver_to(
+            operator,
+            MessageDelivery::onchain_constrained(),
+        );
+        let sender = self.msg_sender();
+        if config.request_fee > 0 {
+            self.enqueue(ConfidentialToken::at(config.token).transfer_public_from(sender, operator, config.request_fee));
+        }
+        self.enqueue_self._queue(KIND_REKEY, account_index, master_auth, enc_key_commitment, sender);
     }
 
     /// Queues a forced request (SPEC.md §7.3, §12) on behalf of the caller, who must own the account
@@ -687,8 +710,8 @@ pub contract L3XBridge {
 
     #[external("public")]
     #[only_self]
-    fn _queue(kind: Field, a: Field, b: Field, sender: AztecAddress) {
-        self.internal.queue_entry(kind, a, b, 0, sender);
+    fn _queue(kind: Field, a: Field, b: Field, c: Field, sender: AztecAddress) {
+        self.internal.queue_entry(kind, a, b, c, sender);
     }
 
     #[internal("public")]

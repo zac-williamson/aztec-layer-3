@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.14, 2026-11-22. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passes its exit test on a local network (§15, P1 profile). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), and the print summary with bucketed volume and open interest (P2.16), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), and key rotation by the account's owner (P2.17), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -186,10 +186,10 @@ Same indexing. It holds what trading needs but exit does not:
 ```
 ActivityLeaf = H(DS_ACTV, keys_root, open_bid_lots[P_MAX], open_ask_lots[P_MAX],
                  open_order_count, fee_tier, blind_a)
-KeyLeaf      = H(DS_KEY, pubkey, permissions, expiry, nonce)
+KeyLeaf      = H(DS_KEY, pubkey, permissions, expiry, nonce, key_epoch)
 ```
 
-`keys_root` is a height-8 tree: up to 256 session keys per account, matching Lighter's 255 API-key slots, so market makers can parallelize across keys. A slot's `nonce` is never reset when its key changes. Keeping keys, nonces and open-order lots here means quoting changes no published leaf (§4).
+`keys_root` is a height-8 tree: up to 256 session keys per account, matching Lighter's 255 API-key slots, so market makers can parallelize across keys. A slot's `nonce` is never reset when its key changes. A key is live only while its `key_epoch` equals the account's, which a rekey advances (§7.3), so a rekey revokes every key at once. Keeping keys, nonces and open-order lots here means quoting changes no published leaf (§4).
 
 ### 6.5 Order books
 
@@ -267,11 +267,12 @@ Signers MUST derive Schnorr nonces deterministically, hedged with fresh randomne
 | `Withdraw` | amount, recipient Aztec address (§10.4) |
 | `Transfer` | destination account, amount (phase 2) |
 | `AddKey`, `RevokeKey` | key slot, public key, permissions, expiry |
-| `RotateEncKey`, `SetMasterAuth` | new commitment or authorization; a new `k_enc` is delivered to the operator encrypted |
+| `RotateEncKey`, `SetMasterAuth` | new commitment or authorization; a new `k_enc` is delivered to the operator encrypted. As built (P2.17), both are one priority request, `Rekey`, from the account's owner |
 
 Priority requests are queued on the Bridge (§10.1):
 
 - `Register` and the forced requests `ForcedCancelAll`, `ForcedClose(market, worst_price)` and `ForcedWithdraw(recipient)` (all free collateral). Users submit these directly; each pays `request_fee`.
+- `Rekey(account, master_auth, enc_key_commitment)`, from the account's owner (P2.17): a new master authorization and encryption key. `Bridge.rekey` checks the new `k_enc` against its commitment and delivers it to the operator, as `register` does, and charges `request_fee`. Executing it revokes every session key and cancels every order of the account.
 - `Deposit`. Only a custody transaction appends these, and only once the deposit's funds are in the vault (§10.3).
 
 Each queue entry binds the submitting `msg_sender`, which the circuit checks against the account owner. Payloads MAY be encrypted to the operator key in the configuration; the circuit then proves correct decryption, so the operator cannot discard a request as unreadable.
@@ -1009,7 +1010,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Session keys** (P2.3, §6.4, §7.2):
 
-- `keys_root` is a height-8 tree: 256 slots of `KeyLeaf = H(DS_KEY, pk, market_mask, max_notional, expiry, nonce)`. A slot that was never used is the empty leaf.
+- `keys_root` is a height-8 tree: 256 slots of `KeyLeaf = H(DS_KEY, pk, market_mask, max_notional, expiry, nonce + 2^64·key_epoch)` (key epochs from P2.17). A slot that was never used is the empty leaf.
 - Every action names its signing key: `MASTER_KEY` (256), or a slot. The key id is part of the signed message: `H(DS_ACTION, domain, kind, account, key_id, nonce, p[8])`.
   - The master key's nonce lives in the activity leaf.
   - A slot's nonce lives in its key leaf and is never reset when the slot's key changes, so an old key's signatures cannot be replayed.
@@ -1323,6 +1324,32 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **DA log.** The 52 fields go at the head of the batch's DA log, `[DA_LOG_TAG, batch, market_data, payload]`, instead of the `BatchSettled` event: one loop in the Bridge instead of a larger event, which keeps its public bytecode at 1,604 fields. Exit clients read the frozen market data there.
 - **Cost.** `MarketLeaf` gains six fields (24 in all). `seg_trade` 442,282 gates; the root stays at 2^23.
 
+**Key rotation** (P2.17, §7.3):
+
+- **Request.** `Rekey(account, master_auth, enc_key_commitment)` is a priority request (kind 6). `Bridge.rekey` is private: it checks `k_enc` against the commitment, delivers it to the operator by constrained delivery, enqueues the token's `transfer_public_from` for `request_fee`, and queues the request with its sender. The Bridge's public bytecode is unchanged at 1,605 fields.
+- **Effect.** `seg_priority` executes it only if the account exists and the sender is its owner; otherwise it is consumed without effect, like an invalid forced request.
+  - `master_auth` and `enc_commitment` are replaced; the owner and class are kept. The collateral and positions are unchanged.
+  - The key and order epochs advance and the open lots drop to zero, as in a CancelAll: every session key is revoked and every order and trigger is void at once.
+  - The account is republished in full under the new `k_enc`, so exit clients pick up the new public part from the DA, and only the new keys open the account.
+- **Key epochs.** `KeyLeaf` packs `nonce + 2^64·key_epoch`, and the activity leaf packs `epoch + 2^64·key_epoch`, so neither hash takes another input. `AddKey` writes the account's current key epoch; a session key signs only while its epoch is the account's.
+- **Owner as root of authority.** The owner's Aztec account could already withdraw all free collateral by `ForcedWithdraw` to any recipient, so letting it replace the master authorization adds no power. It gives a user whose master key is lost or compromised a way back that needs neither the operator's cooperation nor the old key.
+- **Shared path.** `Register` and `Rekey` share one account update, one activity update and one full DA entry in `seg_priority` (158,720 gates). `seg_trade` adds the epoch check (442,336). §7.3's signed `SetMasterAuth` and `RotateEncKey` are not built: the owner's request covers both, and a signed rotation would need `seg_trade` to publish full entries.
+
+**Tests** (P2.17):
+
+- **Native**, batch 10:
+  - Alice's master key grants a session key, which rests a bid.
+  - The queue carries a rekey of her account from Bob's address, which has no effect, then her owner's rekey.
+  - Afterwards her session key and her old master key are refused, and her new master key rests an ask.
+  - Carol's sell meets Alice's bid, void since the rekey, and removes it without a fill.
+  - From the DA alone, only Alice's new keys open her account.
+- **Adversarial**, 3 new cases (90 in all):
+  - a rekey published under a key the operator was not given;
+  - a session key acting after a rekey;
+  - an operator applying a rekey of someone else's account, which the circuit consumes without effect, so the state it proves is not the one the operator claims.
+- **Bridge TXE**, 4 new tests (86 in all): `rekey` queues the new keys with the caller and charges the fee; it refuses a key that does not open its commitment, and a caller who cannot pay; an unprocessed rekey blocks settlement after `T_force`.
+- **Exit test:** Bob rekeys through the Bridge before the operator stops. Batch 3 executes the rekey with his forced withdrawal, and his exit client opens his account only with his new seed.
+
 **Tests** (P2.16):
 
 - **Native**, batch 9: market 0 publishes the stop's 25 lots at 1695 and the take-profit's 4 at 1795, so last 1795, VWAP 1708, high 1795, low 1695, volume 16 (29 rounded down), and the open interest rounded down; a market without fills publishes zero prints. Every root proof binds the market data through the header.
@@ -1421,10 +1448,10 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
 1. Fee tiers (§8.6): the tier table, and the operator action that sets an account's tier.
-2. `SetMasterAuth` and `RotateEncKey` (§7.3): which paths may rotate an account's authorization (the master key, a client proof, the owner's Aztec account through a priority request) and how a new `k_enc` reaches the operator.
-3. Per-order display of size [D1]: how displayed orders are published.
-4. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
-5. Resting reduce-only orders with trimming, and stop orders that open a position.
+2. Per-order display of size [D1]: how displayed orders are published.
+3. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
+4. Resting reduce-only orders with trimming, and stop orders that open a position.
+5. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
 
 From P3: the ranking of ADL counterparties (§8.5).
 

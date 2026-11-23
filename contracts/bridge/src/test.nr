@@ -13,17 +13,18 @@ use bb_proof_verification::{UltraHonkVerificationKey, UltraHonkZKProof};
 use l3x_exchange::{
     account::{account_leaf, AccountPriv, AccountPub, enc, enc_commitment, master_auth_of, Position},
     consts::{
-        ACCOUNTS_HEIGHT, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, MAX_WD_BATCH, PROTOCOL_ACCOUNTS,
-        WD_HEIGHT,
+        ACCOUNTS_HEIGHT, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_WD_NODE, KIND_REKEY, MAX_WD_BATCH,
+        PROTOCOL_ACCOUNTS, WD_HEIGHT,
     },
     state::{genesis_state_root, MARKET_DATA_LEN, market_data_hash},
     deposit_blind,
+    request::payload_hash,
     tree::merkle_root,
     withdrawal_record, withdrawals_root,
 };
 use l3x_types::{
-    BatchHeader, config_hash, DA_MAX, da_hash_flat, hash::hash, merge::{VK_TREE_LEAVES, vk_tree_root_of}, receipt_leaf,
-    receipt_node,
+    BatchHeader, config_hash, DA_MAX, da_hash_flat, hash::hash, merge::{VK_TREE_LEAVES, vk_tree_root_of}, priority_entry,
+    receipt_leaf, receipt_node,
 };
 
 global ROOT_VK: Field = 0x1234;
@@ -528,6 +529,44 @@ unconstrained fn register_queues_with_the_caller_as_owner() {
 unconstrained fn register_rejects_a_wrong_key() {
     let e = setup();
     e.env.call_private(e.alice, L3XBridge::at(e.bridge).register(master_auth_of(1, 2), enc_commitment(0xbeef), 0xbeee));
+}
+
+// ---- Rekey (SPEC.md §7.3) ----
+
+#[test]
+unconstrained fn rekey_pays_the_fee_and_queues_the_new_keys_with_the_caller() {
+    let e = setup();
+    let k_enc = 0xcafe;
+    let (auth, commitment) = (master_auth_of(3, 4), enc_commitment(k_enc));
+    e.env.call_private(e.alice, L3XBridge::at(e.bridge).rekey(2, auth, commitment, k_enc));
+    let (_, _, _, _, cursor, count) = tip(e);
+    assert((cursor == 0) & (count == 1));
+    // The circuit applies it only if the caller owns account 2 (seg_priority `republish`).
+    let (_, entry, time) = e.env.view_public(L3XBridge::at(e.bridge).get_priority(0));
+    assert(entry == priority_entry(payload_hash(KIND_REKEY, 2, auth, commitment), e.alice.to_field(), time));
+    assert(balance(e, e.operator) == REQUEST_FEE);
+    assert(balance(e, e.alice) == 10_000 - REQUEST_FEE);
+}
+
+#[test(should_fail_with = "k_enc does not open the commitment")]
+unconstrained fn rekey_rejects_a_key_the_operator_could_not_use() {
+    let e = setup();
+    e.env.call_private(e.alice, L3XBridge::at(e.bridge).rekey(2, master_auth_of(3, 4), enc_commitment(0xcafe), 0xcafd));
+}
+
+#[test(should_fail)]
+unconstrained fn rekey_needs_the_request_fee() {
+    let e = setup();
+    // Bob holds no tokens, so he cannot pay the fee.
+    e.env.call_private(e.bob, L3XBridge::at(e.bridge).rekey(3, master_auth_of(3, 4), enc_commitment(0xcafe), 0xcafe));
+}
+
+#[test(should_fail_with = "priority request overdue")]
+unconstrained fn an_unprocessed_rekey_blocks_settlement() {
+    let e = setup();
+    e.env.call_private(e.alice, L3XBridge::at(e.bridge).rekey(2, master_auth_of(3, 4), enc_commitment(0xcafe), 0xcafe));
+    let now = now_plus(e, T_FORCE + 10);
+    settle(e, e.operator, next_header(e, now, 0), now);
 }
 
 #[test]

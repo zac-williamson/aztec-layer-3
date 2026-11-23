@@ -137,10 +137,7 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
         // CancelAll, and matching removes the void orders when it meets them.
         assert(below(e, mm), "account is not liquidatable");
         assert(s.actv.open_orders > 0, "no orders to cancel");
-        act.epoch = s.actv.epoch + 1;
-        act.open_orders = 0;
-        act.open_bid = [0; MARKETS];
-        act.open_ask = [0; MARKETS];
+        act = s.actv.cancel_all();
     } else if s.kind == LIQ_CLOSE {
         assert(below(e, mm), "account is not liquidatable");
         assert(s.actv.open_orders == 0, "orders must be cancelled first");
