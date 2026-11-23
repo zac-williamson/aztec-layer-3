@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), and fee tiers (P2.18), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), and displayed orders (P2.19), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -340,6 +340,7 @@ Default fractions follow Lighter: `imr = 1/max_leverage` (2% at 50×), `mmr = 0.
   - Each interval, `cum_funding += rate·mark`.
   - Positions settle funding lazily when touched, and equity always includes accrued funding.
 - **Public output**: per batch and market, the header's `market_data` carries index, mark, funding rate, cumulative funding, best bid and ask prices, the print summary (last, VWAP, high and low of the batch's fills) and the batch's volume and the open interest, each rounded down to a power of two [D1]. Consumers should treat these as the prices of one venue: proven to follow the rules, not proven sound.
+- **Displayed orders** [D1], as built (P2.19): an order placed with the display flag publishes its resting lots whenever they change: on resting, modification, cancellation, every fill, and removal. Each entry is `[TAG_DISPLAY, (market·2 + side)·2^80 + price·2^48 + seq, lots]`, in clear in the DA, with zero when the order leaves the book; no entry names its owner. A CancelAll voids displayed orders without enumerating them, so a void displayed order stays in the displayed book until matching or maintenance removes it. Anyone can rebuild the displayed book from the DA alone.
 
 ### 8.5 Liquidation
 
@@ -1345,6 +1346,19 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Test parameters.** Tier 0 pays the markets' rates, tier 1 nothing, tier 2 half the maker and 80% of the taker rate, and tier 3 double the taker rate.
 - **Cost.** `seg_refresh` 174,605 gates, `seg_trade` 442,825, `seg_trigger` 152,825, `seg_liquidate` 260,076.
 
+**Displayed orders** (P2.19, §8.4, [D1]):
+
+- **Placement.** `PlaceOrder`'s last payload field, which had to be zero, is the display flag (0 or 1). Session keys may display. The order leaf packs `side + 2·display`, so the flag is bound by the book path and costs no hash input.
+- **Publication.** Wherever a displayed order's resting lots change, the segment appends a plaintext DA entry, `[TAG_DISPLAY = 6, (market·2 + side)·2^80 + price·2^48 + seq, lots]`: after it rests (`seg_trade`), after a modification or cancellation (`seg_trade`), after every matching step that fills, removes or self-trade-cancels it (`match_order`, so in `seg_trade`, `seg_trigger`, `seg_forced` and `seg_liquidate`), and after a maintenance removal (`seg_refresh`). The entry carries no account. Undisplayed orders publish nothing.
+- **Void orders.** CancelAll, a forced cancel-all, a liquidation's cancel step and a rekey void orders by an epoch, without enumerating them. A displayed order voided this way stays in the displayed book until matching or maintenance removes it, and the removal is published. The engine's maintenance removes void displayed orders like any dead order.
+- **Readers.** `scripts/src/exchange/da.ts` decodes display entries, and `displayedBook` rebuilds the displayed book from them alone.
+- **Cost.** An entry is three fields, since each DA field costs a sponge step in every branch. `seg_trade` 450,232 gates, `seg_trigger` 153,788, `seg_forced` 107,361, `seg_refresh` 176,281. `seg_liquidate` is 261,999, 145 gates under 2^18: its next addition will double its proving size unless something else gives way.
+
+**Tests** (P2.19):
+
+- **Native**, batch 12: Dave displays an ask and Bob a bid, which Bob reduces. Alice's buy fills Dave's undisplayed ask, then part of his displayed one. Dave cancels; Bob cancels all and maintenance removes his void bid; Bob displays a new ask. The batch publishes seven entries, with lots 20, 15, 10, 5, 0, 0 and 3. The displayed book rebuilt from the DA holds only Bob's new ask, and the undisplayed order never appears.
+- **Adversarial**, 3 new cases (95 in all): a display flag out of range, a displayed order filled as if undisplayed, and one cancelled as if undisplayed.
+
 **Tests** (P2.18):
 
 - **Native**, batch 11: the operator moves Bob to tier 1 and Dave to tier 2. Bob buys 50 lots from Dave's ask and pays no taker fee; Dave pays 10 as maker instead of 19. Dave then sells 30 into Alice's bid, paying 22 as taker instead of 27, while Alice in tier 0 pays the full 11 as maker. The batch sweeps exactly the 43 collected.
@@ -1462,10 +1476,9 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
-1. Per-order display of size [D1]: how displayed orders are published.
-2. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
-3. Resting reduce-only orders with trimming, and stop orders that open a position.
-4. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
+1. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
+2. Resting reduce-only orders with trimming, and stop orders that open a position.
+3. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
 
 From P3: the ranking of ADL counterparties (§8.5).
 

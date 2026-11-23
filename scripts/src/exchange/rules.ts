@@ -158,10 +158,13 @@ export function orderIndex(side: bigint, price: bigint, seq: bigint): bigint {
 export const RIGHTMOST = (1n << 80n) - 1n;
 export const LEFTMOST = 0n;
 
-/** A resting order; `epoch` is its owner's order epoch when it was placed (SPEC.md §6.5). */
-export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint; epoch: bigint };
-export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint, epoch: bigint) =>
-  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side, account, lots, expiry, epoch]);
+/**
+ * A resting order; `epoch` is its owner's order epoch when it was placed (SPEC.md §6.5), and
+ * `display` whether its owner opted to display its size [D1].
+ */
+export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint; epoch: bigint; display?: boolean };
+export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint, epoch: bigint, display = false) =>
+  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side + (display ? 2n : 0n), account, lots, expiry, epoch]);
 export const expired = (o: { expiry: bigint }, now: bigint) => o.expiry !== 0n && o.expiry < now;
 export const askLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.ASK ? o.lots : 0n);
 export const bidLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.BID ? o.lots : 0n);

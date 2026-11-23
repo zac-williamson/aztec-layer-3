@@ -5,7 +5,7 @@
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
 import { type BatchWitness, type ProvedBatch, Prover, assert, executeBatch, foldReceipt, newApi, proveBatch, receiptLeaf, receiptPath } from '../pipeline.ts';
-import { decodeBatch, openAccount, rebuildAccounts } from './da.ts';
+import { decodeBatch, displayedBook, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
 import { p256Key } from './p256.ts';
@@ -582,13 +582,51 @@ async function main() {
   const b11 = await settle(w11);
   assert(b11.header[0] === b10.header[1], 'batch 11 does not chain from batch 10');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the eleven
+  // Batch 12 (P2.19): displayed orders [D1]. Dave displays an ask of 20 at 1820 and Bob a bid of
+  // 15 at 1780, which he reduces to 10. Alice buys 25: Dave's undisplayed 10 at 1810 first, then 15
+  // of his displayed ask, which shows 5 left. Dave cancels it. Bob cancels all: his displayed bid is
+  // void at once but leaves the displayed book only when maintenance removes it. Bob then displays
+  // an ask of 3 at 1850. Every change publishes the order's lots, never its owner; undisplayed
+  // orders publish nothing.
+  await engine.beginBatch(12n, b11.end.priorityHead, b11.end.priorityCursor, b11.end.time);
+  const t12 = t11 + 100n;
+  await engine.block(t12, [await update(0n, 1800n, 1800n, t12 - 1n)]);
+  const restingOrder = (account: bigint, price: bigint) => [...engine.orders[0].values()].find((o) => o.account === account && o.price === price)!;
+  await engine.trade([
+    await act(dave, D, nx(D), PLACE, [0n, ASK, 1820n, 20n, GTC, 0n, 0n, 1n]),
+    await act(bob, B, nx(B), PLACE, [0n, BID, 1780n, 15n, GTC, 0n, 0n, 1n]),
+  ]);
+  const daveAsk = restingOrder(D, 1820n);
+  const bobBid = restingOrder(B, 1780n);
+  await engine.trade([await act(bob, B, nx(B), MODIFY, [0n, BID, 1780n, bobBid.seq, 10n])]);
+  await engine.trade([await act(alice2, A, nx(A), PLACE, [0n, BID, 1820n, 25n, IOC, 0n])]);
+  await engine.trade([await act(dave, D, nx(D), CANCEL, [0n, ASK, 1820n, daveAsk.seq])]);
+  await engine.trade([await act(bob, B, nx(B), CANCEL_ALL, [])]);
+  await engine.maintenance({ clean: [{ market: 0, index: X.orderIndex(BID, 1780n, bobBid.seq) }] });
+  await engine.trade([await act(bob, B, nx(B), PLACE, [0n, ASK, 1850n, 3n, GTC, 0n, 0n, 1n])]);
+  assert(Number(engine.rejected.length) === rejected10 + 2, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 12');
+  const w12 = await engine.endBatch();
+  log(`batch 12: ${w12.segments.map((s) => s.label).join(' | ')}; ${w12.daPayload.length} DA fields`);
+  const b12 = await settle(w12);
+  assert(b12.header[0] === b11.header[1], 'batch 12 does not chain from batch 11');
+  // From the DA alone: the displayed orders' every change, and the displayed book they leave.
+  const shown = decodeBatch(12n, b12.daPayload).displays;
+  assert(shown.map((d) => d.lots).join() === '20,15,10,5,0,0,3', `display entries: ${shown.map((d) => d.lots)}`);
+  const bobAsk = restingOrder(B, 1850n);
+  const displayed = [...displayedBook(shown)];
+  assert(displayed.length === 1 && displayed[0][0] === `0:${ASK}:1850:${bobAsk.seq}` && displayed[0][1] === 3n, `displayed book: ${displayed}`);
+  assert(!shown.some((d) => d.price === 1810n), "an undisplayed order's lots were published");
+  log(`display: ${shown.length} entries in batch 12 (lots ${shown.map((d) => d.lots).join(', ')}); the displayed book rebuilt from the DA holds bob's ask of 3 at 1850`);
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the twelve
   // batches, then open every user's account and compare with the engine. Alice opens hers with
   // the keys her owner rekeyed it to; her old keys no longer open it.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b11.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b12.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   const oldKeysOpen = await openAccount(h, rebuilt, alice.kEnc, await M.masterAuthOf(h, alice.pk!.x, alice.pk!.y)).then(
     () => true,
     () => false,
@@ -609,16 +647,16 @@ async function main() {
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 41n && pos(B).positions[0].size === 20n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 66n && pos(B).positions[0].size === 20n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 11 ${hex(b11.headerHash)}`);
+  log(`header of batch 12 ${hex(b12.headerHash)}`);
   await api.destroy();
 }
 

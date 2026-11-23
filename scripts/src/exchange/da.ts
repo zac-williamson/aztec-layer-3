@@ -16,10 +16,13 @@ export type AccountEntry = {
   ct: bigint[];
 };
 export type WithdrawalEntry = { batch: bigint; pos: number; record: bigint };
+/** A displayed order's resting lots after a change [D1]; zero when it left the book. */
+export type DisplayEntry = { batch: bigint; pos: number; market: bigint; side: bigint; price: bigint; seq: bigint; lots: bigint };
 
 export function decodeBatch(batch: bigint, payload: bigint[]) {
   const accounts: AccountEntry[] = [];
   const withdrawals: WithdrawalEntry[] = [];
+  const displays: DisplayEntry[] = [];
   let daNonce: bigint | undefined;
   let pos = 0;
   while (pos < payload.length) {
@@ -47,11 +50,31 @@ export function decodeBatch(batch: bigint, payload: bigint[]) {
     } else if (tag === M.TAG.WD) {
       withdrawals.push({ batch, pos, record: payload[pos + 1] });
       pos += 2;
+    } else if (tag === M.TAG.DISPLAY) {
+      const key = payload[pos + 1];
+      const ms = key >> 80n;
+      displays.push({ batch, pos, market: ms >> 1n, side: ms & 1n, price: (key >> 48n) & 0xffffffffn, seq: key & ((1n << 48n) - 1n), lots: payload[pos + 2] });
+      pos += 3;
     } else {
       throw new Error(`unknown DA tag ${tag} at ${pos}`);
     }
   }
-  return { accounts, withdrawals };
+  return { accounts, withdrawals, displays };
+}
+
+/**
+ * The displayed book [D1], from published display entries alone: each displayed order's latest
+ * resting lots, keyed `market:side:price:seq`. An order voided by its owner's CancelAll stays
+ * listed until matching or maintenance removes it.
+ */
+export function displayedBook(entries: DisplayEntry[]) {
+  const book = new Map<string, bigint>();
+  for (const e of entries) {
+    const k = `${e.market}:${e.side}:${e.price}:${e.seq}`;
+    if (e.lots === 0n) book.delete(k);
+    else book.set(k, e.lots);
+  }
+  return book;
 }
 
 export async function decrypt(h: M.H, kEnc: bigint, e: AccountEntry): Promise<M.AccountPriv> {

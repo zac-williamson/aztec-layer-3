@@ -34,11 +34,14 @@ pub struct Order {
     /// The owner's order epoch when the order was placed. Once the owner's epoch moves past it
     /// (CancelAll) the order is void: matching removes it, and it no longer counts as open.
     pub epoch: u64,
+    /// The owner opted to display the order's size (SPEC.md §8.4, [D1]): every change to its
+    /// resting lots is published, without its owner.
+    pub display: bool,
 }
 
 impl Order {
     pub fn empty() -> Self {
-        Order { side: 0, account_index: 0, lots: 0, expiry: 0, epoch: 0 }
+        Order { side: 0, account_index: 0, lots: 0, expiry: 0, epoch: 0, display: false }
     }
 
     /// The leaf value; an order with no lots left is the empty leaf.
@@ -47,7 +50,10 @@ impl Order {
             0
         } else {
             hash(
-                [DS_ORDER, self.side, self.account_index as Field, self.lots as Field, self.expiry as Field, self.epoch as Field],
+                [
+                    DS_ORDER, self.side + (self.display as Field) * 2, self.account_index as Field, self.lots as Field,
+                    self.expiry as Field, self.epoch as Field,
+                ],
             )
         }
     }

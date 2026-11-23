@@ -59,7 +59,9 @@ export const KEY_SLOTS = 256;
 export const MASTER_KEY = 256n;
 export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n, REKEY: 6n } as const;
 export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n, TRIGGER: 7n, TIER: 8n } as const;
-export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
+export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n, DISPLAY: 6n } as const;
+/** A display entry's key (da.nr `emit_display`): (market·2 + side)·2^80 + price·2^48 + seq. */
+export const displayKey = (market: bigint, side: bigint, price: bigint, seq: bigint) => ((market * 2n + side) << 80n) + (price << 48n) + seq;
 export const PLAINTEXT_LEN = 2 + MARKETS;
 export const CHANGE_ENTRY_LEN = 3 + PLAINTEXT_LEN;
 export const FULL_ENTRY_LEN = 7 + PLAINTEXT_LEN;

@@ -4,7 +4,7 @@ use crate::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Position},
     book::{Order, order_index, Sibling, SIDE_BID, walk},
     consts::{ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, FEE_TIERS, MAX_COLLATERAL},
-    da::emit_change,
+    da::{emit_change, emit_display},
     params::FeeTier,
     state::{Market, State},
     trade::{abs, fill, settle_funding, tier_fee},
@@ -110,11 +110,15 @@ pub fn match_order<let F: u32>(
                     lots: f.order.lots - q,
                     expiry: f.order.expiry,
                     epoch: f.order.epoch,
+                    display: f.order.display,
                 }
             } else {
                 Order::empty()
             };
             mkt.book_root = walk(left.leaf(), left.ask_lots(), left.bid_lots(), f.index, f.book_path).root;
+            if f.order.display {
+                r = emit_display(r, mid, f.order.side, f.price, f.seq, left.lots);
+            }
             if own {
                 // A void order of the taker's no longer counts as open; only a live one shrinks its lots.
                 if f.order.epoch == t.act.epoch {

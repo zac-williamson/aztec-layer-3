@@ -98,6 +98,9 @@ pub global TAG_CHANGE: Field = 2; // [tag, index, leaf, ct × PLAINTEXT_LEN]: pu
 pub global TAG_REFRESH: Field = 3; // [tag, index, leaf, owner, master_auth, enc_commitment, class, ct × PLAINTEXT_LEN]
 pub global TAG_WD: Field = 4; // [tag, record]
 pub global TAG_FULL: Field = 5; // TAG_REFRESH's layout for a new leaf: registration
+/// [tag, (market·2 + side)·2^80 + price·2^48 + seq, lots]: a displayed order's resting lots, in
+/// clear, whenever they change; zero when it leaves the book (SPEC.md §8.4, [D1]).
+pub global TAG_DISPLAY: Field = 6;
 pub global SEG_HEADER_LEN: u32 = 2;
 /// Encrypted plaintext of an account entry: collateral, one packed position per market, blind.
 pub global PLAINTEXT_LEN: u32 = 2 + MARKETS;

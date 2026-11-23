@@ -199,7 +199,7 @@ async function main() {
   await expectFail('block time regresses', 'seg_block', t, 'time regressed');
   // The operator hides the bids to move the mark: an empty side must be proved empty.
   t = clone(tick);
-  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0' } };
+  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false } };
   await expectFail('tick hides the best bid', 'seg_block', t, 'empty bid side path');
   t = clone(tick);
   t.updates[0].ask.seq = (BigInt(t.updates[0].ask.seq) + 2n).toString(); // a later ask at the same price (not the leaf's sibling)
@@ -716,6 +716,25 @@ async function main() {
   t = clone(R.segments.at(-1)!.inputs);
   t.tiers[0].account_index = '9';
   await expectFail('a fee tier for an account that does not exist', 'seg_refresh', t, 'Merkle path does not match root');
+
+  // Display [D1]: the flag is 0 or 1, and a displayed order is in the book's leaf, so the operator
+  // cannot fill or cancel it as if undisplayed, which would skip publishing its new lots.
+  t = clone(quiet);
+  await resign(t, 0, 2, 2n, PLACE, [0n, BID, 1990n, 5n, GTC, 0n, 0n, 2n]);
+  await expectFail('a display flag out of range', 'seg_trade', t, 'display flag');
+  const rNonce = (i: bigint) => R.actv.get(i)!.nonce + 1n;
+  await R.trade([await signAction(h, R.domain, rKeys[1], PLACE, idx(1), rNonce(idx(1)), [0n, ASK, 2001n, 2n, GTC, 0n, 0n, 1n])]);
+  await R.trade([await signAction(h, R.domain, rNext, PLACE, R0, rNonce(R0), [0n, BID, 2001n, 1n, IOC, 0n])]);
+  t = clone(R.segments.at(-1)!.inputs);
+  assert(t.actions[0].fills[0].order.display === true, 'the fill is against the displayed ask');
+  t.actions[0].fills[0].order.display = false;
+  await expectFail('a displayed order filled as if undisplayed', 'seg_trade', t, 'maker order path');
+  const shownAsk = [...R.orders[0].values()].find((o) => o.account === idx(1))!;
+  await R.trade([await signAction(h, R.domain, rKeys[1], X.KIND_ACT.CANCEL, idx(1), rNonce(idx(1)), [0n, ASK, 2001n, shownAsk.seq])]);
+  t = clone(R.segments.at(-1)!.inputs);
+  t.actions[0].cancel_display = false;
+  await expectFail('a displayed order cancelled as if undisplayed', 'seg_trade', t, 'book path does not match root');
+  assert(R.rejected.length === 0, `display setup rejected: ${R.rejected.map((r) => r.reason)}`);
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

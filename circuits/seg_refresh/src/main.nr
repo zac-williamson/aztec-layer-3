@@ -6,7 +6,7 @@ use l3x_exchange::{
         DS_TIER, FEE_INDEX, FEE_TIERS, INSURANCE_INDEX, LOG_CLEANUP, LOG_TIER, MARKETS, MAX_COLLATERAL, MICRO,
         PROTOCOL_ACCOUNTS, TAG_REFRESH,
     },
-    da::{emit_change, emit_full, open_segment, segment_nonce},
+    da::{emit_change, emit_display, emit_full, open_segment, segment_nonce},
     liq::below,
     params::Params,
     state::State,
@@ -135,6 +135,13 @@ fn main(
     }
     let da_nonce = segment_nonce(start, end.action_log);
     end = open_segment(end, da_nonce);
+    // A removed displayed order leaves the displayed book (SPEC.md §8.4, [D1]).
+    for i in 0..CL {
+        if (i < n_clean) & removals[i].order.display {
+            let c = removals[i];
+            end = emit_display(end, c.market, c.order.side, c.price, c.seq, 0);
+        }
+    }
     if sweep {
         for k in 0..PROTOCOL_ACCOUNTS {
             let w = protocol[k];

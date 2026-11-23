@@ -6,7 +6,7 @@ use l3x_exchange::{
         KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_COLLATERAL, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
         MAX_PRICE, PPM,
     },
-    da::{emit_change, open_segment, segment_nonce},
+    da::{emit_change, emit_display, open_segment, segment_nonce},
     matching::{assert_no_crossing, Fill, match_order, Taker},
     params::Params,
     sig::{assert_signed, Signature},
@@ -55,9 +55,10 @@ struct Action {
     /// Place: the path of the resting slot (GTC, post-only) or of the no-crossing probe (IOC
     /// remainder). Cancel and modify: the path of the order.
     rest_path: [Sibling; BOOK_HEIGHT],
-    /// Cancel and modify: the order's remaining lots and expiry.
+    /// Cancel and modify: the order's remaining lots, expiry and display flag.
     cancel_lots: u64,
     cancel_expiry: u64,
+    cancel_display: bool,
     /// Transfer: the destination account, its key and its path after the source's debit.
     dest_pub: AccountPub,
     dest_priv: AccountPriv,
@@ -167,7 +168,7 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     if a.kind == KIND_PLACE {
         place(state, running, a, act, da_nonce, params)
     } else if (a.kind == KIND_CANCEL) | (a.kind == KIND_MODIFY) {
-        (cancel(state, a, act), running)
+        cancel(state, running, a, act)
     } else if a.kind == KIND_WITHDRAW {
         withdraw(state, running, a, act, da_nonce, params)
     } else if a.kind == KIND_TRANSFER {
@@ -271,7 +272,9 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
     let rests = (tif == TIF_GTC) | (tif == TIF_POST_ONLY) | (tif == TIF_GTT);
     // GTT (SPEC.md §6.5): a resting order with an expiry in the future; other orders have none.
     let expiry = a.p[6] as u64;
-    assert((expiry as Field == a.p[6]) & (a.p[7] == 0), "expiry");
+    assert(expiry as Field == a.p[6], "expiry");
+    assert((a.p[7] == 0) | (a.p[7] == 1), "display flag");
+    let display = a.p[7] == 1;
     assert((tif == TIF_GTT) == (expiry != 0), "only GTT orders expire");
     assert((expiry == 0) | (expiry > r.time), "order already expired");
     // P2: reduce-only orders do not rest, so a later position change never has to trim them.
@@ -329,8 +332,11 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         let seq = market.next_seq;
         let slot = assert_no_crossing(market.book_root, side, price, seq, a.rest_path);
         if rests {
-            let o = Order { side, account_index: idx, lots: remaining, expiry, epoch: act.epoch };
+            let o = Order { side, account_index: idx, lots: remaining, expiry, epoch: act.epoch, display };
             market.book_root = walk(o.leaf(), o.ask_lots(), o.bid_lots(), slot, a.rest_path).root;
+            if display {
+                r = emit_display(r, mid, side, price as u32, seq, remaining);
+            }
             market.next_seq = seq + 1;
             if side == SIDE_BID {
                 act.open_bid[mid] += remaining;
@@ -443,8 +449,9 @@ fn cancel_all(state: State, a: Action, act_auth: Activity) -> State {
 /// lots): removes the account's resting order, or reduces it in place to `lots`, which keeps its
 /// place in the queue (SPEC.md §7.3). A modification that would add lots or move the price is a
 /// cancellation and a new order.
-fn cancel(state: State, a: Action, act_auth: Activity) -> State {
+fn cancel(state: State, running: Running, a: Action, act_auth: Activity) -> (State, Running) {
     let mut st = state;
+    let mut r = running;
     // The account's leaf authenticates the signing key.
     let leaf = account_leaf(a.taker_pub, a.taker_priv);
     st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, a.account_index, leaf, leaf, a.taker_acct_path);
@@ -465,14 +472,18 @@ fn cancel(state: State, a: Action, act_auth: Activity) -> State {
     // Only a live order can be cancelled or modified: a void one is already gone from the account's
     // open lots, and its leaf records an earlier epoch.
     let epoch = a.taker_actv.epoch;
-    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry, epoch };
+    let display = a.cancel_display;
+    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry, epoch, display };
     let kept = if modify {
-        Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry, epoch }
+        Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry, epoch, display }
     } else {
         Order::empty()
     };
     let (root, _) = replace(st.markets[mid].book_root, index, o, kept, a.rest_path);
     st.markets[mid].book_root = root;
+    if display {
+        r = emit_display(r, mid, side, price, seq, lots);
+    }
     let mut act = act_auth;
     let removed = a.cancel_lots - lots;
     if side == SIDE_BID {
@@ -485,5 +496,5 @@ fn cancel(state: State, a: Action, act_auth: Activity) -> State {
     }
     st.activity_root =
         update(DS_ACTV_NODE, st.activity_root, a.account_index, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
-    st
+    (st, r)
 }
