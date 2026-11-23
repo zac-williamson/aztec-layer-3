@@ -304,6 +304,7 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         a.n_fills,
         mp.maker_fee_ppm,
         mp.taker_fee_ppm,
+        params.fee_tiers,
         da_nonce,
     );
     st = st2;

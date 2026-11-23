@@ -228,6 +228,14 @@ pub fn fee(lots: u64, price: u64, rate_ppm: u64) -> u64 {
     ((num + (PPM as u128) - 1) / (PPM as u128)) as u64
 }
 
+/// A trading fee at a fee tier (SPEC.md §8.6): the market's rate scaled by the tier's factor,
+/// ceil(lots · price · rate · factor / PPM²), rounded against the account once.
+pub fn tier_fee(lots: u64, price: u64, rate_ppm: u64, factor_ppm: u64) -> u64 {
+    let ppm2 = (PPM as u128) * (PPM as u128);
+    let num = (lots as u128) * (price as u128) * (rate_ppm as u128) * (factor_ppm as u128);
+    ((num + ppm2 - 1) / ppm2) as u64
+}
+
 /// Equity at the markets' marks, including unrealized funding (SPEC.md §8.3):
 /// collateral + Σ_m [size_m · mark_m − entry_m + funding_credit_m].
 pub fn equity(acct: AccountPriv, markets: [Market; MARKETS]) -> i64 {

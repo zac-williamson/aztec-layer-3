@@ -66,6 +66,8 @@ export function settleFunding(collateral: bigint, pos: M.Position, cum: bigint):
 
 /** ceil(lots · price · rate / PPM). */
 export const fee = (lots: bigint, price: bigint, ratePpm: bigint) => (lots * price * ratePpm + PPM - 1n) / PPM;
+/** A trading fee at a fee tier (trade.nr `tier_fee`): the market's rate scaled by the tier's factor. */
+export const tierFee = (lots: bigint, price: bigint, ratePpm: bigint, factorPpm: bigint) => (lots * price * ratePpm * factorPpm + PPM * PPM - 1n) / (PPM * PPM);
 
 export const equity = (acct: M.AccountPriv, markets: M.Market[]) =>
   equityAt(acct, markets.map((m) => m.markPrice), markets.map((m) => m.cumFunding));

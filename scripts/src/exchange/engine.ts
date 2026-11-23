@@ -49,6 +49,8 @@ const TRADE_PER_SEGMENT = 2;
 const UPDATES_PER_BLOCK = 4;
 const REFRESH_PER_SEGMENT = 4;
 const CLEANUPS_PER_SEGMENT = 4;
+/** Fee-tier changes per maintenance segment (seg_refresh TC). */
+const TIERS_PER_SEGMENT = 2;
 const LIQ_PER_SEGMENT = 2;
 const FILLS = 2;
 const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
@@ -121,7 +123,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers' | 'rekey-owner' | 'revoked-keys'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers' | 'rekey-owner' | 'revoked-keys' | 'tiers'>();
 
   // The batch being built.
   running!: Running;
@@ -723,9 +725,11 @@ export class Engine {
    * refreshes the next accounts. A removal must be of a void or expired order unless the engine is
    * relaxed ('cleanup').
    */
-  async maintenance(opts: { sweep?: boolean; refresh?: number; clean?: { market: number; index: bigint }[] }) {
+  async maintenance(opts: { sweep?: boolean; refresh?: number; clean?: { market: number; index: bigint }[]; tiers?: { account: bigint; tier: bigint }[] }) {
     const n = opts.refresh ?? 0;
     const clean = opts.clean ?? [];
+    const tiers = opts.tiers ?? [];
+    assert(tiers.length <= TIERS_PER_SEGMENT, 'too many tier changes');
     assert(n <= REFRESH_PER_SEGMENT && BigInt(n) <= this.numAccounts, 'refresh count');
     assert(clean.length <= CLEANUPS_PER_SEGMENT, 'too many removals');
     const start = copyRunning(this.running);
@@ -760,6 +764,18 @@ export class Engine {
       }
       const msg = await this.h([M.DS.CLEAN, BigInt(c.market), o.side, o.price, o.seq]);
       this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, msg, M.LOG.CLEANUP);
+    }
+    // Fee tiers (SPEC.md §8.6): the operator's choice, logged; the circuit checks the tier exists.
+    const tierChanges: unknown[] = [];
+    for (const c of tiers) {
+      const act = this.actv.get(c.account);
+      assert(act, 'no such account');
+      assert(c.tier < BigInt(M.FEE_TIERS) || this.relax.has('tiers'), 'fee tier');
+      tierChanges.push({ account_index: c.account.toString(), tier: c.tier.toString(), actv: M.activityToNoir(act), actv_path: this.activity.path(c.account).map(hex) });
+      const nact = { ...M.copyActivity(act), feeTier: c.tier };
+      this.actv.set(c.account, nact);
+      await this.activity.set(c.account, await M.activityHash(this.h, nact));
+      this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, await this.h([M.DS.TIER, c.account, c.tier]), M.LOG.TIER);
     }
     const daNonce = await M.segmentNonce(this.h, start.batch, this.running.actionLog, start.daLen);
     await this.absorb(M.TAG.SEG);
@@ -799,13 +815,20 @@ export class Engine {
         this.refreshCursor = rec.index + 1n;
       }
     }
-    const label = [clean.length ? `remove ${clean.length} dead order${clean.length > 1 ? 's' : ''}` : '', opts.sweep ? `sweep (${swept.join(', ')})` : '', n ? `refresh [${indices.join(', ')}]` : '']
+    const label = [
+      clean.length ? `remove ${clean.length} dead order${clean.length > 1 ? 's' : ''}` : '',
+      tiers.length ? `fee tiers [${tiers.map((c) => `${c.account}: ${c.tier}`).join(', ')}]` : '',
+      opts.sweep ? `sweep (${swept.join(', ')})` : '',
+      n ? `refresh [${indices.join(', ')}]` : '',
+    ]
       .filter(Boolean)
       .join(', ');
     await this.finishSegment('seg_refresh', label || 'maintenance', {
       ...this.base(start, before),
       n_clean: clean.length,
       removals: pad(removals, CLEANUPS_PER_SEGMENT, () => ({ market: '0', price: '0', seq: '0', order: emptyOrder(), path: emptyBookPath(), ...emptyOwner() })),
+      n_tiers: tiers.length,
+      tiers: pad(tierChanges, TIERS_PER_SEGMENT, () => ({ account_index: '0', tier: '0', actv: M.activityToNoir(M.newActivity()), actv_path: zeros(M.ACCOUNTS_HEIGHT) })),
       sweep: !!opts.sweep,
       protocol,
       n,
@@ -1558,7 +1581,7 @@ export class Engine {
       this.insuranceMicro += mdust;
       const dm = o.side === M.SIDE.BID ? q : -q;
       const [ms, me, mpnl] = X.fill(mpos.size, mpos.entry, dm, o.price);
-      const mfee = X.fee(q, o.price, makerFeePpm);
+      const mfee = X.tierFee(q, o.price, makerFeePpm, this.params.feeTiers[Number(mact.feeTier)].makerPpm);
       this.shiftOi(m, mpos.size, ms);
       mpriv.positions[m] = { size: ms, entry: me, funding: mpos.funding };
       mpriv.collateral = mc + mpnl - mfee;
@@ -1583,7 +1606,7 @@ export class Engine {
       }
       const tpos = t.priv.positions[m];
       const [ts, te, tpnl] = X.fill(tpos.size, tpos.entry, -dm, o.price);
-      const tfee = X.fee(q, o.price, takerFeePpm);
+      const tfee = X.tierFee(q, o.price, takerFeePpm, this.params.feeTiers[Number(t.act.feeTier)].takerPpm);
       this.shiftOi(m, tpos.size, ts);
       t.priv.positions[m] = { size: ts, entry: te, funding: tpos.funding };
       t.priv.collateral = t.priv.collateral + tpnl - tfee;

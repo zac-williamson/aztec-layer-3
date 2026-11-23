@@ -24,7 +24,7 @@ const market = (imr: bigint, mmr: bigint, cmr: bigint, band: bigint, jump: bigin
 export const UNLISTED: M.MarketParams = market(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n);
 
 /**
- * Test parameters: three oracle publishers with a 2-of-3 threshold, indices at most an hour old
+ * Test parameters: three oracle publishers with a 2-of-3 threshold, four fee tiers, indices at most an hour old
  * for risk-increasing actions, hourly funding, and three listed markets (market 3 is unlisted):
  * - market 0: 10× (IM 10%, MM 6%, CM 4%), maker 2 bp, taker 5 bp;
  * - market 1: 20× (IM 5%, MM 3%, CM 2%), maker 1 bp, taker 4 bp;
@@ -48,6 +48,14 @@ export async function testParams(h: M.H, chainId = 31337n, instance = 1n) {
       market(50_000n, 30_000n, 20_000n, 50_000n, 100_000n, 20_000n, 100n, 400n, 10_000n),
       market(200_000n, 120_000n, 80_000n, 100_000n, 200_000n, 30_000n, 0n, 600n, 15_000n),
       UNLISTED,
+    ],
+    // Fee tiers (SPEC.md §8.6): 0, every new account's, pays the markets' rates; 1 pays nothing;
+    // 2 pays half the maker rate and 80% of the taker rate; 3 pays double the taker rate.
+    feeTiers: [
+      { makerPpm: 1_000_000n, takerPpm: 1_000_000n },
+      { makerPpm: 0n, takerPpm: 0n },
+      { makerPpm: 500_000n, takerPpm: 800_000n },
+      { makerPpm: 1_000_000n, takerPpm: 2_000_000n },
     ],
   };
   return { params, oracleSks: oracles.map((k) => k.sk), oracleSk: oracles[0].sk };

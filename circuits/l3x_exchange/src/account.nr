@@ -212,6 +212,8 @@ pub struct Activity {
     /// The account's key epoch (SPEC.md §7.3). Session keys record the epoch they were added in,
     /// and a rekey advances it, which revokes every session key at once.
     pub key_epoch: u64,
+    /// The account's fee tier (SPEC.md §8.6), set by the operator.
+    pub fee_tier: u32,
 }
 
 impl Activity {
@@ -224,6 +226,7 @@ impl Activity {
             open_ask: [0; MARKETS],
             epoch: 0,
             key_epoch: 0,
+            fee_tier: 0,
         }
     }
 
@@ -246,7 +249,7 @@ impl Activity {
         for m in 0..MARKETS {
             inputs[4 + m] = (self.open_bid[m] as Field) + (self.open_ask[m] as Field) * TWO_64;
         }
-        inputs[4 + MARKETS] = (self.epoch as Field) + (self.key_epoch as Field) * TWO_64;
+        inputs[4 + MARKETS] = (self.epoch as Field) + (self.key_epoch as Field) * TWO_64 + (self.fee_tier as Field) * TWO_128;
         hash(inputs)
     }
 }

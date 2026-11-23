@@ -44,6 +44,7 @@ export const DS = {
   DEP: 55n,
   TRIGGER: 56n,
   FIRE: 57n,
+  TIER: 58n,
 } as const;
 
 export const ACCOUNTS_HEIGHT = 32;
@@ -57,7 +58,7 @@ export const KEY_SLOTS = 256;
 /** The key id of actions the master key signs. */
 export const MASTER_KEY = 256n;
 export const KIND = { REGISTER: 1n, DEPOSIT: 2n, FORCED_WITHDRAW: 3n, FORCED_CLOSE: 4n, FORCED_CANCEL_ALL: 5n, REKEY: 6n } as const;
-export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n, TRIGGER: 7n } as const;
+export const LOG = { PRIORITY: 1n, BLOCK: 2n, ORACLE: 3n, SIGNED: 4n, LIQUIDATE: 5n, CLEANUP: 6n, TRIGGER: 7n, TIER: 8n } as const;
 export const TAG = { SEG: 1n, CHANGE: 2n, REFRESH: 3n, WD: 4n, FULL: 5n } as const;
 export const PLAINTEXT_LEN = 2 + MARKETS;
 export const CHANGE_ENTRY_LEN = 3 + PLAINTEXT_LEN;
@@ -87,7 +88,7 @@ export type AccountPriv = { collateral: bigint; positions: Position[]; blind: bi
  * An account's activity leaf (SPEC.md §6.4); `epoch` is its order epoch, which CancelAll advances
  * (§6.5), and `keyEpoch` its key epoch, which a rekey advances (§7.3).
  */
-export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[]; epoch: bigint; keyEpoch: bigint };
+export type Activity = { nonce: bigint; keysRoot: bigint; openOrders: bigint; openBid: bigint[]; openAsk: bigint[]; epoch: bigint; keyEpoch: bigint; feeTier: bigint };
 /** A session key (SPEC.md §7.2). */
 /** A session key; `epoch` is the account's key epoch when it was added, and it is live only while that holds. */
 export type Key = { pkX: bigint; pkY: bigint; marketMask: bigint; maxNotional: bigint; expiry: bigint; nonce: bigint; epoch: bigint };
@@ -151,7 +152,11 @@ export type Params = {
   maxAge: bigint;
   fundingInterval: bigint;
   markets: MarketParams[];
+  /** Fee tiers (SPEC.md §8.6): factors in ppm on every market's maker and taker rates. */
+  feeTiers: FeeTier[];
 };
+export type FeeTier = { makerPpm: bigint; takerPpm: bigint };
+export const FEE_TIERS = 4;
 /**
  * A priority request as queued. A Deposit's `b` commits to its amount and `c` is its refund address;
  * `deposit` is the opening the operator received by constrained delivery, never on chain.
@@ -170,7 +175,7 @@ export async function initModel(h: H) {
 }
 export const newActivity = (): Activity => {
   if (EMPTY_KEYS_ROOT === 0n) throw new Error('initModel was not called');
-  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n), epoch: 0n, keyEpoch: 0n };
+  return { nonce: 0n, keysRoot: EMPTY_KEYS_ROOT, openOrders: 0n, openBid: Array(MARKETS).fill(0n), openAsk: Array(MARKETS).fill(0n), epoch: 0n, keyEpoch: 0n, feeTier: 0n };
 };
 export const emptyKey = (): Key => ({ pkX: 0n, pkY: 0n, marketMask: 0n, maxNotional: 0n, expiry: 0n, nonce: 0n, epoch: 0n });
 export const keyLeaf = (h: H, k: Key) =>
@@ -254,7 +259,7 @@ export const blindOf = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number
 export const keystream = (h: H, k: bigint, idx: bigint, nonce: bigint, pos: number, i: number) =>
   h([DS.KS, k, idx, nonce, BigInt(pos + i)]);
 export const activityHash = (h: H, a: Activity) =>
-  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64), a.epoch + a.keyEpoch * TWO_64]);
+  h([DS.ACTV, a.nonce, a.keysRoot, a.openOrders, ...a.openBid.map((b, m) => b + a.openAsk[m] * TWO_64), a.epoch + a.keyEpoch * TWO_64 + a.feeTier * TWO_128]);
 
 export const marketHash = (h: H, m: Market) =>
   h([
@@ -323,7 +328,8 @@ export const marketParamsHash = (h: H, p: MarketParams) =>
 export async function paramsHash(h: H, p: Params) {
   const oracles = p.oraclePkX.flatMap((x, i) => [x, p.oraclePkY[i]]);
   const markets = await Promise.all(p.markets.map((m) => marketParamsHash(h, m)));
-  return h([DS.PARAMS, p.chainId, p.instance, ...oracles, p.oracleK, p.maxAge, p.fundingInterval, ...markets]);
+  const tiers = p.feeTiers.map((t) => t.makerPpm + t.takerPpm * TWO_64);
+  return h([DS.PARAMS, p.chainId, p.instance, ...oracles, p.oracleK, p.maxAge, p.fundingInterval, ...markets, ...tiers]);
 }
 export const domainOf = (h: H, p: Params) => h([DS.DOMAIN, p.chainId, p.instance]);
 
@@ -390,6 +396,7 @@ export const activityToNoir = (a: Activity) => ({
   open_ask: a.openAsk.map(String),
   epoch: a.epoch.toString(),
   key_epoch: a.keyEpoch.toString(),
+  fee_tier: a.feeTier.toString(),
 });
 export const marketToNoir = (m: Market) => ({
   book_root: hex(m.bookRoot),
@@ -449,6 +456,7 @@ export const paramsToNoir = (p: Params) => ({
   max_age: p.maxAge.toString(),
   funding_interval: p.fundingInterval.toString(),
   markets: p.markets.map(marketParamsToNoir),
+  fee_tiers: p.feeTiers.map((t) => ({ maker_ppm: t.makerPpm.toString(), taker_ppm: t.takerPpm.toString() })),
 });
 export const keyToNoir = (k: Key) => ({
   pk_x: hex(k.pkX),

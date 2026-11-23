@@ -37,6 +37,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.15**: stop and take-profit triggers. Each market keeps a trigger tree beside its book; every mark tick proves whether a trigger is due and, while one is, the market takes no new orders until the operator fires the due triggers in price-time order as reduce-only IOC orders.
 - **P2.16**: public market data per D1. Each batch publishes, per market, the last, VWAP, high and low of its fills, and its volume and the open interest rounded down to a power of two.
 - **P2.17**: key rotation. An account's owner rekeys it through the Bridge: a new master authorization and encryption key, the key delivered to the operator as at registration. A rekey revokes every session key and cancels every order at once, and is the way back for a lost or compromised master key.
+- **P2.18**: fee tiers. The configuration holds four tiers, each scaling every market's maker and taker rates; the operator sets an account's tier privately, and each side of a fill pays at its own tier.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -49,7 +50,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick that also flags due triggers |
 | `circuits/seg_priority` | X-segment: Register, Deposit, ForcedWithdraw and Rekey requests in queue order (refunds for missing accounts) |
 | `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, PlaceTrigger, CancelTrigger, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
-| `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
+| `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sets fee tiers, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
 | `circuits/seg_forced` | X-segment: a forced close or forced cancel-all from the priority queue |
 | `circuits/seg_trigger` | X-segment: the operator fires the next due stop or take-profit as a reduce-only IOC order and re-proves whether any is still due |
@@ -113,7 +114,7 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs ten batches natively across markets 0–2. They cover:
+This runs eleven batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
@@ -123,7 +124,8 @@ This runs ten batches natively across markets 0–2. They cover:
 - an order reduced in place that keeps its queue position, a session key's modification, and a transfer between accounts;
 - cancel-all by a session key, a master key and a forced request, with the void orders removed by later sells instead of filled;
 - stop and take-profit triggers fired in price-time order, and the batch's prints;
-- an owner's rekey, after which the account's session key and old master key are refused and its resting bid is void.
+- an owner's rekey, after which the account's session key and old master key are refused and its resting bid is void;
+- fee tiers set by the operator, with each side of a fill charged at its own tier.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -229,6 +231,8 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.16: tests | Native batch 9 checks market 0's prints and buckets; every root proof binds them; exit clients read the frozen market data from the DA log. |
 | P2.17: key rotation | `Bridge.rekey` queues the owner's new master authorization and encryption key and delivers the key to the operator; `seg_priority` applies it, advancing the account's key and order epochs, and republishes the account under the new key. |
 | P2.17: tests | Native batch 10 rekeys an account with a session key and a resting bid; 3 more adversarial witnesses (90 in all); 4 more Bridge TXE tests (86); the exit test's Bob exits with his rotated keys. |
+| P2.18: fee tiers | Four tiers of factors on the markets' rates in the configuration; the operator sets accounts' tiers in the maintenance segment, logged; fills charge each side at its tier. |
+| P2.18: tests | Native batch 11 charges a zero-fee taker, a discounted maker and taker, and a full-rate maker, and sweeps exactly their 43; 2 more adversarial witnesses (92 in all). |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats

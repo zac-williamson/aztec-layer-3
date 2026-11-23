@@ -58,6 +58,8 @@ pub global DS_DEP: Field = 55;
 /// A trigger's leaf, and a trigger firing's log message (SPEC.md §6.5).
 pub global DS_TRIGGER: Field = 56;
 pub global DS_FIRE: Field = 57;
+/// A fee-tier change, logged as H(DS_TIER, account, tier) (SPEC.md §8.6).
+pub global DS_TIER: Field = 58;
 /// Depth bound of a receipt path: two levels in the trade segment and the root, plus the merge
 /// tree's depth (SPEC.md §11).
 pub global RECEIPT_DEPTH: u32 = 24;
@@ -85,6 +87,10 @@ pub global LOG_LIQUIDATE: Field = 5;
 pub global LOG_CLEANUP: Field = 6;
 /// A trigger firing (SPEC.md §6.5), logged as H(DS_FIRE, market, index).
 pub global LOG_TRIGGER: Field = 7;
+/// A fee-tier change by the operator (SPEC.md §8.6).
+pub global LOG_TIER: Field = 8;
+/// Fee tiers (SPEC.md §8.6). Tier 0 is every new account's.
+pub global FEE_TIERS: u32 = 4;
 
 // DA entries (SPEC.md §9.5). Every entry starts with its tag and has a fixed length.
 pub global TAG_SEG: Field = 1; // [tag, da_nonce]: opens a segment's encryption context

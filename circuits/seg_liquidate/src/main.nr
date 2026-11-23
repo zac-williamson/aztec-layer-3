@@ -149,7 +149,7 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
         let limit = close_limit(pos.size, st.markets[m].mark_price, mp.mmr_ppm, e, mm);
         let taker = Taker { index: idx, priv: a0, act: s.actv, traded: false };
         let (st2, r2, market, t, remaining, notional) =
-            match_order(st, r, st.markets[m], m, side, limit, s.lots, taker, s.fills, s.n_fills, mp.maker_fee_ppm, 0, da_nonce);
+            match_order(st, r, st.markets[m], m, side, limit, s.lots, taker, s.fills, s.n_fills, mp.maker_fee_ppm, 0, params.fee_tiers, da_nonce);
         st = st2;
         r = r2;
         if remaining > 0 {

@@ -3,10 +3,11 @@
 use crate::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Position},
     book::{Order, order_index, Sibling, SIDE_BID, walk},
-    consts::{ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, MAX_COLLATERAL},
+    consts::{ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, FEE_TIERS, MAX_COLLATERAL},
     da::emit_change,
+    params::FeeTier,
     state::{Market, State},
-    trade::{abs, fee, fill, settle_funding},
+    trade::{abs, fill, settle_funding, tier_fee},
     tree::update,
 };
 use l3x_types::Running;
@@ -42,7 +43,8 @@ pub struct Taker {
 /// is the best on its side. A step cancels the taker's own order (self-trade prevention), removes
 /// a void order (its owner cancelled all since placing it) or an expired GTT order, or fills:
 /// fills execute at the maker's price, settle both sides' funding first, and charge
-/// `maker_fee_ppm` and `taker_fee_ppm` into `fees_pending`. Makers' leaves are
+/// `maker_fee_ppm` and `taker_fee_ppm`, each scaled by its account's fee tier in `tiers`, into
+/// `fees_pending` (SPEC.md §8.6). Makers' leaves are
 /// written and published here; the taker's is left to the caller. Returns the updated state,
 /// running values, market and taker, the unfilled lots and the filled notional.
 pub fn match_order<let F: u32>(
@@ -58,6 +60,7 @@ pub fn match_order<let F: u32>(
     n: u32,
     maker_fee_ppm: u64,
     taker_fee_ppm: u64,
+    tiers: [FeeTier; FEE_TIERS],
     da_nonce: Field,
 ) -> (State, Running, Market, Taker, u64, u64) {
     let mut st = state;
@@ -136,7 +139,8 @@ pub fn match_order<let F: u32>(
                     mact.open_orders = f.maker_actv.open_orders - 1;
                 }
                 if is_fill {
-                    let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, f, q, da_nonce);
+                    let maker_factor = tiers[f.maker_actv.fee_tier].maker_ppm;
+                    let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, maker_factor, f, q, da_nonce);
                     st = st2;
                     r = r2;
                     mkt = m2;
@@ -152,7 +156,7 @@ pub fn match_order<let F: u32>(
                     let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
                     let tpos = t.priv.positions[mid];
                     let (ts, te, tpnl) = fill(tpos.size, tpos.entry, 0 - dm, mp_price as i64);
-                    let tfee = fee(q, mp_price, taker_fee_ppm);
+                    let tfee = tier_fee(q, mp_price, taker_fee_ppm, tiers[t.act.fee_tier].taker_ppm);
                     mkt = shift_oi(mkt, tpos.size, ts);
                     t.priv.positions[mid] = Position { size: ts, entry: te, funding: tpos.funding };
                     t.priv.collateral = t.priv.collateral + tpnl - tfee as i64;
@@ -173,14 +177,15 @@ pub fn match_order<let F: u32>(
 }
 
 /// The maker side of a fill of `q` lots at the maker's price: settles the maker's funding, applies
-/// the fill and the maker fee, and writes and publishes the maker's leaf. The caller writes the
-/// maker's activity.
+/// the fill and the maker fee at the maker's tier, and writes and publishes the maker's leaf. The
+/// caller writes the maker's activity.
 fn fill_maker(
     state: State,
     running: Running,
     market: Market,
     mid: u32,
     maker_fee_ppm: u64,
+    maker_factor_ppm: u64,
     f: Fill,
     q: u64,
     da_nonce: Field,
@@ -194,7 +199,7 @@ fn fill_maker(
     st.insurance_micro += mdust;
     let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
     let (ms, me, mpnl) = fill(mpos.size, mpos.entry, dm, mp_price as i64);
-    let mfee = fee(q, mp_price, maker_fee_ppm);
+    let mfee = tier_fee(q, mp_price, maker_fee_ppm, maker_factor_ppm);
     mkt = shift_oi(mkt, mpos.size, ms);
     let mut mpriv = f.maker_priv;
     mpriv.positions[mid] = Position { size: ms, entry: me, funding: mpos.funding };

@@ -3,7 +3,8 @@ use l3x_exchange::{
     book::{Order, order_index, replace, Sibling, SIDE_BID},
     consts::{
         ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_FEE, CLASS_INSURANCE, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_CLEAN,
-        FEE_INDEX, INSURANCE_INDEX, LOG_CLEANUP, MARKETS, MAX_COLLATERAL, MICRO, PROTOCOL_ACCOUNTS, TAG_REFRESH,
+        DS_TIER, FEE_INDEX, FEE_TIERS, INSURANCE_INDEX, LOG_CLEANUP, LOG_TIER, MARKETS, MAX_COLLATERAL, MICRO,
+        PROTOCOL_ACCOUNTS, TAG_REFRESH,
     },
     da::{emit_change, emit_full, open_segment, segment_nonce},
     liq::below,
@@ -17,6 +18,16 @@ use l3x_types::{DS_ACTION_LOG, hash::hash, NodeOutput, Running};
 global RF: u32 = 4;
 /// Order removals per maintenance segment.
 global CL: u32 = 4;
+/// Fee-tier changes per maintenance segment.
+global TC: u32 = 2;
+
+/// The operator sets an account's fee tier (SPEC.md §8.6).
+struct TierChange {
+    account_index: u32,
+    tier: u32,
+    actv: Activity,
+    actv_path: [Field; ACCOUNTS_HEIGHT],
+}
 
 /// A resting order that is void or expired, and its owner's activity, which says which.
 struct Removal {
@@ -46,6 +57,9 @@ struct Item {
 /// is an operator action in the action log. A tick may use only a live order as its top of book
 /// (seg_block), so the operator removes dead orders from the top of a book before ticking it.
 ///
+/// It then sets up to TC accounts' fee tiers, each an operator action in the action log. The tier
+/// is the operator's choice (SPEC.md §8.6, not proven); the circuit checks only that it exists.
+///
 /// With `sweep`, it first credits the fees collected so far to the fee account, and the liquidation
 /// fees and whole units of funding remainders to the insurance account, which keeps those balances
 /// out of every trade's witness (SPEC.md §8.8).
@@ -66,6 +80,8 @@ fn main(
     state: State,
     n_clean: u32,
     removals: [Removal; CL],
+    n_tiers: u32,
+    tiers: [TierChange; TC],
     sweep: bool,
     protocol: [Item; PROTOCOL_ACCOUNTS],
     n: u32,
@@ -101,6 +117,20 @@ fn main(
             st.activity_root = update(DS_ACTV_NODE, st.activity_root, owner, c.owner_actv.hash(), act.hash(), c.owner_actv_path);
             let msg = hash([DS_CLEAN, c.market as Field, c.order.side, c.price as Field, c.seq as Field]);
             end.action_log = hash([DS_ACTION_LOG, end.action_log, msg, LOG_CLEANUP]);
+        }
+    }
+    assert(n_tiers <= TC, "too many tier changes");
+    for i in 0..TC {
+        if i < n_tiers {
+            let c = tiers[i];
+            assert(c.tier < FEE_TIERS, "fee tier");
+            let mut act = c.actv;
+            act.fee_tier = c.tier;
+            // Only an account has a non-empty activity leaf, so the account exists.
+            st.activity_root =
+                update(DS_ACTV_NODE, st.activity_root, c.account_index, c.actv.hash(), act.hash(), c.actv_path);
+            let msg = hash([DS_TIER, c.account_index as Field, c.tier as Field]);
+            end.action_log = hash([DS_ACTION_LOG, end.action_log, msg, LOG_TIER]);
         }
     }
     let da_nonce = segment_nonce(start, end.action_log);

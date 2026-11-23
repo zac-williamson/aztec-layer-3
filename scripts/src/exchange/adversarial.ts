@@ -703,6 +703,20 @@ async function main() {
   assert(R.rejected.length === 0, `rekey setup rejected: ${R.rejected.map((r) => r.reason)}`);
   await expectFail('session key acts after a rekey', 'seg_trade', R.segments.at(-1)!.inputs, 'session key revoked by a rekey');
 
+  // Fee tiers (SPEC.md §8.6): the operator chooses an account's tier, but only among those that
+  // exist, and only for an account that exists.
+  const beforeTiers = R.snapshot();
+  R.relax.add('tiers');
+  await R.maintenance({ tiers: [{ account: idx(1), tier: BigInt(M.FEE_TIERS) }] });
+  R.relax.delete('tiers');
+  const badTier = R.segments.at(-1)!.inputs;
+  R.restore(beforeTiers);
+  await expectFail('a fee tier that does not exist', 'seg_refresh', badTier, 'fee tier');
+  await R.maintenance({ tiers: [{ account: idx(1), tier: 1n }] });
+  t = clone(R.segments.at(-1)!.inputs);
+  t.tiers[0].account_index = '9';
+  await expectFail('a fee tier for an account that does not exist', 'seg_refresh', t, 'Merkle path does not match root');
+
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);
   await api.destroy();

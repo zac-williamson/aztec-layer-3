@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), and key rotation by the account's owner (P2.17), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), and fee tiers (P2.18), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -352,6 +352,8 @@ The waterfall follows Lighter's. For each step the circuit checks the preconditi
 ### 8.6 Fees
 
 Maker and taker rates in hundredths of a basis point, by fee tier. Tiers are stored privately and set by the operator. Fees credit the fee account (class `fee`). Zero-fee tiers are allowed.
+
+As built (P2.18), the configuration holds `FEE_TIERS = 4` tiers, each a pair of factors in ppm that scale every market's maker and taker rates: a fill charges `ceil(lots·price·rate·factor / 10^12)`. An account's tier is in its activity leaf, and new accounts start in tier 0. Each side of a fill pays at its own tier.
 
 ### 8.7 Risk sweep (phase 3)
 
@@ -1335,6 +1337,19 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Owner as root of authority.** The owner's Aztec account could already withdraw all free collateral by `ForcedWithdraw` to any recipient, so letting it replace the master authorization adds no power. It gives a user whose master key is lost or compromised a way back that needs neither the operator's cooperation nor the old key.
 - **Shared path.** `Register` and `Rekey` share one account update, one activity update and one full DA entry in `seg_priority` (158,720 gates). `seg_trade` adds the epoch check (442,336). §7.3's signed `SetMasterAuth` and `RotateEncKey` are not built: the owner's request covers both, and a signed rotation would need `seg_trade` to publish full entries.
 
+**Fee tiers** (P2.18, §8.6):
+
+- **Tiers.** `Params` gains `fee_tiers: [FeeTier; 4]`, each `(maker_ppm, taker_ppm)` factors on the markets' rates, so the configuration hash commits to the tier table. A fill charges each side `tier_fee(lots, price, rate, factor) = ceil(lots·price·rate·factor / 10^12)`, rounded against the account once. The taker pays at its tier and each maker at its own; the liquidation fee is not tiered.
+- **Storage.** The tier is private: the activity leaf packs `epoch + 2^64·key_epoch + 2^128·fee_tier`, so its hash takes no extra input. New accounts start in tier 0.
+- **Setting.** The maintenance segment sets up to two accounts' tiers. Each change is an operator action in the action log, `H(DS_TIER = 58, account, tier)` under `LOG_TIER = 8`. As §8.1 allows, the choice is the operator's and is not proven. The circuit checks only that the tier exists and, through the activity path, that the account does.
+- **Test parameters.** Tier 0 pays the markets' rates, tier 1 nothing, tier 2 half the maker and 80% of the taker rate, and tier 3 double the taker rate.
+- **Cost.** `seg_refresh` 174,605 gates, `seg_trade` 442,825, `seg_trigger` 152,825, `seg_liquidate` 260,076.
+
+**Tests** (P2.18):
+
+- **Native**, batch 11: the operator moves Bob to tier 1 and Dave to tier 2. Bob buys 50 lots from Dave's ask and pays no taker fee; Dave pays 10 as maker instead of 19. Dave then sells 30 into Alice's bid, paying 22 as taker instead of 27, while Alice in tier 0 pays the full 11 as maker. The batch sweeps exactly the 43 collected.
+- **Adversarial**, 2 new cases (92 in all): a tier that does not exist, and a tier for an account that does not exist.
+
 **Tests** (P2.17):
 
 - **Native**, batch 10:
@@ -1447,11 +1462,10 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
-1. Fee tiers (§8.6): the tier table, and the operator action that sets an account's tier.
-2. Per-order display of size [D1]: how displayed orders are published.
-3. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
-4. Resting reduce-only orders with trimming, and stop orders that open a position.
-5. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
+1. Per-order display of size [D1]: how displayed orders are published.
+2. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
+3. Resting reduce-only orders with trimming, and stop orders that open a position.
+4. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
 
 From P3: the ranking of ADL counterparties (§8.5).
 

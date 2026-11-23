@@ -546,13 +546,49 @@ async function main() {
   const b10 = await settle(w10);
   assert(b10.header[0] === b9.header[1], 'batch 10 does not chain from batch 9');
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the ten
+  // Batch 11 (P2.18): fee tiers (SPEC.md §8.6). The operator moves Bob to tier 1 (no fees) and
+  // Dave to tier 2 (half the maker rate, 80% of the taker rate). Dave rests an ask and Alice, with
+  // her rekeyed master key, a bid in market 0; Bob buys 50 from Dave, then Dave sells 30 to Alice.
+  // Each side pays at its own tier: Bob nothing as taker, Dave half the maker rate and 80% of the
+  // taker rate, Alice (tier 0) the full maker rate.
+  await engine.beginBatch(11n, b10.end.priorityHead, b10.end.priorityCursor, b10.end.time);
+  const t11 = t10 + 100n;
+  await engine.block(t11, [await update(0n, 1800n, 1800n, t11 - 1n)]);
+  await engine.maintenance({ tiers: [{ account: B, tier: 1n }, { account: D, tier: 2n }] });
+  assert(engine.actv.get(B)!.feeTier === 1n && engine.actv.get(D)!.feeTier === 2n, 'fee tiers not set');
+  await engine.trade([
+    await act(dave, D, nx(D), PLACE, [0n, ASK, 1810n, 60n, GTC, 0n]),
+    await act(alice2, A, nx(A), PLACE, [0n, BID, 1790n, 40n, GTC, 0n]),
+  ]);
+  assert(Number(engine.rejected.length) === rejected10 + 2, `batch 11 setup: ${engine.rejected.slice(rejected10 + 2).map((r) => r.reason)}`);
+  const fees11 = engine.feesPending;
+  await engine.trade([await act(bob, B, nx(B), PLACE, [0n, BID, 1810n, 50n, IOC, 0n])]);
+  await engine.trade([await act(dave, D, nx(D), PLACE, [0n, ASK, 1790n, 30n, IOC, 0n])]);
+  const mk0 = params.markets[0];
+  const [tier0, tier1, tier2] = params.feeTiers;
+  const want11 = [
+    X.tierFee(50n, 1810n, mk0.takerFeePpm, tier1.takerPpm), // Bob, taker at tier 1: 0
+    X.tierFee(50n, 1810n, mk0.makerFeePpm, tier2.makerPpm), // Dave, maker at tier 2: 10 (19 at tier 0)
+    X.tierFee(30n, 1790n, mk0.takerFeePpm, tier2.takerPpm), // Dave, taker at tier 2: 22 (27 at tier 0)
+    X.tierFee(30n, 1790n, mk0.makerFeePpm, tier0.makerPpm), // Alice, maker at tier 0: 11
+  ];
+  assert(want11.join() === '0,10,22,11' && engine.feesPending - fees11 === 43n, `batch 11 fees: ${engine.feesPending - fees11}`);
+  assert(Number(engine.rejected.length) === rejected10 + 2, `unexpected rejection: ${engine.rejected.at(-1)?.reason}`);
+  log('fee tiers: bob (tier 1) paid no taker fee on 50 lots; dave (tier 2) paid 10 as maker and 22 as taker instead of 19 and 27; alice (tier 0) paid 11 as maker');
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 11');
+  const w11 = await engine.endBatch();
+  log(`batch 11: ${w11.segments.map((s) => s.label).join(' | ')}; ${w11.daPayload.length} DA fields`);
+  const b11 = await settle(w11);
+  assert(b11.header[0] === b10.header[1], 'batch 11 does not chain from batch 10');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the eleven
   // batches, then open every user's account and compare with the engine. Alice opens hers with
   // the keys her owner rekeyed it to; her old keys no longer open it.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b10.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b11.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   const oldKeysOpen = await openAccount(h, rebuilt, alice.kEnc, await M.masterAuthOf(h, alice.pk!.x, alice.pk!.y)).then(
     () => true,
     () => false,
@@ -573,16 +609,16 @@ async function main() {
   const pos = (idx: bigint) => engine.accts.get(idx)!.priv;
   log(`from DA: alice m0 ${pos(A).positions[0].size} m1 ${pos(A).positions[1].size}, collateral ${pos(A).collateral}; bob m0 ${pos(B).positions[0].size} m1 ${pos(B).positions[1].size}; carol m0 ${pos(C).positions[0].size} m1 ${pos(C).positions[1].size}; grace m0 ${pos(G).positions[0].size}`);
   log(`protocol: insurance ${pos(M.INSURANCE_INDEX).collateral} (+${engine.insuranceMicro} micro), fees ${pos(M.FEE_INDEX).collateral}`);
-  assert(pos(A).positions[0].size === 11n && pos(B).positions[0].size === -30n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
+  assert(pos(A).positions[0].size === 41n && pos(B).positions[0].size === 20n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 10 ${hex(b10.headerHash)}`);
+  log(`header of batch 11 ${hex(b11.headerHash)}`);
   await api.destroy();
 }
 

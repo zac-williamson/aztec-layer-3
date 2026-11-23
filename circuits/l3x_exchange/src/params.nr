@@ -1,4 +1,4 @@
-use crate::consts::{DS_DOMAIN, DS_MKT_PARAMS, DS_PARAMS, MARKETS, N_ORACLES};
+use crate::consts::{DS_DOMAIN, DS_MKT_PARAMS, DS_PARAMS, FEE_TIERS, MARKETS, N_ORACLES};
 use l3x_types::{config_hash, hash::hash};
 
 /// One market's parameters (SPEC.md §6.6, §8), in ppm. A market is listed when `imr_ppm > 0`.
@@ -38,6 +38,13 @@ impl MarketParams {
     }
 }
 
+/// A fee tier (SPEC.md §8.6): factors, in ppm, that scale every market's maker and taker rates for
+/// the tier's accounts. 1,000,000 keeps the market's rate; 0 waives the fee.
+pub struct FeeTier {
+    pub maker_ppm: u64,
+    pub taker_ppm: u64,
+}
+
 /// Exchange parameters committed in config_hash (SPEC.md §6.2).
 pub struct Params {
     /// Signing domain: chain and a per-deployment id, so signatures do not replay elsewhere.
@@ -51,11 +58,13 @@ pub struct Params {
     pub max_age: u64,
     pub funding_interval: u64,
     pub markets: [MarketParams; MARKETS],
+    /// Fee tiers; an account's tier is private and set by the operator (SPEC.md §8.6).
+    pub fee_tiers: [FeeTier; FEE_TIERS],
 }
 
 impl Params {
     pub fn hash(self) -> Field {
-        let mut inputs: [Field; 6 + 2 * N_ORACLES + MARKETS] = [0; 6 + 2 * N_ORACLES + MARKETS];
+        let mut inputs: [Field; 6 + 2 * N_ORACLES + MARKETS + FEE_TIERS] = [0; 6 + 2 * N_ORACLES + MARKETS + FEE_TIERS];
         inputs[0] = DS_PARAMS;
         inputs[1] = self.chain_id;
         inputs[2] = self.instance;
@@ -68,6 +77,10 @@ impl Params {
         inputs[5 + 2 * N_ORACLES] = self.funding_interval as Field;
         for m in 0..MARKETS {
             inputs[6 + 2 * N_ORACLES + m] = self.markets[m].hash();
+        }
+        for t in 0..FEE_TIERS {
+            let tier = self.fee_tiers[t];
+            inputs[6 + 2 * N_ORACLES + MARKETS + t] = (tier.maker_ppm as Field) + (tier.taker_ppm as Field) * 0x10000000000000000;
         }
         hash(inputs)
     }

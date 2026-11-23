@@ -90,6 +90,7 @@ fn main(
                     n_fills,
                     mp.maker_fee_ppm,
                     mp.taker_fee_ppm,
+                    params.fee_tiers,
                     da_nonce,
                 );
                 st = st2;
