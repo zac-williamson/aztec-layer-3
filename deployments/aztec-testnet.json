@@ -1,0 +1,221 @@
+{
+  "network": {
+    "nodeUrl": "https://aztec-testnet.drpc.org",
+    "aztecVersion": "6.0.0",
+    "l1ChainId": 11155111,
+    "rollupVersion": 679261766
+  },
+  "l2": {
+    "token": "0x25b72f333b10ab26d7e0c6392ab7f44495045571454904920c8ca4d41ec00a03",
+    "bridge": "0x23e4e34a9a27559bd356656075a97da458ccf1bc7b2c52173a57f76446383951",
+    "bridgeDeployBlock": 59715,
+    "operator": "0x1408bf8dfd64bfd86779b324015b0409729f454e5bf7122ab0122d250bb061f2",
+    "alice": "0x0a4a7af9cdb6e3623ed17aadc19a2f04ff66d6ea16c28582057caae2f29ae188",
+    "bob": "0x19da84996781e7910cdba9e96da19eb9677e9d0c5bd5714266c88cdfd388af55"
+  },
+  "config": {
+    "configHash": "0x21bee28f615ff090ce47d0c0c9c3a466e6a759899985ac839f343775a8557351",
+    "rootVkHash": "0x0fffba49028b9ed1a83cabc4fd79980d06adb3ac4f60a9e649b62993d0580779",
+    "instance": "0x24594cb2d23b35752ec5dd1610a407906aae1dee7fc72e06300fd51df2a066e0",
+    "tForce": 900,
+    "tClaim": 600,
+    "tLate": 120,
+    "tRefresh": 1209600,
+    "tDep": 3600,
+    "tPayout": 600,
+    "requestFee": 100
+  },
+  "operate": {
+    "startedAt": "2026-11-23T12:54:35.620Z",
+    "steps": [
+      {
+        "label": "deploy token",
+        "txHash": "0x0cfdfe20a83facbb5ddd55f167351ba91b7fbf471921a4352b5bbc785b4e6113",
+        "block": 59710,
+        "ms": 52812
+      },
+      {
+        "label": "deploy bridge",
+        "txHash": "0x15a5e83367fbbb20f5c243dd92e38cada8c8363d026d9203a175961ad8dce284",
+        "block": 59715,
+        "ms": 69102
+      },
+      {
+        "label": "mint to alice and bob",
+        "txHash": "0x091d5a3106cbe2d1faaccf83f969c3d755ff74c3e25610b0bfc576f166cb3c2a",
+        "block": 59721,
+        "ms": 72334
+      },
+      {
+        "label": "bob registers",
+        "txHash": "0x2d3a3bb961fde2f2f4d46cd6c96107d96ff5ab0ae0cef3ef081697b721093872",
+        "block": 59726,
+        "ms": 72714
+      },
+      {
+        "label": "alice registers",
+        "txHash": "0x1efb8745a23a137ee0061c7ad869704e7bce1b3a7177abe6fb4e0340505470ee",
+        "block": 59725,
+        "ms": 72926
+      },
+      {
+        "label": "bob shields",
+        "txHash": "0x16cc39fdc4029f9f652c61bb1dd85baf9ebc988b0ca842be7250a414fe3034ae",
+        "block": 59729,
+        "ms": 70690
+      },
+      {
+        "label": "alice shields",
+        "txHash": "0x20032b0c33a95880fc2930b1039d777ba68e32d8b12134d917dc62393b7b5329",
+        "block": 59728,
+        "ms": 71516
+      },
+      {
+        "label": "bob deposits",
+        "txHash": "0x2c379097c00be8d02472a061b21e1f787a7fbd00dc7e6c68e16c1aedc2b74dc9",
+        "block": 59732,
+        "ms": 73305
+      },
+      {
+        "label": "alice deposits",
+        "txHash": "0x1dbf80343938d75802c337c33cba034c6993b95d081bf024ff1f16c619d20fdc",
+        "block": 59731,
+        "ms": 74028
+      },
+      {
+        "label": "custody sweeps both deposits",
+        "txHash": "0x2cbab4c738c8d3f56f5191bc74c95347e5d10a1ca36ec6bc5179e09bfec28c03",
+        "block": 59735,
+        "ms": 69585
+      },
+      {
+        "label": "batch 1 settles",
+        "txHash": "0x0a116c751038923939c8521c31b8c798dc8e8c4819afd04125a66894c30ca395",
+        "block": 59744,
+        "ms": 82035,
+        "shape": "root(block, priority)",
+        "daFields": 46,
+        "proveMs": 61775,
+        "batchTime": 1795439028,
+        "lagS": 72
+      },
+      {
+        "label": "batch 2 settles",
+        "txHash": "0x0734fc607db54f62dc6ae98e054ace612dc19650a638355e11910bad671dd0e3",
+        "block": 59746,
+        "ms": 60245,
+        "shape": "root(merge(block, trade), trade)",
+        "daFields": 40,
+        "proveMs": 77304,
+        "batchTime": 1795439100,
+        "lagS": 144
+      },
+      {
+        "label": "batch 3 settles",
+        "txHash": "0x1adb7a12b0af776c1dd9baa32e1af35b2068ad2f6096a67fa70886f19f21a3ea",
+        "block": 59748,
+        "ms": 79153,
+        "shape": "root(block, refresh)",
+        "daFields": 72,
+        "proveMs": 64764,
+        "batchTime": 1795439244,
+        "lagS": 144
+      },
+      {
+        "label": "bob approves the request fee",
+        "txHash": "0x18a0f4b79d637b49b4aec24bbb988e4417dd1d075ebd853bde5af6094143adfc",
+        "block": 59753,
+        "ms": 68866
+      },
+      {
+        "label": "bob forces a withdrawal",
+        "txHash": "0x221522ece3ca8e832153da3e58f731ad83049f9d0e05355800a1c042ae28b1f0",
+        "block": 59760,
+        "ms": 72830
+      }
+    ],
+    "expected": {
+      "alice": "999868",
+      "bob": "2000013",
+      "fee account": "119"
+    },
+    "forcedAt": 1795439532,
+    "status": "passed",
+    "finishedAt": "2026-11-23T13:12:16.723Z"
+  },
+  "exit": {
+    "startedAt": "2026-11-23T13:12:39.886Z",
+    "steps": [
+      {
+        "label": "bob activates desert mode",
+        "txHash": "0x091565f291d0585910ad235f0438b511aa5adc57c9377286561c486c45540ff3",
+        "block": 59799,
+        "ms": 65447
+      },
+      {
+        "label": "alice registers its claim",
+        "txHash": "0x17473a70dc2c91484ef439be37cf1044e8effede8fd080b4708e907f4408cc8c",
+        "block": 59801,
+        "ms": 69235
+      },
+      {
+        "label": "bob registers its claim",
+        "txHash": "0x2aff988da86d62d69af83cb827e70704f9fbb874046e5710ee28331a2ceca3e3",
+        "block": 59803,
+        "ms": 72571
+      },
+      {
+        "label": "fee account registers its claim",
+        "txHash": "0x275b94b79b1ebad5a64dd763211e1bd4486a256e401ca4840bcd6f32aeaeaa8d",
+        "block": 59806,
+        "ms": 69619
+      },
+      {
+        "label": "alice withdraws its claim",
+        "txHash": "0x2b0347a098cba16a28b7e5e19c7d876545fb58d2e193611dc372ec1c33713e4b",
+        "block": 59825,
+        "ms": 129964
+      },
+      {
+        "label": "bob withdraws its claim",
+        "txHash": "0x088cbc080f3e52f34ea27499b9f9c8f8f301d94c4b9b6b91865c1c95be7040ce",
+        "block": 59834,
+        "ms": 139745
+      },
+      {
+        "label": "fee account withdraws its claim",
+        "txHash": "0x09a959dde1696b72997b3b3279b18c7b17f561dc1ae0d0661a29c88107818774",
+        "block": 59837,
+        "ms": 142221
+      }
+    ],
+    "paid": {
+      "alice": "999868",
+      "bob": "2000013",
+      "fee account": "119"
+    },
+    "vaultResidual": "0",
+    "rebuild": {
+      "alice": {
+        "batches": 3,
+        "ms": 426,
+        "account": 2,
+        "equity": "999868"
+      },
+      "bob": {
+        "batches": 3,
+        "ms": 354,
+        "account": 3,
+        "equity": "2000013"
+      },
+      "fee account": {
+        "batches": 3,
+        "ms": 409,
+        "account": 1,
+        "equity": "119"
+      }
+    },
+    "status": "passed",
+    "finishedAt": "2026-11-23T13:44:39.401Z"
+  }
+}

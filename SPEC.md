@@ -831,7 +831,7 @@ Each segment proves in under 2 s on the reference laptop; a merge (1.48M gates) 
 - Collateral is a minimal public token for C0, not the D7 token.
 - Storage is grouped into packed structs, because aztec-nr's type-complexity limit rejects a contract with about 40 separate state variables.
 
-**Exit test** (P1 exit criterion), on the 6.0.0 local network with real client proofs, not yet on a testnet:
+**Exit test** (P1 exit criterion), on the 6.0.0 local network with real client proofs. The criterion's testnet run came later, on the P2.16 build (§15, Testnet run):
 
 1. Alice and Bob register (7–9 s each, including constrained key delivery) and deposit.
 2. Three batches settle, each 7–8 s from send to checkpoint:
@@ -1429,6 +1429,29 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 From P3: the ranking of ADL counterparties (§8.5).
 
 P2's remaining exit criteria are outside this repository: a load test at the §14 targets on a testnet, and an external audit.
+
+### Testnet run (2026-11-23)
+
+P1's exit criterion ran on the public Aztec testnet, on the P2.16 build. `scripts/src/exchange/testnet.ts` drives it, and `deployments/aztec-testnet.json` is the public record: addresses, configuration, transaction hashes and results.
+
+- **Network.** Aztec 6.0.0 over Sepolia (chain 11155111, rollup version 679261766), with 72-second slots and 32-slot epochs.
+  - Every transaction carries a real client proof, which the network verifies; each took 45–82 s from send to its checkpoint.
+  - The network's sponsored FPC paid every fee, about 1.7 fee juice per transaction.
+  - The accounts are initializerless Schnorr accounts, which need no deployment transaction.
+- **Configuration.** L2 time is real time, so the windows are minutes: `t_force` 15 min, `t_claim` 10 min, `t_late` 2 min, `t_dep` 1 h, `t_payout` 10 min, and `T_lag` 15 min as built. The oracle and protocol-account keys are the test keys of `params.ts`. The collateral is a `ConfidentialToken` whose minter is the operator: nothing is bridged in this run.
+- **Operate**, one process:
+  - The token and the Bridge deploy. The Bridge's 1,604 fields of public bytecode fit the testnet's per-transaction DA limit of 117,624 DA gas, about 3,675 fields.
+  - Alice and Bob register, shield, and deposit 1,000,000 and 2,000,000; the openings reach the operator by constrained delivery. One custody transaction sweeps both deposits into the vault.
+  - Three batches settle. Each proved in 62–77 s on one laptop (root proofs 42–43 s) and was checkpointed 72–144 s of L2 time after its batch time, well inside `T_lag`:
+    1. `root(block, priority)`: three index updates, then the two registrations and the two deposits.
+    2. `root(merge(block, trade), trade)`: Alice bids 100 at 2100 in market 0 and Bob sells 60 into the bid. Alice offers 2 at 30,000 post-only in market 1, and Bob buys them.
+    3. `root(block, refresh)`: market 1's index moves to 30,050; the 119 of fees are swept into the fee account and all four accounts are refreshed.
+  - The operator stops. Bob approves the request fee and forces a withdrawal through the Bridge, which nobody processes.
+- **Exit**, a second process with an empty wallet that holds only the node's URL, the Bridge's address and each user's keys:
+  - Once Bob's request is `t_force` old, Bob activates desert mode.
+  - Each claimant rebuilds the frozen accounts tree from the three DA logs (0.4 s), opens its leaf, and registers a claim at the frozen indices. The equities equal the operator's engine.
+  - After `t_claim`, Alice withdraws 999,868: her collateral less 32 of maker fees, and −100 on her market-1 short at the frozen index. Bob withdraws 2,000,013: less 87 of taker fees, plus 100.
+  - The operator withdraws the fee account's 119 after `t_late`, and the vault ends empty.
 
 ## 16. Decisions
 

@@ -13,14 +13,20 @@
     "native": "node src/exchange/native.ts",
     "e2e": "node src/exchange/e2e.ts",
     "l1bridge": "node src/exchange/l1bridge.ts",
-    "adversarial": "node src/exchange/adversarial.ts"
+    "adversarial": "node src/exchange/adversarial.ts",
+    "testnet": "node src/exchange/testnet.ts"
   },
   "dependencies": {
     "@aztec-foundation/bb.js": "6.0.0",
+    "@aztec-foundation/l1-artifacts": "6.0.0",
     "@aztec-foundation/noir-noir_js": "6.0.0",
     "@aztec-labs/accounts": "6.0.0",
     "@aztec-labs/aztec": "6.0.0",
     "@aztec-labs/aztec.js": "6.0.0",
-    "@aztec-labs/wallets": "6.0.0"
+    "@aztec-labs/ethereum": "6.0.0",
+    "@aztec-labs/noir-contracts.js": "6.0.0",
+    "@aztec-labs/stdlib": "6.0.0",
+    "@aztec-labs/wallets": "6.0.0",
+    "viem": "2.57.1"
   }
 }
