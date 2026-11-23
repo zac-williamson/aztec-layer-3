@@ -130,6 +130,8 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
     let mut write_a = false;
     let mut other = s.other_priv;
     let mut write_other = false;
+    // ADL: the insurance account as a takeover would leave it, to show the backstop is exhausted.
+    let mut ins_probe = s.ins_priv;
     let uses_insurance = (s.kind == LIQ_TAKEOVER) | (s.kind == LIQ_DEFICIT) | (s.kind == LIQ_ADL);
 
     if s.kind == LIQ_CANCEL {
@@ -213,15 +215,8 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
                 == st.accounts_root,
             "insurance account path",
         );
-        assert(
-            exposure_fresh(s.ins_priv, s.ins_actv, st.markets, params.max_age, r.time),
-            "index too old for the insurance account",
-        );
         let (_, i2, _, _) = takeover(a0, s.ins_priv, st.markets[m], m);
-        assert(
-            !covers(equity(i2, st.markets), initial_margin(i2, s.ins_actv, st.markets, params)),
-            "insurance can absorb",
-        );
+        ins_probe = i2;
         // Close the smaller of the two positions at the account's bankruptcy price.
         let market = st.markets[m];
         let q = if abs(pos.size) < abs(cpos.size) { abs(pos.size) } else { abs(cpos.size) };
@@ -250,16 +245,19 @@ fn apply(state: State, running: Running, s: Step, da_nonce: Field, params: Param
             merkle_root(DS_ACTV_NODE, s.ins_actv.hash(), INSURANCE_INDEX, s.ins_actv_path) == st.activity_root,
             "insurance activity path",
         );
-        if s.kind != LIQ_ADL {
-            // The insurance account must still meet its IM, at fresh indices.
-            assert(
-                exposure_fresh(other, s.ins_actv, st.markets, params.max_age, r.time),
-                "index too old for the insurance account",
-            );
-            assert(
-                covers(equity(other, st.markets), initial_margin(other, s.ins_actv, st.markets, params)),
-                "insurance below initial margin",
-            );
+        // One margin check of the insurance account, at fresh indices: after a takeover or a
+        // deficit it must still meet its IM; for ADL, a takeover would have left it below its IM.
+        // (Marks and funding are unchanged since the ADL step's own check point: it moved only OI.)
+        let probe = if s.kind == LIQ_ADL { ins_probe } else { other };
+        assert(
+            exposure_fresh(probe, s.ins_actv, st.markets, params.max_age, r.time),
+            "index too old for the insurance account",
+        );
+        let meets_im = covers(equity(probe, st.markets), initial_margin(probe, s.ins_actv, st.markets, params));
+        if s.kind == LIQ_ADL {
+            assert(!meets_im, "insurance can absorb");
+        } else {
+            assert(meets_im, "insurance below initial margin");
         }
     }
 

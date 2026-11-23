@@ -55,10 +55,11 @@ struct Action {
     /// Place: the path of the resting slot (GTC, post-only) or of the no-crossing probe (IOC
     /// remainder). Cancel and modify: the path of the order.
     rest_path: [Sibling; BOOK_HEIGHT],
-    /// Cancel and modify: the order's remaining lots, expiry and display flag.
+    /// Cancel and modify: the order's remaining lots, expiry, and display and reduce-only flags.
     cancel_lots: u64,
     cancel_expiry: u64,
     cancel_display: bool,
+    cancel_reduce_only: bool,
     /// Transfer: the destination account, its key and its path after the source's debit.
     dest_pub: AccountPub,
     dest_priv: AccountPriv,
@@ -277,8 +278,13 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
     let display = a.p[7] == 1;
     assert((tif == TIF_GTT) == (expiry != 0), "only GTT orders expire");
     assert((expiry == 0) | (expiry > r.time), "order already expired");
-    // P2: reduce-only orders do not rest, so a later position change never has to trim them.
-    assert((reduce_only == 0) | !rests, "reduce-only orders cannot rest");
+    // A resting reduce-only order (P2.21) must fit within the position it reduces when placed;
+    // matching trims it to whatever that position has left when it fills.
+    if (reduce_only == 1) & rests {
+        let size = a.taker_priv.positions[mid].size;
+        assert((size != 0) & ((size > 0) == (side == SIDE_ASK)), "reduce-only order must reduce");
+        assert(lots <= abs(size), "reduce-only order larger than the position");
+    }
     if tif == TIF_POST_ONLY {
         assert(a.n_fills == 0, "post-only order would take liquidity");
     }
@@ -332,16 +338,19 @@ fn place(state: State, running: Running, a: Action, act_auth: Activity, da_nonce
         let seq = market.next_seq;
         let slot = assert_no_crossing(market.book_root, side, price, seq, a.rest_path);
         if rests {
-            let o = Order { side, account_index: idx, lots: remaining, expiry, epoch: act.epoch, display };
+            let o = Order { side, account_index: idx, lots: remaining, expiry, epoch: act.epoch, display, reduce_only: reduce_only == 1 };
             market.book_root = walk(o.leaf(), o.ask_lots(), o.bid_lots(), slot, a.rest_path).root;
             if display {
                 r = emit_display(r, mid, side, price as u32, seq, remaining);
             }
             market.next_seq = seq + 1;
-            if side == SIDE_BID {
-                act.open_bid[mid] += remaining;
-            } else {
-                act.open_ask[mid] += remaining;
+            // A reduce-only order holds no open lots: it can never add exposure.
+            if reduce_only == 0 {
+                if side == SIDE_BID {
+                    act.open_bid[mid] += remaining;
+                } else {
+                    act.open_ask[mid] += remaining;
+                }
             }
             act.open_orders += 1;
             assert(act.open_orders <= MAX_OPEN_ORDERS, "too many open orders");
@@ -474,9 +483,10 @@ fn cancel(state: State, running: Running, a: Action, act_auth: Activity) -> (Sta
     // open lots, and its leaf records an earlier epoch.
     let epoch = a.taker_actv.epoch;
     let display = a.cancel_display;
-    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry, epoch, display };
+    let reduce_only = a.cancel_reduce_only;
+    let o = Order { side, account_index: a.account_index, lots: a.cancel_lots, expiry: a.cancel_expiry, epoch, display, reduce_only };
     let kept = if modify {
-        Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry, epoch, display }
+        Order { side, account_index: a.account_index, lots, expiry: a.cancel_expiry, epoch, display, reduce_only }
     } else {
         Order::empty()
     };
@@ -486,7 +496,7 @@ fn cancel(state: State, running: Running, a: Action, act_auth: Activity) -> (Sta
         r = emit_display(r, mid, side, price, seq, lots);
     }
     let mut act = act_auth;
-    let removed = a.cancel_lots - lots;
+    let removed = if reduce_only { 0 } else { a.cancel_lots - lots };
     if side == SIDE_BID {
         act.open_bid[mid] = a.taker_actv.open_bid[mid] - removed;
     } else {

@@ -37,11 +37,15 @@ pub struct Order {
     /// The owner opted to display the order's size (SPEC.md §8.4, [D1]): every change to its
     /// resting lots is published, without its owner.
     pub display: bool,
+    /// A resting reduce-only order (P2.21): it fills at most its owner's position on its other side
+    /// and is trimmed to what that position has left, so it never adds exposure and holds no open
+    /// lots.
+    pub reduce_only: bool,
 }
 
 impl Order {
     pub fn empty() -> Self {
-        Order { side: 0, account_index: 0, lots: 0, expiry: 0, epoch: 0, display: false }
+        Order { side: 0, account_index: 0, lots: 0, expiry: 0, epoch: 0, display: false, reduce_only: false }
     }
 
     /// The leaf value; an order with no lots left is the empty leaf.
@@ -51,7 +55,8 @@ impl Order {
         } else {
             hash(
                 [
-                    DS_ORDER, self.side + (self.display as Field) * 2, self.account_index as Field, self.lots as Field,
+                    DS_ORDER, self.side + (self.display as Field) * 2 + (self.reduce_only as Field) * 4,
+                    self.account_index as Field, self.lots as Field,
                     self.expiry as Field, self.epoch as Field,
                 ],
             )

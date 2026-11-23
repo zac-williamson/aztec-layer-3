@@ -107,10 +107,13 @@ fn main(
             st.markets[c.market].book_root = root;
             let mut act = c.owner_actv;
             if is_expired {
-                if c.order.side == SIDE_BID {
-                    act.open_bid[c.market] = c.owner_actv.open_bid[c.market] - c.order.lots;
-                } else {
-                    act.open_ask[c.market] = c.owner_actv.open_ask[c.market] - c.order.lots;
+                // A reduce-only order holds no open lots, only its place in the count (P2.21).
+                if !c.order.reduce_only {
+                    if c.order.side == SIDE_BID {
+                        act.open_bid[c.market] = c.owner_actv.open_bid[c.market] - c.order.lots;
+                    } else {
+                        act.open_ask[c.market] = c.owner_actv.open_ask[c.market] - c.order.lots;
+                    }
                 }
                 act.open_orders = c.owner_actv.open_orders - 1;
             }

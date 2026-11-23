@@ -199,7 +199,7 @@ async function main() {
   await expectFail('block time regresses', 'seg_block', t, 'time regressed');
   // The operator hides the bids to move the mark: an empty side must be proved empty.
   t = clone(tick);
-  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false } };
+  t.updates[0].bid = { ...t.updates[0].bid, has: false, price: '0', seq: '0', order: { side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false, reduce_only: false } };
   await expectFail('tick hides the best bid', 'seg_block', t, 'empty bid side path');
   t = clone(tick);
   t.updates[0].ask.seq = (BigInt(t.updates[0].ask.seq) + 2n).toString(); // a later ask at the same price (not the leaf's sibling)
@@ -762,6 +762,23 @@ async function main() {
     const msg = String(e?.message ?? e).split('\n')[0];
     results.push({ name: 'an unaffordable entry stop filled', pass: msg.includes('Merkle path does not match root'), how: `undone: ${msg.slice(0, 100)}` });
   }
+
+  // Resting reduce-only orders (P2.21): one must fit within the position it reduces, and the
+  // operator cannot trim one away by misstating its owner's position, which the trim rests on.
+  const long2 = engine.accts.get(idx(2))!.priv.positions[0].size;
+  assert(long2 > 0n, 'account 4 is long in market 0');
+  t = clone(quiet);
+  await resign(t, 0, 2, 2n, PLACE, [0n, ASK, 1990n, long2 + 1n, GTC, 1n]);
+  await expectFail('a resting reduce-only order larger than the position', 'seg_trade', t, 'reduce-only order larger than the position');
+  const q0 = engine.segments.length;
+  await engine.trade([await act(2, engine.actv.get(idx(2))!.nonce + 1n, PLACE, [0n, ASK, 2003n, 1n, GTC, 1n])]);
+  await engine.trade([await act(1, engine.actv.get(idx(1))!.nonce + 1n, PLACE, [0n, BID, 2003n, 1n, IOC, 0n])]);
+  assert(engine.segments.length === q0 + 2 && engine.rejected.length === 0, `reduce-only setup: ${engine.rejected.map((r) => r.reason)}`);
+  t = clone(engine.segments[q0 + 1].inputs);
+  const roFill = t.actions[0].fills.findIndex((f: any) => f.order.reduce_only);
+  assert(roFill >= 0, 'the buy meets the reduce-only ask');
+  t.actions[0].fills[roFill].maker_priv.positions[0].size = '0';
+  await expectFail('a reduce-only order trimmed by misstating its owner\'s position', 'seg_trade', t, 'Merkle path does not match root');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

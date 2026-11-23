@@ -162,9 +162,11 @@ export const LEFTMOST = 0n;
  * A resting order; `epoch` is its owner's order epoch when it was placed (SPEC.md §6.5), and
  * `display` whether its owner opted to display its size [D1].
  */
-export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint; epoch: bigint; display?: boolean };
-export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint, epoch: bigint, display = false) =>
-  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side + (display ? 2n : 0n), account, lots, expiry, epoch]);
+export type Order = { side: bigint; account: bigint; lots: bigint; price: bigint; seq: bigint; expiry: bigint; epoch: bigint; display?: boolean; reduceOnly?: boolean };
+export const orderLeaf = (h: M.H, side: bigint, account: bigint, lots: bigint, expiry: bigint, epoch: bigint, display = false, reduceOnly = false) =>
+  lots === 0n ? Promise.resolve(0n) : h([M.DS.ORDER, side + (display ? 2n : 0n) + (reduceOnly ? 4n : 0n), account, lots, expiry, epoch]);
+/** The position a reduce-only order on `side` can reduce: the owner's size on the other side (P2.21). */
+export const heldFor = (side: bigint, size: bigint) => (side === M.SIDE.ASK && size > 0n ? size : side === M.SIDE.BID && size < 0n ? -size : 0n);
 export const expired = (o: { expiry: bigint }, now: bigint) => o.expiry !== 0n && o.expiry < now;
 export const askLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.ASK ? o.lots : 0n);
 export const bidLots = (o: { side: bigint; lots: bigint }) => (o.side === M.SIDE.BID ? o.lots : 0n);

@@ -57,14 +57,15 @@ const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
 const zeros = (n: number) => Array<string>(n).fill(hex(0n));
 const siblingsToNoir = (path: BookSibling[]) => path.map((s) => ({ hash: hex(s.hash), ask: s.ask.toString(), bid: s.bid.toString() }));
 const emptyBookPath = () => siblingsToNoir(Array.from({ length: M.BOOK_HEIGHT }, () => ({ hash: 0n, ask: 0n, bid: 0n })));
-const emptyOrder = () => ({ side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false });
-const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: bigint; epoch: bigint; display?: boolean }) => ({
+const emptyOrder = () => ({ side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false, reduce_only: false });
+const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: bigint; epoch: bigint; display?: boolean; reduceOnly?: boolean }) => ({
   side: hex(o.side),
   account_index: o.account.toString(),
   lots: o.lots.toString(),
   expiry: o.expiry.toString(),
   epoch: o.epoch.toString(),
   display: !!o.display,
+  reduce_only: !!o.reduceOnly,
 });
 const pad = <T>(xs: T[], n: number, f: () => T) => [...xs, ...Array.from({ length: n - xs.length }, f)];
 const emptyTrigger = () => ({ dir: hex(0n), side: hex(0n), account_index: '0', lots: '0', limit: '0', epoch: '0', entry: false });
@@ -769,8 +770,10 @@ export class Engine {
       if (o.display) removedDisplayed.push({ market: c.market, o });
       if (isExpired) {
         const nact = M.copyActivity(owner);
-        if (o.side === M.SIDE.BID) nact.openBid[c.market] -= o.lots;
-        else nact.openAsk[c.market] -= o.lots;
+        if (!o.reduceOnly) {
+          if (o.side === M.SIDE.BID) nact.openBid[c.market] -= o.lots;
+          else nact.openAsk[c.market] -= o.lots;
+        }
         nact.openOrders -= 1n;
         this.actv.set(o.account, nact);
         await this.activity.set(o.account, await M.activityHash(this.h, nact));
@@ -1035,6 +1038,7 @@ export class Engine {
       cancel_lots: '0',
       cancel_expiry: '0',
       cancel_display: false,
+      cancel_reduce_only: false,
       dest_pub: M.pubToNoir(M.zeroPub()),
       dest_priv: M.privToNoir(M.emptyPriv()),
       dest_k_enc: hex(0n),
@@ -1468,7 +1472,12 @@ export class Engine {
     if (display !== 0n && display !== 1n) throw new Error('display flag');
     if ((tif === X.TIF.GTT) !== (expiry !== 0n)) throw new Error('only GTT orders expire');
     if (expiry !== 0n && expiry <= this.running.time) throw new Error('order already expired');
-    if (reduceOnly === 1n && rests) throw new Error('reduce-only orders cannot rest');
+    if (reduceOnly === 1n && rests) {
+      // A resting reduce-only order must fit within the position it reduces (P2.21).
+      const size = rec.priv.positions[m].size;
+      if (size === 0n || size > 0n !== (side === M.SIDE.ASK)) throw new Error('reduce-only order must reduce');
+      if (lots > X.abs(size)) throw new Error('reduce-only order larger than the position');
+    }
     if (this.markets[m].triggerPending && !this.relax.has('triggers')) throw new Error('triggers are due in this market');
     const mark = this.markets[m].markPrice;
     if (mark === 0n) throw new Error('no mark price');
@@ -1496,13 +1505,16 @@ export class Engine {
       const slot = X.orderIndex(side, price, seq);
       restPath = siblingsToNoir(book.path(slot));
       if (rests) {
-        const o = { side, account: a.account, lots: remaining, price, seq, market: mk, expiry, epoch: act.epoch, display: display === 1n };
-        await book.set(slot, await X.orderLeaf(this.h, side, a.account, remaining, expiry, act.epoch, o.display), X.askLots(o), X.bidLots(o));
+        const o = { side, account: a.account, lots: remaining, price, seq, market: mk, expiry, epoch: act.epoch, display: display === 1n, reduceOnly: reduceOnly === 1n };
+        await book.set(slot, await X.orderLeaf(this.h, side, a.account, remaining, expiry, act.epoch, o.display, o.reduceOnly), X.askLots(o), X.bidLots(o));
         this.orders[m].set(slot, o);
         await this.emitDisplay(m, o, remaining);
         this.markets[m].nextSeq = seq + 1n;
-        if (side === M.SIDE.BID) act.openBid[m] += remaining;
-        else act.openAsk[m] += remaining;
+        // A reduce-only order holds no open lots: it can never add exposure.
+        if (!o.reduceOnly) {
+          if (side === M.SIDE.BID) act.openBid[m] += remaining;
+          else act.openAsk[m] += remaining;
+        }
         act.openOrders += 1n;
         if (act.openOrders > X.MAX_OPEN_ORDERS) throw new Error('too many open orders');
       }
@@ -1567,8 +1579,10 @@ export class Engine {
         this.orders[m].delete(index);
         await this.emitDisplay(m, o, 0n);
         if (o.epoch === t.act.epoch) {
-          if (o.side === M.SIDE.BID) t.act.openBid[m] -= o.lots;
-          else t.act.openAsk[m] -= o.lots;
+          if (!o.reduceOnly) {
+            if (o.side === M.SIDE.BID) t.act.openBid[m] -= o.lots;
+            else t.act.openAsk[m] -= o.lots;
+          }
           t.act.openOrders -= 1n;
         }
         fills.push(fillWitness);
@@ -1592,8 +1606,10 @@ export class Engine {
         this.orders[m].delete(index);
         await this.emitDisplay(m, o, 0n);
         const nact = M.copyActivity(oact);
-        if (o.side === M.SIDE.BID) nact.openBid[m] -= o.lots;
-        else nact.openAsk[m] -= o.lots;
+        if (!o.reduceOnly) {
+          if (o.side === M.SIDE.BID) nact.openBid[m] -= o.lots;
+          else nact.openAsk[m] -= o.lots;
+        }
         nact.openOrders -= 1n;
         this.actv.set(o.account, nact);
         await this.activity.set(o.account, await M.activityHash(this.h, nact));
@@ -1611,9 +1627,22 @@ export class Engine {
         maker_actv_path: this.activity.path(o.account).map(hex),
       });
       fills.push(fillWitness);
-      const q = remaining < o.lots ? remaining : o.lots;
-      const left = o.lots - q;
-      await book.set(index, await X.orderLeaf(this.h, o.side, o.account, left, o.expiry, o.epoch, o.display), X.askLots({ side: o.side, lots: left }), X.bidLots({ side: o.side, lots: left }));
+      // A reduce-only order fills at most its owner's position on its other side and keeps at
+      // most that; with nothing to reduce it is trimmed away (matching.nr, P2.21).
+      const held = X.heldFor(o.side, maker.priv.positions[m].size);
+      if (o.reduceOnly && held === 0n) {
+        await book.set(index, 0n, 0n, 0n);
+        this.orders[m].delete(index);
+        await this.emitDisplay(m, o, 0n);
+        const nact = { ...M.copyActivity(mact), openOrders: mact.openOrders - 1n };
+        this.actv.set(o.account, nact);
+        await this.activity.set(o.account, await M.activityHash(this.h, nact));
+        continue;
+      }
+      const avail = o.reduceOnly && held < o.lots ? held : o.lots;
+      const q = remaining < avail ? remaining : avail;
+      const left = avail - q;
+      await book.set(index, await X.orderLeaf(this.h, o.side, o.account, left, o.expiry, o.epoch, o.display, o.reduceOnly), X.askLots({ side: o.side, lots: left }), X.bidLots({ side: o.side, lots: left }));
       if (left === 0n) this.orders[m].delete(index);
       else this.orders[m].set(index, { ...o, lots: left });
       await this.emitDisplay(m, o, left);
@@ -1634,8 +1663,10 @@ export class Engine {
       const mleaf = await this.writeAccount(maker, mpriv, daNonce);
       await this.emitChange(maker, mleaf, daNonce);
       const nact = M.copyActivity(mact);
-      if (o.side === M.SIDE.BID) nact.openBid[m] -= q;
-      else nact.openAsk[m] -= q;
+      if (!o.reduceOnly) {
+        if (o.side === M.SIDE.BID) nact.openBid[m] -= q;
+        else nact.openAsk[m] -= q;
+      }
       if (left === 0n) nact.openOrders -= 1n;
       this.actv.set(maker.index, nact);
       await this.activity.set(maker.index, await M.activityHash(this.h, nact));
@@ -1678,7 +1709,7 @@ export class Engine {
     const acctPath = this.accounts.path(a.account).map(hex);
     const restPath = siblingsToNoir(this.books[m].path(index));
     if (modify) {
-      await this.books[m].set(index, await X.orderLeaf(this.h, side, a.account, lots, o.expiry, o.epoch, o.display), X.askLots({ side, lots }), X.bidLots({ side, lots }));
+      await this.books[m].set(index, await X.orderLeaf(this.h, side, a.account, lots, o.expiry, o.epoch, o.display, o.reduceOnly), X.askLots({ side, lots }), X.bidLots({ side, lots }));
       this.orders[m].set(index, { ...o, lots });
     } else {
       await this.books[m].set(index, 0n, 0n, 0n);
@@ -1687,12 +1718,14 @@ export class Engine {
     await this.emitDisplay(m, o, lots);
     this.markets[m].bookRoot = this.books[m].root;
     const nact: M.Activity = { ...M.copyActivity(act), openOrders: modify ? act.openOrders : act.openOrders - 1n };
-    if (side === M.SIDE.BID) nact.openBid[m] -= o.lots - lots;
-    else nact.openAsk[m] -= o.lots - lots;
+    if (!o.reduceOnly) {
+      if (side === M.SIDE.BID) nact.openBid[m] -= o.lots - lots;
+      else nact.openAsk[m] -= o.lots - lots;
+    }
     const actvPath = this.activity.path(a.account).map(hex);
     this.actv.set(a.account, nact);
     await this.activity.set(a.account, await M.activityHash(this.h, nact));
-    return { taker_acct_path: acctPath, taker_actv_path: actvPath, rest_path: restPath, cancel_lots: o.lots.toString(), cancel_expiry: o.expiry.toString(), cancel_display: !!o.display };
+    return { taker_acct_path: acctPath, taker_actv_path: actvPath, rest_path: restPath, cancel_lots: o.lots.toString(), cancel_expiry: o.expiry.toString(), cancel_display: !!o.display, cancel_reduce_only: !!o.reduceOnly };
   }
 
   private async execWithdraw(a: Pick<SignedAction, 'account' | 'p'>, rec: AccountRecord, act: M.Activity, daNonce: bigint) {

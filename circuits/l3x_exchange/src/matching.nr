@@ -2,7 +2,7 @@
 //! shared by signed orders (seg_trade) and liquidation closes (seg_liquidate).
 use crate::{
     account::{account_leaf, AccountPriv, AccountPub, Activity, blind, enc_commitment, Position},
-    book::{Order, order_index, Sibling, SIDE_BID, walk},
+    book::{Order, order_index, Sibling, SIDE_ASK, SIDE_BID, walk},
     consts::{ACCOUNTS_HEIGHT, BOOK_HEIGHT, DS_ACCT_NODE, DS_ACTV_NODE, FEE_TIERS, MAX_COLLATERAL},
     da::{emit_change, emit_display},
     params::FeeTier,
@@ -95,22 +95,35 @@ pub fn match_order<let F: u32>(
             let own = f.order.account_index == t.index;
             let is_void = !own & (f.order.epoch != f.maker_actv.epoch);
             let is_expired = !own & !is_void & f.order.expired(r.time);
-            let is_fill = !own & !is_void & !is_expired;
+            // A reduce-only order (P2.21) can fill at most its owner's position on its other side,
+            // and keeps at most that: the rest is trimmed. With nothing to reduce it is removed.
+            let mpos = f.maker_priv.positions[mid].size;
+            let held: u64 = if (f.order.side == SIDE_ASK) & (mpos > 0) {
+                mpos as u64
+            } else if (f.order.side == SIDE_BID) & (mpos < 0) {
+                (0 - mpos) as u64
+            } else {
+                0
+            };
+            let is_trimmed = !own & !is_void & !is_expired & f.order.reduce_only & (held == 0);
+            let is_fill = !own & !is_void & !is_expired & !is_trimmed;
+            let avail = if f.order.reduce_only & (held < f.order.lots) { held } else { f.order.lots };
             let q = if !is_fill {
                 0
-            } else if remaining < f.order.lots {
+            } else if remaining < avail {
                 remaining
             } else {
-                f.order.lots
+                avail
             };
             let left = if is_fill {
                 Order {
                     side: f.order.side,
                     account_index: f.order.account_index,
-                    lots: f.order.lots - q,
+                    lots: avail - q,
                     expiry: f.order.expiry,
                     epoch: f.order.epoch,
                     display: f.order.display,
+                    reduce_only: f.order.reduce_only,
                 }
             } else {
                 Order::empty()
@@ -122,33 +135,45 @@ pub fn match_order<let F: u32>(
             if own {
                 // A void order of the taker's no longer counts as open; only a live one shrinks its lots.
                 if f.order.epoch == t.act.epoch {
-                    if f.order.side == SIDE_BID {
-                        t.act.open_bid[mid] -= f.order.lots;
-                    } else {
-                        t.act.open_ask[mid] -= f.order.lots;
+                    if !f.order.reduce_only {
+                        if f.order.side == SIDE_BID {
+                            t.act.open_bid[mid] -= f.order.lots;
+                        } else {
+                            t.act.open_ask[mid] -= f.order.lots;
+                        }
                     }
                     t.act.open_orders -= 1;
                 }
             } else {
                 // A void order is already gone from its owner's open lots; an expired one takes all
-                // its lots out of them, and a fill the lots it fills.
+                // its lots out of them, and a fill the lots it fills. A reduce-only order holds no
+                // open lots, only its place in the open-order count.
                 let mut mact = f.maker_actv;
-                let gone = if is_expired { f.order.lots } else { q };
+                let gone = if f.order.reduce_only {
+                    0
+                } else if is_expired {
+                    f.order.lots
+                } else {
+                    q
+                };
                 if f.order.side == SIDE_BID {
                     mact.open_bid[mid] = f.maker_actv.open_bid[mid] - gone;
                 } else {
                     mact.open_ask[mid] = f.maker_actv.open_ask[mid] - gone;
                 }
-                if is_expired | (is_fill & (left.lots == 0)) {
+                if is_expired | is_trimmed | (is_fill & (left.lots == 0)) {
                     mact.open_orders = f.maker_actv.open_orders - 1;
                 }
-                if is_fill {
+                // A fill writes the maker's leaf; a trim proves it unchanged, since the trim rests
+                // on the owner's position. Both share one account update.
+                if is_fill | is_trimmed {
                     let maker_factor = tiers[f.maker_actv.fee_tier].maker_ppm;
-                    let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, maker_factor, f, q, da_nonce);
+                    let (st2, r2, m2) = fill_maker(st, r, mkt, mid, maker_fee_ppm, maker_factor, f, q, da_nonce, is_trimmed);
                     st = st2;
                     r = r2;
                     mkt = m2;
-
+                }
+                if is_fill {
                     // Taker side of the fill.
                     if !t.traded {
                         let (c, pos, dust) = settle_funding(t.priv.collateral, t.priv.positions[mid], mkt.cum_funding);
@@ -181,8 +206,9 @@ pub fn match_order<let F: u32>(
 }
 
 /// The maker side of a fill of `q` lots at the maker's price: settles the maker's funding, applies
-/// the fill and the maker fee at the maker's tier, and writes and publishes the maker's leaf. The
-/// caller writes the maker's activity.
+/// the fill and the maker fee at the maker's tier, and writes and publishes the maker's leaf. With
+/// `trim` (a reduce-only order whose owner has nothing left to reduce), the leaf is only proven,
+/// unchanged, since the trim rests on it. The caller writes the maker's activity.
 fn fill_maker(
     state: State,
     running: Running,
@@ -193,6 +219,7 @@ fn fill_maker(
     f: Fill,
     q: u64,
     da_nonce: Field,
+    trim: bool,
 ) -> (State, Running, Market) {
     let mut st = state;
     let mut r = running;
@@ -200,7 +227,9 @@ fn fill_maker(
     let mi = f.order.account_index;
     let mp_price = f.price as u64;
     let (mc, mpos, mdust) = settle_funding(f.maker_priv.collateral, f.maker_priv.positions[mid], mkt.cum_funding);
-    st.insurance_micro += mdust;
+    if !trim {
+        st.insurance_micro += mdust;
+    }
     let dm: i64 = if f.order.side == SIDE_BID { q as i64 } else { 0 - (q as i64) };
     let (ms, me, mpnl) = fill(mpos.size, mpos.entry, dm, mp_price as i64);
     let mfee = tier_fee(q, mp_price, maker_fee_ppm, maker_factor_ppm);
@@ -212,10 +241,12 @@ fn fill_maker(
     st.fees_pending += mfee;
     assert(enc_commitment(f.maker_k_enc) == f.maker_pub.enc_commitment, "maker k_enc");
     mpriv.blind = blind(f.maker_k_enc, mi, da_nonce, r.da_len);
-    let maker_leaf = account_leaf(f.maker_pub, mpriv);
-    st.accounts_root =
-        update(DS_ACCT_NODE, st.accounts_root, mi, account_leaf(f.maker_pub, f.maker_priv), maker_leaf, f.maker_acct_path);
-    r = emit_change(r, mi, maker_leaf, mpriv, f.maker_k_enc, da_nonce);
+    let old_leaf = account_leaf(f.maker_pub, f.maker_priv);
+    let maker_leaf = if trim { old_leaf } else { account_leaf(f.maker_pub, mpriv) };
+    st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, mi, old_leaf, maker_leaf, f.maker_acct_path);
+    if !trim {
+        r = emit_change(r, mi, maker_leaf, mpriv, f.maker_k_enc, da_nonce);
+    }
     (st, r, mkt)
 }
 
