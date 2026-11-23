@@ -549,7 +549,20 @@ async function l1(net: Network) {
     const bridgeAt: any = await Contract.at(AztecAddress.fromStringUnsafe(r.l2Bridge), bridgeArtifact, wallet as any);
     const tokenAt: any = await Contract.at(AztecAddress.fromStringUnsafe(r.l2Token), tokenArtifact, wallet as any);
     const publicBalance = async (who: any) => big((await tokenAt.methods.balance_of_public(who).simulate({ from: alice })).result);
-    const erc20Balance = async (who: Hex) => (await pub.readContract({ address: r.erc20, abi: TestERC20Abi, functionName: 'balanceOf', args: [who] })) as bigint;
+    /**
+     * An ERC-20 balance at an explicit L1 block. A public RPC balances requests over nodes that may
+     * lag the receipt it just returned, so reads name the block and retry until a node has it.
+     */
+    const erc20Balance = async (who: Hex, blockNumber: bigint) => {
+      for (let i = 0; ; i++) {
+        try {
+          return (await pub.readContract({ address: r.erc20, abi: TestERC20Abi, functionName: 'balanceOf', args: [who], blockNumber })) as bigint;
+        } catch (err) {
+          if (i >= 20) throw err;
+          await sleep(3_000);
+        }
+      }
+    };
 
     /** Deposits through the portal; returns the claim's secret and the message's key and leaf index. */
     async function deposit(kind: 'public' | 'private', amount: bigint) {
@@ -628,8 +641,7 @@ async function l1(net: Network) {
           await sleep(60_000);
         }
       });
-      const before = await erc20Balance(recipient);
-      await write(`${e.label}: the portal releases ${e.amount}`, r.portal, TokenPortalAbi, 'withdraw', [
+      const released = await write(`${e.label}: the portal releases ${e.amount}`, r.portal, TokenPortalAbi, 'withdraw', [
         recipient,
         BigInt(e.amount),
         false,
@@ -638,8 +650,9 @@ async function l1(net: Network) {
         witness.leafIndex,
         witness.siblingPath.toBufferArray().map((b: Buffer) => toHex(b)),
       ]);
-      assert((await erc20Balance(recipient)) === before + BigInt(e.amount), `${e.label}: the portal did not release ${e.amount}`);
-      Object.assign(e, { released: true, epoch: Number(witness.epochNumber), waitedS: Math.round(ms / 1000) });
+      const before = await erc20Balance(recipient, released.blockNumber - 1n);
+      assert((await erc20Balance(recipient, released.blockNumber)) === before + BigInt(e.amount), `${e.label}: the portal did not release ${e.amount}`);
+      Object.assign(e, { released: true, epoch: Number(witness.epochNumber), waitedS: Math.round(ms / 1000), l1Block: Number(released.blockNumber) });
       persist();
     }
 
@@ -651,7 +664,8 @@ async function l1(net: Network) {
       r.changeSpent = true;
     }
     const supply = await publicBalance(alice);
-    const portalHolds = await erc20Balance(r.portal);
+    // No L1 transaction follows the last release, so the portal's holding is read at its block.
+    const portalHolds = await erc20Balance(r.portal, BigInt(Math.max(...r.exits.map((e: any) => e.l1Block))));
     assert(supply === 950n && portalHolds === 950n, `L2 supply ${supply}, portal holds ${portalHolds}`);
     log(`the portal holds ${portalHolds}, exactly the token's supply on L2`);
     r.portalHolds = portalHolds.toString();

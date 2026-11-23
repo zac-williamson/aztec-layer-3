@@ -217,5 +217,152 @@
     },
     "status": "passed",
     "finishedAt": "2026-11-23T13:44:39.401Z"
+  },
+  "l1": {
+    "startedAt": "2026-11-23T13:25:23.366Z",
+    "steps": [
+      {
+        "label": "deploy the ERC-20 on L1",
+        "l1TxHash": "0xff1838c1cb072952bfed28af5a30c562d489f5147dfbb85ee23a6e6c45a2cf57",
+        "l1Block": 12195974,
+        "gasUsed": 4834390
+      },
+      {
+        "label": "deploy the TokenPortal on L1",
+        "l1TxHash": "0xda750a9560b6268a1b583a865816bfec2857f0201f69c1db78c5f607ebe9d9b5",
+        "l1Block": 12195975,
+        "gasUsed": 5048157
+      },
+      {
+        "label": "deploy the token bridge",
+        "txHash": "0x0391502b45d10f9d6668846c2ac0be4ae22701dffa8168583a572cd36ad71614",
+        "block": 59795,
+        "ms": 45240
+      },
+      {
+        "label": "deploy the bridged token",
+        "txHash": "0x1936f2c446497d7bbc6b20bce8455ac4821f96de6e079fba695e249bde2014a4",
+        "block": 59798,
+        "ms": 72024
+      },
+      {
+        "label": "bind the token to its bridge",
+        "txHash": "0x2a06cabad537d2f45e5a7b4ce2b498df5a02281f1a7f3d859fc489c71aaa601d",
+        "block": 59800,
+        "ms": 71607
+      },
+      {
+        "label": "initialize the portal",
+        "l1TxHash": "0xace8ac2fe2f4108a5f962d7df244305c9f3d115acc599ecadcbc1eccd94ccbff",
+        "l1Block": 12195992,
+        "gasUsed": 805030
+      },
+      {
+        "label": "make the deployer an ERC-20 minter",
+        "l1TxHash": "0x8db9cdce8e09e04aa6028072e0d87250014f26c4707c4a3220be14d4f0d66dac",
+        "l1Block": 12195993,
+        "gasUsed": 21402
+      },
+      {
+        "label": "mint 10,000 on L1",
+        "l1TxHash": "0xd1d459acaa6a95411bcb06913c35c6a5d59cb495988d9883a679501b434df3b6",
+        "l1Block": 12195994,
+        "gasUsed": 240720
+      },
+      {
+        "label": "approve the portal for 1000",
+        "l1TxHash": "0xf307b0dfc7f93b6aac339761a9a279bc80b1dba52e2e545cf480608f2ace750a",
+        "l1Block": 12195995,
+        "gasUsed": 128238
+      },
+      {
+        "label": "deposit 1000 to alice's public balance",
+        "l1TxHash": "0x52e0196438f3229912a301922c1e68471350b94eb15f42df79f20d8837ce7d72",
+        "l1Block": 12195996,
+        "gasUsed": 212322
+      },
+      {
+        "label": "alice claims 1000 to her public balance",
+        "txHash": "0x0cadd5d69c4257b1073d95dd2644aa146e023ec9e1a4ac2b1d202fb02f07509b",
+        "block": 59810,
+        "ms": 62866
+      },
+      {
+        "label": "approve the portal for 600",
+        "l1TxHash": "0xf57d01d920026b9db542e9fa7fbc5404c6ff264f498dee7bde329ce29ae8b541",
+        "l1Block": 12196010,
+        "gasUsed": 128238
+      },
+      {
+        "label": "deposit 600 without a recipient",
+        "l1TxHash": "0x2cab3c93957aff49326c6dec667268a0bf1c84ec8b28236e0bdc7acfcf2b5c99",
+        "l1Block": 12196011,
+        "gasUsed": 113640
+      },
+      {
+        "label": "alice claims 600 as a credit",
+        "txHash": "0x2af9c0b49ddd229f2ca2e63b8d3c22dc6c3f71b5bbd3e70941e7be2b67fb9d13",
+        "block": 59820,
+        "ms": 59900
+      },
+      {
+        "label": "alice exits 400 of her public balance",
+        "txHash": "0x1ccd41e650413cbf2c890d07e3f1055e54de1d47d73d78a7b76a99e7e31da25e",
+        "block": 59821,
+        "ms": 72748
+      },
+      {
+        "label": "alice exits 250 of her credit",
+        "txHash": "0x049ef2f4ae020eb359d946d791442fa08b5abc7aed03b00965bb1c9f07e9f78b",
+        "block": 59824,
+        "ms": 214698
+      },
+      {
+        "label": "public exit: the portal releases 400",
+        "l1TxHash": "0x96feb4c0db0b00a3dafd3752e6a089e55bffa41a1828afb640edc8e5aa380992",
+        "l1Block": 12196167,
+        "gasUsed": 188276
+      },
+      {
+        "label": "confidential exit: the portal releases 250",
+        "l1TxHash": "0x86ed29f96ef400c682c03e68fc7d39a717eb08f140a11783e9fe5d1f85ff76d9",
+        "l1Block": 12196175,
+        "gasUsed": 90355
+      },
+      {
+        "label": "alice spends her 350 of change",
+        "txHash": "0x277fdda0ea45bae02c369f0323b9b1739f07308eb5e3068d9e12104bbcd1bd9b",
+        "block": 59896,
+        "ms": 92380
+      }
+    ],
+    "erc20": "0x5c572261815090cec4c338821f038edc38b53752",
+    "portal": "0x10759672c07fcf940f718d4e1497477cd68853a5",
+    "l2Bridge": "0x2d68d58275665a55144fec62cec92817088bbbde854aa3b566ad1a45719c4e91",
+    "l2Token": "0x04b41484ef52460ccf4fecce1cc6d8f31e48a2231daf5ccf745d57e0d0df3373",
+    "claimed": true,
+    "exits": [
+      {
+        "label": "public exit",
+        "amount": "400",
+        "txHash": "0x1ccd41e650413cbf2c890d07e3f1055e54de1d47d73d78a7b76a99e7e31da25e",
+        "released": true,
+        "epoch": 1203,
+        "l1Block": 12196167
+      },
+      {
+        "label": "confidential exit",
+        "amount": "250",
+        "txHash": "0x049ef2f4ae020eb359d946d791442fa08b5abc7aed03b00965bb1c9f07e9f78b",
+        "released": true,
+        "epoch": 1203,
+        "waitedS": 1,
+        "l1Block": 12196175
+      }
+    ],
+    "status": "passed",
+    "finishedAt": "2026-11-23T14:08:41.618Z",
+    "changeSpent": true,
+    "portalHolds": "950"
   }
 }

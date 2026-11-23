@@ -1452,6 +1452,11 @@ P1's exit criterion ran on the public Aztec testnet, on the P2.16 build. `script
   - Each claimant rebuilds the frozen accounts tree from the three DA logs (0.4 s), opens its leaf, and registers a claim at the frozen indices. The equities equal the operator's engine.
   - After `t_claim`, Alice withdraws 999,868: her collateral less 32 of maker fees, and −100 on her market-1 short at the frozen index. Bob withdraws 2,000,013: less 87 of taker fees, plus 100.
   - The operator withdraws the fee account's 119 after `t_late`, and the vault ends empty.
+- **Token bridge** (§10.6), the same day, between Sepolia and the testnet:
+  - A `TestERC20` and Aztec's `TokenPortal` deploy on Sepolia. On L2, a `ConfidentialTokenBridge` and a `ConfidentialToken` minted by it deploy and are bound once; the portal is initialized with the registry and the L2 bridge.
+  - Alice deposits 1,000 to her public balance and 600 without a recipient. Each message reached L2 in 62–92 s, and she claims them, the second as a credit.
+  - She exits 400 of her public balance and 250 of her credit. Both burns fell in epoch 1203, whose proof reached Sepolia about 29 minutes after the first: the only wait in these runs on an epoch proof, since the portal pays only against a root the Outbox holds. The portal then released both.
+  - She spends her 350 of change, and the portal holds 950, exactly the token's supply on L2. The L1 side used 11.8M gas.
 
 ## 16. Decisions
 
