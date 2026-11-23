@@ -410,7 +410,8 @@ fn trigger_action(state: State, a: Action, act: Activity, params: Params) -> Sta
         assert((limit as Field == a.p[2]) & (limit > 0) & (limit < MAX_PRICE), "price out of range");
         assert((lots as Field == a.p[3]) & (lots > 0) & (lots < MAX_LOTS), "lots out of range");
         assert((price as Field == a.p[5]) & (price > 0) & ((price as u64) < MAX_PRICE), "trigger price out of range");
-        assert((a.p[6] == 0) & (a.p[7] == 0), "trigger payload");
+        // p[6] is the entry flag: a stop that opens a position instead of reducing one.
+        assert(((a.p[6] == 0) | (a.p[6] == 1)) & (a.p[7] == 0), "trigger payload");
         let mark = market.mark_price;
         assert(mark > 0, "no mark price");
         if dir == DIR_UP {
@@ -418,7 +419,7 @@ fn trigger_action(state: State, a: Action, act: Activity, params: Params) -> Sta
         } else {
             assert((price as u64) < mark, "trigger already due");
         }
-        new = Trigger { dir, side, account_index: idx, lots, limit, epoch: a.taker_actv.epoch };
+        new = Trigger { dir, side, account_index: idx, lots, limit, epoch: a.taker_actv.epoch, entry: a.p[6] == 1 };
         market.next_seq = seq + 1;
     } else {
         assert((price as Field == a.p[2]) & (seq as Field == a.p[3]), "trigger reference");

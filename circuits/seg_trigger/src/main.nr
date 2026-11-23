@@ -6,6 +6,7 @@ use l3x_exchange::{
     matching::{assert_no_crossing, Fill, match_order, Taker},
     params::Params,
     state::State,
+    trade::{covers, equity, exposure_fresh, initial_margin, worst},
     tree::update,
     trigger::{DIR_UP, due, highest_down, lowest_up, Trigger, trigger_index, trigger_walk, TriggerTop},
 };
@@ -18,9 +19,12 @@ global F: u32 = 2;
 /// trigger must be the next due in its direction (the lowest UP trigger at or below the mark, or
 /// the highest DOWN trigger at or above it), so due triggers fire in price-time order.
 ///
-/// A live trigger executes as a reduce-only IOC order at its limit price, paying the taker fee: it
-/// fills at most the owner's position on its other side, so it reserves no margin and never
-/// increases risk. It stops early only when its matching steps run out, in which case the rest
+/// A live trigger executes as an IOC order at its limit price, paying the taker fee. A reduce-only
+/// trigger fills at most the owner's position on its other side, so it reserves no margin and never
+/// increases risk. An entry trigger (a stop that opens a position) fills its lots, and if that
+/// raised the owner's worst-case exposure, the owner must then cover initial margin at fresh
+/// indices; otherwise the firing is consumed without effect, so a due trigger never stalls the
+/// market and the operator cannot fake an unaffordable one. It stops early only when its matching steps run out, in which case the rest
 /// stays in the tree to fire again, or when no liquidity is left within its limit, in which case
 /// the rest is dropped. A void trigger (its owner cancelled all since placing it), or one whose
 /// owner has nothing left to reduce, is removed without effect. The segment then proves the next
@@ -86,11 +90,12 @@ fn main(
     };
     let q = if !live {
         0
-    } else if trigger.lots < held {
+    } else if trigger.entry | (trigger.lots < held) {
         trigger.lots
     } else {
         held
     };
+    let (st0, end0, mk0) = (st, end, mk);
     let mut a = acct_priv;
     let mut act = actv;
     let mut traded = false;
@@ -129,6 +134,24 @@ fn main(
         assert(st.fees_pending < MAX_FEES, "fees out of range");
     } else {
         assert(n_fills == 0, "nothing to fill");
+    }
+    // An entry trigger must be affordable after its fill (P2.20), as a new order is in seg_trade.
+    if trigger.entry & traded {
+        let mut ms = st.markets;
+        ms[market] = mk;
+        let worst_before = worst(acct_priv.positions[market].size, actv.open_bid[market], actv.open_ask[market]);
+        let worst_after = worst(a.positions[market].size, act.open_bid[market], act.open_ask[market]);
+        let affordable = (worst_after <= worst_before)
+            | (exposure_fresh(a, act, ms, params.max_age, end.time) & covers(equity(a, ms), initial_margin(a, act, ms, params)));
+        if !affordable {
+            st = st0;
+            end = end0;
+            mk = mk0;
+            a = acct_priv;
+            act = actv;
+            traded = false;
+            left = 0;
+        }
     }
 
     // The trigger leaves the tree, or keeps the lots its steps did not reach.

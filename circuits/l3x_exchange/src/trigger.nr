@@ -4,7 +4,8 @@
 //! take-profit an UP sell, and the mirror image for a short. UP triggers use the ask slot, so the
 //! lowest price, earliest first, is leftmost; DOWN triggers use the bid slot, so the highest
 //! price, earliest first, is rightmost. One walk then finds the next trigger due in each
-//! direction. A fired trigger is a reduce-only IOC order at its limit price.
+//! direction. A fired trigger is an IOC order at its limit price: reduce-only, or, for a stop that
+//! opens a position, subject to initial margin when it fires.
 use crate::{
     book::{order_index, Sibling, SIDE_ASK, SIDE_BID, walk, Walk, LEFTMOST, RIGHTMOST},
     consts::{BOOK_HEIGHT, DS_TRIGGER},
@@ -15,7 +16,8 @@ pub global DIR_DOWN: Field = 0;
 pub global DIR_UP: Field = 1;
 
 /// A resting trigger. `epoch` is its owner's order epoch when placed, so CancelAll voids triggers
-/// as it voids orders.
+/// as it voids orders. A trigger is reduce-only unless `entry`: a stop that opens a position,
+/// which fires only if its owner can afford it then (SPEC.md §6.5).
 pub struct Trigger {
     pub dir: Field,
     pub side: Field,
@@ -23,11 +25,12 @@ pub struct Trigger {
     pub lots: u64,
     pub limit: u64,
     pub epoch: u64,
+    pub entry: bool,
 }
 
 impl Trigger {
     pub fn empty() -> Self {
-        Trigger { dir: 0, side: 0, account_index: 0, lots: 0, limit: 0, epoch: 0 }
+        Trigger { dir: 0, side: 0, account_index: 0, lots: 0, limit: 0, epoch: 0, entry: false }
     }
 
     /// The leaf value; a trigger with no lots is the empty leaf.
@@ -37,8 +40,8 @@ impl Trigger {
         } else {
             hash(
                 [
-                    DS_TRIGGER, self.dir, self.side, self.account_index as Field, self.lots as Field,
-                    self.limit as Field, self.epoch as Field,
+                    DS_TRIGGER, self.dir, self.side + (self.entry as Field) * 2, self.account_index as Field,
+                    self.lots as Field, self.limit as Field, self.epoch as Field,
                 ],
             )
         }

@@ -67,14 +67,15 @@ const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: b
   display: !!o.display,
 });
 const pad = <T>(xs: T[], n: number, f: () => T) => [...xs, ...Array.from({ length: n - xs.length }, f)];
-const emptyTrigger = () => ({ dir: hex(0n), side: hex(0n), account_index: '0', lots: '0', limit: '0', epoch: '0' });
-const triggerToNoir = (t: { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint }) => ({
+const emptyTrigger = () => ({ dir: hex(0n), side: hex(0n), account_index: '0', lots: '0', limit: '0', epoch: '0', entry: false });
+const triggerToNoir = (t: { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint; entry?: boolean }) => ({
   dir: hex(t.dir),
   side: hex(t.side),
   account_index: t.account.toString(),
   lots: t.lots.toString(),
   limit: t.limit.toString(),
   epoch: t.epoch.toString(),
+  entry: !!t.entry,
 });
 const emptyTriggerTop = () => ({ has: false, price: '0', seq: '0', trigger: emptyTrigger(), path: emptyBookPath() });
 const emptyOwner = () => ({ owner_actv: M.activityToNoir(M.newActivity()), owner_actv_path: zeros(M.ACCOUNTS_HEIGHT) });
@@ -124,7 +125,7 @@ export class Engine {
    * Rules this engine skips, to build consistent but non-compliant witnesses for adversarial tests
    * (a malicious operator's engine). Empty in any real use.
    */
-  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers' | 'rekey-owner' | 'revoked-keys' | 'tiers'>();
+  relax = new Set<'fills' | 'oracle-sigs' | 'liq' | 'client-auth' | 'cleanup' | 'triggers' | 'rekey-owner' | 'revoked-keys' | 'tiers' | 'entry-margin'>();
 
   // The batch being built.
   running!: Running;
@@ -1279,13 +1280,14 @@ export class Engine {
       if (side !== M.SIDE.BID && side !== M.SIDE.ASK) throw new Error('side');
       if (dir !== X.DIR.UP && dir !== X.DIR.DOWN) throw new Error('trigger direction');
       if (limit <= 0n || limit >= X.MAX_PRICE || lots <= 0n || lots >= X.MAX_LOTS || price <= 0n || price >= X.MAX_PRICE) throw new Error('trigger out of range');
-      if (p6 !== 0n || p7 !== 0n) throw new Error('trigger payload');
+      // p6 is the entry flag: a stop that opens a position (P2.20).
+      if ((p6 !== 0n && p6 !== 1n) || p7 !== 0n) throw new Error('trigger payload');
       if (mk.markPrice === 0n) throw new Error('no mark price');
       if (dir === X.DIR.UP ? price <= mk.markPrice : price >= mk.markPrice) throw new Error('trigger already due');
       const seq = mk.nextSeq;
       const index = X.triggerIndex(dir, price, seq);
       witness.trigger_path = siblingsToNoir(this.triggerTrees[m].path(index));
-      const t: X.Trigger = { dir, side, account: a.account, lots, limit, epoch: act.epoch, price, seq };
+      const t: X.Trigger = { dir, side, account: a.account, lots, limit, epoch: act.epoch, price, seq, entry: p6 === 1n };
       await this.triggerTrees[m].set(index, await X.triggerLeaf(this.h, t), dir === X.DIR.UP ? lots : 0n, dir === X.DIR.DOWN ? lots : 0n);
       this.triggers[m].set(index, t);
       mk.nextSeq = seq + 1n;
@@ -1332,8 +1334,10 @@ export class Engine {
   }
 
   /**
-   * One firing: a reduce-only IOC order at the trigger's limit for at most the owner's position on
-   * its other side. The rest stays in the tree only when the matching steps ran out.
+   * One firing: an IOC order at the trigger's limit. A reduce-only trigger fills at most the owner's
+   * position on its other side; an entry trigger fills its lots and must then be affordable, or
+   * the firing is undone and consumed without effect (seg_trigger). The rest stays in the tree only
+   * when the matching steps ran out.
    */
   async triggerSegment(m: number, index: bigint, t: X.Trigger) {
     const start = copyRunning(this.running);
@@ -1364,12 +1368,13 @@ export class Engine {
     const live = t.epoch === act0.epoch;
     const pos = rec.priv.positions[m].size;
     const held = t.side === M.SIDE.ASK && pos > 0n ? pos : t.side === M.SIDE.BID && pos < 0n ? -pos : 0n;
-    const q = !live ? 0n : t.lots < held ? t.lots : held;
+    const q = !live ? 0n : t.entry || t.lots < held ? t.lots : held;
     let priv = M.copyPriv(rec.priv);
     let act = M.copyActivity(act0);
     let traded = false;
     let left = 0n;
     let effect = live ? 'nothing to reduce' : 'void';
+    const beforeFill = t.entry ? this.snapshot() : undefined;
     if (q > 0n) {
       const taker = { index: t.account, priv, act, traded: false };
       const matched = await this.matchOrder(m, t.side, t.limit, q, taker, daNonce, mp.makerFeePpm, mp.takerFeePpm);
@@ -1383,6 +1388,24 @@ export class Engine {
       traded = taker.traded;
       Object.assign(w, { n_fills: matched.fills.length, fills: pad(matched.fills, FILLS, () => this.emptyFill()) });
       effect = `filled ${q - matched.remaining} of ${q}${left ? `, ${left} left to fire` : ''}`;
+    }
+    // An entry trigger that raised the owner's worst-case exposure must leave it above initial
+    // margin at fresh indices; otherwise the firing is undone and the trigger consumed.
+    if (t.entry && traded) {
+      const wBefore = X.worst(rec.priv.positions[m].size, act0.openBid[m], act0.openAsk[m]);
+      const wAfter = X.worst(priv.positions[m].size, act.openBid[m], act.openAsk[m]);
+      const affordable =
+        wAfter <= wBefore ||
+        (X.exposureFresh(priv, act, this.markets, this.params.maxAge, this.running.time) &&
+          X.covers(X.equity(priv, this.markets), X.initialMargin(priv, act, this.markets, this.params)));
+      if (!affordable && !this.relax.has('entry-margin')) {
+        this.restore(beforeFill!);
+        priv = M.copyPriv(rec.priv);
+        act = M.copyActivity(act0);
+        traded = false;
+        left = 0n;
+        effect = 'unaffordable, consumed without effect';
+      }
     }
     if (left > 0n) {
       const kept = { ...t, lots: left };

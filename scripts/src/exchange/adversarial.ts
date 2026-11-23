@@ -613,7 +613,7 @@ async function main() {
   assert(T.markets[0].triggerPending, 'trigger setup: the stops are not due');
   const pathOf = (tree: { path(i: bigint): { hash: bigint; ask: bigint; bid: bigint }[] }, i: bigint) =>
     tree.path(i).map((x) => ({ hash: hex(x.hash), ask: x.ask.toString(), bid: x.bid.toString() }));
-  const trigNoir = (x: X.Trigger) => ({ dir: hex(x.dir), side: hex(x.side), account_index: x.account.toString(), lots: x.lots.toString(), limit: x.limit.toString(), epoch: x.epoch.toString() });
+  const trigNoir = (x: X.Trigger) => ({ dir: hex(x.dir), side: hex(x.side), account_index: x.account.toString(), lots: x.lots.toString(), limit: x.limit.toString(), epoch: x.epoch.toString(), entry: !!x.entry });
   const resting = [...T.triggers[0].entries()];
   const [laterIdx, later] = resting.find(([, x]) => x.price === 1955n)!;
   const [tpIdx, tp] = resting.find(([, x]) => x.price === 2100n)!;
@@ -735,6 +735,33 @@ async function main() {
   t.actions[0].cancel_display = false;
   await expectFail('a displayed order cancelled as if undisplayed', 'seg_trade', t, 'book path does not match root');
   assert(R.rejected.length === 0, `display setup rejected: ${R.rejected.map((r) => r.reason)}`);
+
+  // Stops that open a position (P2.20): the entry flag is 0 or 1, and an entry stop the owner
+  // cannot afford when it fires is undone, whatever the operator claims.
+  t = clone(quiet);
+  await resign(t, 0, 2, 2n, X.KIND_ACT.PLACE_TRIGGER, [0n, BID, 1990n, 5n, X.DIR.UP, 2100n, 2n]);
+  t.actions[0].kind = hex(X.KIND_ACT.PLACE_TRIGGER);
+  await expectFail('an entry flag out of range', 'seg_trade', t, 'trigger payload');
+  await R.trade([await signAction(h, R.domain, rKeys[1], WITHDRAW, idx(1), rNonce(idx(1)), [950_000n, 77n])]);
+  await R.trade([await signAction(h, R.domain, rNext, PLACE, R0, rNonce(R0), [0n, ASK, 2005n, 300n, GTC, 0n])]);
+  await R.trade([await signAction(h, R.domain, rKeys[1], X.KIND_ACT.PLACE_TRIGGER, idx(1), rNonce(idx(1)), [0n, BID, 2010n, 300n, X.DIR.UP, 2003n, 1n])]);
+  assert(R.rejected.length === 0, `entry setup rejected: ${R.rejected.map((r) => r.reason)}`);
+  await R.block(now + 2n, [await update(R, 0n, 2004n, now + 2n)]);
+  R.relax.add('entry-margin');
+  await R.fireTriggers([0]);
+  R.relax.delete('entry-margin');
+  const overreach = R.segments.at(-1)!;
+  assert(overreach.pkg === 'seg_trigger' && overreach.label.includes('filled 300 of 300'), `entry firing: ${overreach.label}`);
+  // The circuit undoes the fill, so the operator's witness, built on the filled state, either
+  // fails against the restored roots or proves a state other than the one claimed.
+  try {
+    const { returnValue } = (await execute('seg_trigger', overreach.inputs)) as any;
+    const proved = BigInt(returnValue.end.state);
+    results.push({ name: 'an unaffordable entry stop filled', pass: proved !== overreach.expectedEnd.state, how: proved !== overreach.expectedEnd.state ? 'undone: the proved state differs from the claimed one' : 'FILLED' });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).split('\n')[0];
+    results.push({ name: 'an unaffordable entry stop filled', pass: msg.includes('Merkle path does not match root'), how: `undone: ${msg.slice(0, 100)}` });
+  }
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

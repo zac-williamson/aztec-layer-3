@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), and displayed orders (P2.19), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), and stops that open a position (P2.20), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -1317,7 +1317,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - It stops early only when its two matching steps run out, and then the rest stays in the tree to fire again; otherwise any rest is dropped, once no order within the limit crosses.
   - A void trigger, or one whose owner has nothing left to reduce, is removed without effect.
   - The segment then proves the next trigger due in each direction and clears the flag once none is due.
-- **Narrowing.** Triggers are reduce-only and do not expire, so a stop that opens a position is deferred. §7.3's single `PlaceOrder` with a trigger field is built as two separate kinds.
+- **Narrowing.** Triggers are reduce-only and do not expire, so a stop that opens a position was deferred (built in P2.20). §7.3's single `PlaceOrder` with a trigger field is built as two separate kinds.
 - **Cost.** `seg_block`: 317,728 gates, for two more 80-level walks per update. `seg_trade`: 438,638, for one trigger write per action, placement and cancellation sharing it. `seg_trigger`: 150,096.
 
 **Market data** (P2.16, §8.4, [D1]):
@@ -1353,6 +1353,18 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Void orders.** CancelAll, a forced cancel-all, a liquidation's cancel step and a rekey void orders by an epoch, without enumerating them. A displayed order voided this way stays in the displayed book until matching or maintenance removes it, and the removal is published. The engine's maintenance removes void displayed orders like any dead order.
 - **Readers.** `scripts/src/exchange/da.ts` decodes display entries, and `displayedBook` rebuilds the displayed book from them alone.
 - **Cost.** An entry is three fields, since each DA field costs a sponge step in every branch. `seg_trade` 450,232 gates, `seg_trigger` 153,788, `seg_forced` 107,361, `seg_refresh` 176,281. `seg_liquidate` is 261,999, 145 gates under 2^18: its next addition will double its proving size unless something else gives way.
+
+**Stops that open a position** (P2.20, §6.5):
+
+- **Placement.** `PlaceTrigger`'s `p[6]`, which had to be zero, is the entry flag. An entry trigger is a stop that opens or adds to a position. The trigger leaf packs `side + 2·entry`, so the flag is bound by the trigger path and reduce-only triggers keep their leaves. Entry triggers reserve no margin, as orders do not until they rest, and session keys may place them within their notional.
+- **Firing.** An entry trigger fires as an IOC order for all its lots at its limit, not capped at the owner's position. If the fill raised the owner's worst-case exposure in the market, then, as for a new order in `seg_trade`, the owner's indices must be fresh wherever it is exposed and its equity must cover initial margin at the marks.
+- **Unaffordable firings.** If not, `seg_trigger` keeps the state, the running values (including the makers' entries in the DA) and the market from before the fill. The trigger leaves the tree without effect, so a due trigger never stalls its market. The circuit decides affordability itself: an operator can neither fill an entry stop its owner cannot afford nor drop one its owner can.
+- **Cost.** `seg_trigger` 157,136 gates.
+
+**Tests** (P2.20):
+
+- **Native**, batch 13: Bob and Carol place entry stops to buy once the mark reaches 1820, and the index moves to 1825. Bob's stop buys 10, one from Alice's earlier ask at 1830 by time priority. Carol, nearly insolvent, could not cover the margin of 40 more lots, so her firing is consumed without effect, and neither her account nor the book changes.
+- **Adversarial**, 2 new cases (97 in all): an entry flag out of range, and an operator filling an entry stop its owner cannot afford. For the second, the circuit undoes the fill, so the witness built on the filled state fails against the restored roots.
 
 **Tests** (P2.19):
 
@@ -1477,7 +1489,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
 1. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
-2. Resting reduce-only orders with trimming, and stop orders that open a position.
+2. Resting reduce-only orders with trimming.
 3. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
 
 From P3: the ranking of ADL counterparties (§8.5).

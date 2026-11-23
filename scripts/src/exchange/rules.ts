@@ -222,9 +222,10 @@ export function takeover(a: M.AccountPriv, ins: M.AccountPriv, market: M.Market,
 /** An UP trigger fires once the mark rises to its price, a DOWN trigger once it falls to it. */
 export const DIR = { DOWN: 0n, UP: 1n } as const;
 /** A resting trigger; `price` and `seq` locate it in the market's trigger tree. */
-export type Trigger = { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint; price: bigint; seq: bigint };
-export const triggerLeaf = (h: M.H, t: Pick<Trigger, 'dir' | 'side' | 'account' | 'lots' | 'limit' | 'epoch'>) =>
-  t.lots === 0n ? Promise.resolve(0n) : h([M.DS.TRIGGER, t.dir, t.side, t.account, t.lots, t.limit, t.epoch]);
+/** A trigger; `entry` marks a stop that opens a position instead of reducing one (P2.20). */
+export type Trigger = { dir: bigint; side: bigint; account: bigint; lots: bigint; limit: bigint; epoch: bigint; price: bigint; seq: bigint; entry?: boolean };
+export const triggerLeaf = (h: M.H, t: Pick<Trigger, 'dir' | 'side' | 'account' | 'lots' | 'limit' | 'epoch' | 'entry'>) =>
+  t.lots === 0n ? Promise.resolve(0n) : h([M.DS.TRIGGER, t.dir, t.side + (t.entry ? 2n : 0n), t.account, t.lots, t.limit, t.epoch]);
 export const triggerIndex = (dir: bigint, price: bigint, seq: bigint) => orderIndex(dir === DIR.UP ? M.SIDE.ASK : M.SIDE.BID, price, seq);
 /** Whether a trigger is due at `mark`, given the lowest UP and highest DOWN trigger prices (0: none). */
 export const due = (up: bigint, down: bigint, mark: bigint) => (up > 0n && up <= mark) || (down > 0n && down >= mark);
