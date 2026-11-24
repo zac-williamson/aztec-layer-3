@@ -694,21 +694,52 @@ async function main() {
   const shown14 = decodeBatch(14n, b14.daPayload).displays;
   assert(shown14.map((d) => d.lots).join() === '40,0', `batch 14 display entries: ${shown14.map((d) => d.lots)}`);
 
-  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the fourteen
+  // Batch 15 (P2.22): a rotation signed by the master key (SPEC.md §7.3). Bob's master key sets a
+  // new master authorization; the account is republished in full. His old key is then refused and
+  // the new one trades; from the DA, only the new authorization opens his account.
+  await engine.beginBatch(15n, b14.end.priorityHead, b14.end.priorityCursor, b14.end.time);
+  const t15 = t14 + 100n;
+  await engine.block(t15, [await update(0n, 1825n, 1825n, t15 - 1n)]);
+  const bobNew = await keysFromSeed(h, 222n);
+  const bobAuth2 = await M.masterAuthOf(h, bobNew.pk.x, bobNew.pk.y);
+  const { SET_MASTER_AUTH } = X.KIND_ACT;
+  await engine.trade([await act(bob, B, nx(B), SET_MASTER_AUTH, [bobAuth2])]);
+  assert(engine.accts.get(B)!.pub.masterAuth === bobAuth2, "bob's master authorization was not replaced");
+  const rejected15 = engine.rejected.length;
+  await engine.trade([await act(bob, B, nx(B), PLACE, [0n, BID, 1800n, 1n, GTC, 0n])]); // the old key
+  await engine.trade([await act(bobNew, B, nx(B), PLACE, [0n, BID, 1800n, 1n, GTC, 0n])]); // the new key
+  assert(engine.rejected.slice(rejected15).map((r) => r.reason).join('|') === "signing key is not the account's", `batch 15 rejections`);
+  assert(!!restingOrder(B, 1800n), "bob's new key did not trade");
+  log("signed rotation: bob's master key set a new authorization; his old key is refused and the new one trades");
+  await engine.maintenance({ sweep: true, refresh: 4 });
+  checkConservation(engine, netDeposits, 'batch 15');
+  const w15 = await engine.endBatch();
+  log(`batch 15: ${w15.segments.map((s) => s.label).join(' | ')}; ${w15.daPayload.length} DA fields`);
+  const b15 = await settle(w15);
+  assert(b15.header[0] === b14.header[1], 'batch 15 does not chain from batch 14');
+
+  // Exit from DA alone: rebuild the accounts tree from the genesis protocol leaves and the fifteen
   // batches, then open every user's account and compare with the engine. Alice opens hers with
   // the keys her owner rekeyed it to; her old keys no longer open it.
   const genesisLeaves = await Promise.all(protocol.map(async (p, i) => ({ index: BigInt(i), leaf: await M.accountLeaf(h, p.pub, M.emptyPriv(0n)), pub: p.pub })));
-  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
+  const entries = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15].flatMap((b, i) => decodeBatch(BigInt(i + 1), b.daPayload).accounts);
   const rebuilt = await rebuildAccounts(h, entries, genesisLeaves);
-  assert(rebuilt.tree.root === b14.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
+  assert(rebuilt.tree.root === b15.header[2], 'accounts tree rebuilt from DA != header.new_accounts_root');
   const oldKeysOpen = await openAccount(h, rebuilt, alice.kEnc, await M.masterAuthOf(h, alice.pk!.x, alice.pk!.y)).then(
     () => true,
     () => false,
   );
   assert(!oldKeysOpen, "alice's old keys still open her account");
+  const bobOldOpens = await openAccount(h, rebuilt, bob.kEnc, await M.masterAuthOf(h, bob.pk!.x, bob.pk!.y)).then(
+    () => true,
+    () => false,
+  );
+  assert(!bobOldOpens, "bob's old master authorization still opens his account");
   for (const [i, u] of users.entries()) {
+    // Alice was rekeyed (batch 10); Bob rotated his master key (batch 15).
     const k = i === 0 ? alice2 : u.keys;
-    const opened = await openAccount(h, rebuilt, k.kEnc, await M.masterAuthOf(h, k.pk!.x, k.pk!.y));
+    const auth = i === 1 ? bobAuth2 : await M.masterAuthOf(h, k.pk!.x, k.pk!.y);
+    const opened = await openAccount(h, rebuilt, k.kEnc, auth);
     const want = engine.accts.get(BigInt(2 + i))!.priv;
     assert(show(opened.priv) === show(want), `account ${2 + i} opened from DA differs from the engine`);
   }
@@ -724,13 +755,13 @@ async function main() {
   assert(pos(A).positions[0].size === 0n && pos(B).positions[0].size === 0n && pos(C).positions[0].size === 34n && pos(G).positions[0].size === 20n, 'market 0 positions');
   assert(pos(B).positions[1].size === 2n && pos(C).positions[1].size === -2n, 'market 1 positions');
 
-  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
+  report.batches = [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15].map((b) => ({ shape: b.shape, daFields: b.daPayload.length, ms: b.ms }));
   report.liquidation = { steps: kinds, before: before4 };
   report.equity = Object.fromEntries([...engine.accts.keys()].map((k) => [k.toString(), engine.equityOf(k).toString()]));
   report.markets = engine.markets.map((m) => ({ index: m.indexPrice, mark: m.markPrice, cumFunding: m.cumFunding, rate: m.fundingRate, oi: m.oiLong }));
   writeJson(join(OUT, 'native.json'), report);
   log(`${receiptCount} receipts, sequence numbers 1–${engine.lastSeq}, each with a path to its batch's receipts root`);
-  log(`header of batch 14 ${hex(b14.headerHash)}`);
+  log(`header of batch 15 ${hex(b15.headerHash)}`);
   await api.destroy();
 }
 

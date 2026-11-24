@@ -971,6 +971,7 @@ export class Engine {
       [X.KIND_ACT.TRANSFER.toString()]: 'transfer',
       [X.KIND_ACT.ADD_KEY.toString()]: 'add key',
       [X.KIND_ACT.REVOKE_KEY.toString()]: 'revoke key',
+      [X.KIND_ACT.SET_MASTER_AUTH.toString()]: 'set master auth',
     };
     const labels = actions.map((a) => {
       const by = a.keyId === M.MASTER_KEY ? '' : ` by key ${a.keyId}`;
@@ -1264,6 +1265,7 @@ export class Engine {
     if (a.kind === X.KIND_ACT.CANCEL_ALL) return { ...this.emptyAction(), ...common, ...(await this.execCancelAll(a, act)) };
     if (a.kind === X.KIND_ACT.ADD_KEY || a.kind === X.KIND_ACT.REVOKE_KEY) return { ...this.emptyAction(), ...common, ...(await this.execSetKey(a, act)) };
     if (a.kind === X.KIND_ACT.PLACE_TRIGGER || a.kind === X.KIND_ACT.CANCEL_TRIGGER) return { ...this.emptyAction(), ...common, ...(await this.execTrigger(a, act)) };
+    if (a.kind === X.KIND_ACT.SET_MASTER_AUTH) return { ...this.emptyAction(), ...common, ...(await this.execSetMasterAuth(a, rec, act, daNonce)) };
     throw new Error('unknown action kind');
   }
 
@@ -1750,6 +1752,23 @@ export class Engine {
   /** The activity after CancelAll (SPEC.md §6.5): a new order epoch, no open orders or lots. */
   private voidOrders(act: M.Activity): M.Activity {
     return { ...M.copyActivity(act), epoch: act.epoch + 1n, openOrders: 0n, openBid: Array(M.MARKETS).fill(0n), openAsk: Array(M.MARKETS).fill(0n) };
+  }
+
+  /**
+   * SetMasterAuth (seg_trade `set_key`, SPEC.md §7.3): master key only; the account's master
+   * authorization becomes p[0] and the account is republished in full. Session keys and orders stay.
+   */
+  private async execSetMasterAuth(a: SignedAction, rec: AccountRecord, act: M.Activity, daNonce: bigint) {
+    if (a.p[0] === 0n) throw new Error('empty master authorization');
+    if (a.p.slice(1).some((x) => x !== 0n)) throw new Error('master authorization payload');
+    const acctPath = this.accounts.path(a.account).map(hex);
+    rec.pub = { ...rec.pub, masterAuth: a.p[0] };
+    const leaf = await this.writeAccount(rec, rec.priv, daNonce);
+    const actvPath = this.activity.path(a.account).map(hex);
+    this.actv.set(a.account, act);
+    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    await this.emitFull(M.TAG.FULL, rec, leaf, daNonce);
+    return { taker_acct_path: acctPath, taker_actv_path: actvPath };
   }
 
   /** CancelAll (seg_trade `cancel_all`): every order the account placed so far is void at once. */

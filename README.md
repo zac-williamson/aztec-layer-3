@@ -41,6 +41,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.19**: displayed orders per D1. An order may opt in to display: every change to its resting lots is published in the DA, without its owner, so anyone can rebuild the displayed book.
 - **P2.20**: stops that open a position. A trigger may be an entry stop: it fires as an IOC order for its full size, and only if its owner can then cover initial margin; otherwise the firing is consumed without effect.
 - **P2.21**: resting reduce-only orders. A reduce-only order may rest; it holds no open lots, and when it executes it fills at most its owner's remaining position, with the rest trimmed.
+- **P2.22**: a rotation signed by the master key. `SetMasterAuth` replaces an account's master authorization and republishes the account in full; the owner's rekey stays the path for lost keys and new encryption keys.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
@@ -117,7 +118,7 @@ This compares aggregating 10 client proofs through Chonk and the tube with doing
 npm run native
 ```
 
-This runs fourteen batches natively across markets 0–2. They cover:
+This runs fifteen batches natively across markets 0–2. They cover:
 - registrations, deposits, a refund and an insurance deposit;
 - orders the rules refuse: margin, nonce, post-only, FOK and reduce-only;
 - self-trade prevention, a mark tick from a two-sided book, funding an hour later, and fee sweeps;
@@ -131,7 +132,8 @@ This runs fourteen batches natively across markets 0–2. They cover:
 - fee tiers set by the operator, with each side of a fill charged at its own tier;
 - displayed orders resting, reduced, filled, cancelled and removed, with the displayed book rebuilt from the DA;
 - entry stops: one that fills and adds to a position, and one its owner cannot afford, consumed without effect;
-- resting reduce-only orders, one trimmed to its owner's remaining position as it fills and one removed once the position is closed.
+- resting reduce-only orders, one trimmed to its owner's remaining position as it fills and one removed once the position is closed;
+- a master key rotating itself, after which only the new key signs and opens the account.
 
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
@@ -245,6 +247,8 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.20: tests | Native batch 13 fires an affordable entry stop and consumes an unaffordable one; 2 more adversarial witnesses (97 in all). |
 | P2.21: reduce-only | Resting reduce-only orders hold no open lots and are trimmed to their owner's position when they execute; the trim proves the owner's leaf through the fill's account update. |
 | P2.21: tests | Native batch 14 trims one reduce-only ask as it fills and removes another; 2 more adversarial witnesses (99 in all). |
+| P2.22: signed rotation | `SetMasterAuth`, a master-key action, replaces the master authorization and republishes the account in full; it shares the key-change updates in `seg_trade`. |
+| P2.22: tests | Native batch 15 rotates Bob's master key; 1 more adversarial witness (100 in all). |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats

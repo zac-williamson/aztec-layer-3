@@ -4,9 +4,9 @@ use l3x_exchange::{
     consts::{
         ACCOUNTS_HEIGHT, BOOK_HEIGHT, CLASS_USER, DS_ACCT_NODE, DS_ACTV_NODE, DS_KEY_NODE, KEY_SLOTS,
         KEYS_HEIGHT, LOG_SIGNED, MARKETS, MASTER_KEY, MAX_COLLATERAL, MAX_FEES, MAX_LOTS, MAX_OPEN_ORDERS,
-        MAX_PRICE, PPM,
+        MAX_PRICE, PPM, TAG_FULL,
     },
-    da::{emit_change, emit_display, open_segment, segment_nonce},
+    da::{emit_change, emit_display, emit_full, open_segment, segment_nonce},
     matching::{assert_no_crossing, Fill, match_order, Taker},
     params::Params,
     sig::{assert_signed, Signature},
@@ -14,7 +14,7 @@ use l3x_exchange::{
     trade::{
         abs, ACTION_PAYLOAD, action_msg, covers, credit, debit, equity, exposure_fresh, initial_margin,
         KIND_ADD_KEY, KIND_CANCEL, KIND_CANCEL_ALL, KIND_CANCEL_TRIGGER, KIND_MODIFY, KIND_PLACE, KIND_PLACE_TRIGGER,
-        KIND_REVOKE_KEY, KIND_TRANSFER, KIND_WITHDRAW,
+        KIND_REVOKE_KEY, KIND_SET_MASTER_AUTH, KIND_TRANSFER, KIND_WITHDRAW,
         TIF_FOK, TIF_GTC, TIF_GTT, TIF_IOC, TIF_POST_ONLY, withdraw as withdraw_collateral, worst,
         write_key_slot,
     },
@@ -179,22 +179,47 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     } else if (a.kind == KIND_PLACE_TRIGGER) | (a.kind == KIND_CANCEL_TRIGGER) {
         (trigger_action(state, a, act, params), running)
     } else {
-        assert((a.kind == KIND_ADD_KEY) | (a.kind == KIND_REVOKE_KEY), "unknown action kind");
-        (set_key(state, a, act), running)
+        assert((a.kind == KIND_ADD_KEY) | (a.kind == KIND_REVOKE_KEY) | (a.kind == KIND_SET_MASTER_AUTH), "unknown action kind");
+        set_key(state, running, a, act, da_nonce)
     }
 }
 
 /// AddKey and RevokeKey (SPEC.md §7.2), master key only: writes a session-key slot, keeping the
 /// slot's nonce so a replaced key's signatures can never be replayed.
-fn set_key(state: State, a: Action, act_auth: Activity) -> State {
+///
+/// SetMasterAuth (SPEC.md §7.3), master key only: replaces the account's master authorization with
+/// p[0], a Schnorr key's or a client circuit's (lane P), and republishes the account in full under a
+/// fresh blind, so DA readers and exit clients learn it. Session keys and orders stay; the owner's
+/// Rekey (P2.17) is the way back if the master key is lost or stolen. The three share the account
+/// update (unchanged for key changes) and the activity update.
+fn set_key(state: State, running: Running, a: Action, act_auth: Activity, da_nonce: Field) -> (State, Running) {
     let mut st = state;
+    let mut r = running;
     let idx = a.account_index;
-    let leaf = account_leaf(a.taker_pub, a.taker_priv);
-    st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, leaf, leaf, a.taker_acct_path);
+    let rotate = a.kind == KIND_SET_MASTER_AUTH;
+    let old_leaf = account_leaf(a.taker_pub, a.taker_priv);
     let mut act = act_auth;
-    act.keys_root = write_key_slot(act_auth.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p, act_auth.key_epoch);
+    let mut pubv = a.taker_pub;
+    let mut privv = a.taker_priv;
+    let mut leaf = old_leaf;
+    if rotate {
+        assert(a.p[0] != 0, "empty master authorization");
+        for i in 1..ACTION_PAYLOAD {
+            assert(a.p[i] == 0, "master authorization payload");
+        }
+        assert(enc_commitment(a.taker_k_enc) == a.taker_pub.enc_commitment, "taker k_enc");
+        pubv.master_auth = a.p[0];
+        privv.blind = blind(a.taker_k_enc, idx, da_nonce, r.da_len);
+        leaf = account_leaf(pubv, privv);
+    } else {
+        act.keys_root = write_key_slot(act_auth.keys_root, a.key, a.key_path, a.kind == KIND_ADD_KEY, a.p, act_auth.key_epoch);
+    }
+    st.accounts_root = update(DS_ACCT_NODE, st.accounts_root, idx, old_leaf, leaf, a.taker_acct_path);
     st.activity_root = update(DS_ACTV_NODE, st.activity_root, idx, a.taker_actv.hash(), act.hash(), a.taker_actv_path);
-    st
+    if rotate {
+        r = emit_full(r, TAG_FULL, idx, leaf, pubv, privv, a.taker_k_enc, da_nonce);
+    }
+    (st, r)
 }
 
 /// Withdraw (SPEC.md §8.3, §10.4): debits collateral, keeps equity − amount ≥ IM, and appends a

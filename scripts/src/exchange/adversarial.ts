@@ -780,6 +780,12 @@ async function main() {
   t.actions[0].fills[roFill].maker_priv.positions[0].size = '0';
   await expectFail('a reduce-only order trimmed by misstating its owner\'s position', 'seg_trade', t, 'Merkle path does not match root');
 
+  // A signed rotation (P2.22) must name a master authorization.
+  t = clone(quiet);
+  await resign(t, 0, 2, 2n, X.KIND_ACT.SET_MASTER_AUTH, [0n]);
+  t.actions[0].kind = hex(X.KIND_ACT.SET_MASTER_AUTH);
+  await expectFail('a rotation to an empty master authorization', 'seg_trade', t, 'empty master authorization');
+
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);
   await api.destroy();

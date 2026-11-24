@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), and resting reduce-only orders (P2.21), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), and a master-key rotation (P2.22), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -267,7 +267,7 @@ Signers MUST derive Schnorr nonces deterministically, hedged with fresh randomne
 | `Withdraw` | amount, recipient Aztec address (§10.4) |
 | `Transfer` | destination account, amount (phase 2) |
 | `AddKey`, `RevokeKey` | key slot, public key, permissions, expiry |
-| `RotateEncKey`, `SetMasterAuth` | new commitment or authorization; a new `k_enc` is delivered to the operator encrypted. As built (P2.17), both are one priority request, `Rekey`, from the account's owner |
+| `RotateEncKey`, `SetMasterAuth` | new commitment or authorization; a new `k_enc` is delivered to the operator encrypted. As built, the owner's priority request `Rekey` does both (P2.17), and `SetMasterAuth` is also a master-key action (P2.22) |
 
 Priority requests are queued on the Bridge (§10.1):
 
@@ -1369,6 +1369,18 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Proof of the trim.** A trim rests on the owner's position, so the owner's account leaf is proven unchanged. It shares the account update a fill makes, so the proof costs no further hashing.
 - **Cost.** `seg_trade` 451,510 gates, `seg_trigger` 157,686, `seg_forced` 107,913. `seg_liquidate` merges its two insurance-margin checks (after a takeover or deficit, and the ADL backstop's) into one and is 258,715, back under 2^18.
 
+**Signed rotation** (P2.22, §7.3):
+
+- **Action.** `SetMasterAuth`, p = (new master authorization), is a signed action of kind 11, master key only: session keys never reach it. The new authorization may name a Schnorr key or a client circuit (lane P).
+- **Effect.** The account's `master_auth` is replaced, and the account is republished in full under a fresh blind (`TAG_FULL`), so DA readers and exit clients learn it. The master nonce continues, so the next master action must be signed by the new key. Session keys and orders stay.
+- **Not built.** A lane-P account cannot sign it, since the tube applies only key changes and withdrawals, and a signed `RotateEncKey` would need the new key to reach the operator. Both use the owner's `Rekey` (P2.17), which is also the way back if a master key is lost or stolen.
+- **Cost.** `SetMasterAuth` shares `set_key`'s account and activity updates; `seg_trade` 461,991 gates (+10.5k, for the full entry).
+
+**Tests** (P2.22):
+
+- **Native**, batch 15: Bob's master key sets a new master authorization. His old key is then refused and the new one trades, and from the DA only the new authorization opens his account.
+- **Adversarial**, 1 new case (100 in all): a rotation to an empty master authorization.
+
 **Tests** (P2.21):
 
 - **Native**, batch 14:
@@ -1504,7 +1516,7 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 **Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
 1. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
-2. A rotation signed by the master key or a client proof, besides the owner's `Rekey` (P2.17).
+2. A rotation authorized by a client proof (lane P), and a signed `RotateEncKey`. Lane-P accounts and new encryption keys use the owner's `Rekey` until then.
 
 From P3: the ranking of ADL counterparties (§8.5).
 

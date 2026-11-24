@@ -81,7 +81,7 @@ async function main() {
   const manifest = readJson(join(OUT, 'manifest.json'));
   const report: Record<string, any> = { startedAt: new Date().toISOString(), aztecVersion: manifest.aztecVersion };
   const accounts = await getInitialTestAccountsData();
-  const platform = `${process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
+  const platform = `${process.arch === 'x64' ? 'amd64' : process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
   const bbConfig = {
     bbWorkingDirectory: join(OUT, 'bb-work'),
     bbBinaryPath: join(homedir(), '.aztec', 'versions', manifest.aztecVersion, 'node_modules', '@aztec-foundation', 'bb.js', 'build', platform, 'bb'),

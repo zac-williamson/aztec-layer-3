@@ -133,7 +133,7 @@ async function testnet(): Promise<Network> {
 }
 
 function bbConfig(manifest: any) {
-  const platform = `${process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
+  const platform = `${process.arch === 'x64' ? 'amd64' : process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
   return {
     bbWorkingDirectory: join(OUT, 'bb-work'),
     bbBinaryPath: join(homedir(), '.aztec', 'versions', manifest.aztecVersion, 'node_modules', '@aztec-foundation', 'bb.js', 'build', platform, 'bb'),
