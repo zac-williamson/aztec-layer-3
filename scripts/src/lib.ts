@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Barretenberg } from '@aztec-foundation/bb.js';
+import { native } from './native.ts';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const CIRCUITS = join(ROOT, 'circuits');
@@ -92,25 +93,17 @@ export function randomField(): bigint {
   return fromBytes32(b) % R;
 }
 
-export async function permute(api: Barretenberg, state: bigint[]): Promise<bigint[]> {
-  const { outputs } = await api.poseidon2Permutation({ inputs: state.map(toBytes32) });
-  return outputs.map(fromBytes32);
+/**
+ * The Poseidon2 permutation, in process (l3x-native). The `api` parameter is unused: hashing went
+ * through bb.js before the addon (SPEC.md §14, P2.23).
+ */
+export async function permute(_api: Barretenberg, state: bigint[]): Promise<bigint[]> {
+  return native.permute(state);
 }
 
 /** Mirror of circuits/l3x_types/src/hash.nr: Poseidon2 sponge, rate 3, length in capacity. */
-export async function l3xHash(api: Barretenberg, inputs: bigint[]): Promise<bigint> {
-  let state = [0n, 0n, 0n, (BigInt(inputs.length) * (1n << 64n)) % R];
-  let pos = 0;
-  for (const x of inputs) {
-    state[pos] = (state[pos] + x) % R;
-    pos += 1;
-    if (pos === 3) {
-      state = await permute(api, state);
-      pos = 0;
-    }
-  }
-  if (pos !== 0) state = await permute(api, state);
-  return state[0];
+export async function l3xHash(_api: Barretenberg, inputs: bigint[]): Promise<bigint> {
+  return native.hash(inputs);
 }
 
 // Mirrors of the l3x_types helpers.

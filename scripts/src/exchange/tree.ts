@@ -1,152 +1,98 @@
-// Sparse Merkle trees mirroring circuits/l3x_exchange/src/{tree,book}.nr.
+// Sparse Merkle trees mirroring circuits/l3x_exchange/src/{tree,book}.nr, held and hashed in process
+// by l3x-native (native/src/tree.rs). scripts/src/perf/native_check.ts checks them against the
+// TypeScript trees they replaced (P2.23).
 import type { Barretenberg } from '@aztec-foundation/bb.js';
-import { type H, bookNode } from './model.ts';
+import { type NativeBookTree, type NativeMerkleTree, native } from '../native.ts';
+import { DS, type H } from './model.ts';
 
 /** Binary Merkle tree of fixed height with nodes hash([ds, left, right]) and empty leaves zero. */
 export class MerkleTree {
   readonly height: number;
   readonly ds: bigint;
-  private readonly h: H;
-  private empty: bigint[] = [];
-  private nodes = new Map<string, bigint>();
+  private readonly t: NativeMerkleTree;
 
-  constructor(h: H, height: number, ds: bigint) {
-    this.h = h;
+  constructor(_h: H, height: number, ds: bigint) {
     this.height = height;
     this.ds = ds;
+    this.t = new native.MerkleTree(height, ds);
   }
 
   async init(): Promise<this> {
-    let e = 0n;
-    this.empty = [e];
-    for (let i = 0; i < this.height; i++) {
-      e = await this.h([this.ds, e, e]);
-      this.empty.push(e);
-    }
     return this;
   }
 
-  private node(level: number, index: bigint): bigint {
-    return this.nodes.get(`${level}:${index}`) ?? this.empty[level];
-  }
-
   get root(): bigint {
-    return this.node(this.height, 0n);
+    return this.t.root;
   }
 
   get(index: bigint): bigint {
-    return this.node(0, index);
+    return this.t.get(index);
   }
 
   path(index: bigint): bigint[] {
-    const out: bigint[] = [];
-    let idx = index;
-    for (let level = 0; level < this.height; level++) {
-      out.push(this.node(level, idx ^ 1n));
-      idx >>= 1n;
-    }
-    return out;
+    return this.t.path(index);
   }
 
-  snapshot(): Map<string, bigint> {
-    return new Map(this.nodes);
+  snapshot(): NativeMerkleTree {
+    return this.t.copy();
   }
 
-  restore(nodes: Map<string, bigint>) {
-    this.nodes = new Map(nodes);
+  restore(nodes: NativeMerkleTree) {
+    this.t.restore(nodes);
   }
 
   async set(index: bigint, leaf: bigint): Promise<void> {
-    this.nodes.set(`0:${index}`, leaf);
-    let idx = index;
-    let cur = leaf;
-    for (let level = 0; level < this.height; level++) {
-      const sib = this.node(level, idx ^ 1n);
-      cur = idx & 1n ? await this.h([this.ds, sib, cur]) : await this.h([this.ds, cur, sib]);
-      idx >>= 1n;
-      this.nodes.set(`${level + 1}:${idx}`, cur);
-    }
+    this.t.set(index, leaf);
   }
 }
 
 export type BookSibling = { hash: bigint; ask: bigint; bid: bigint };
-type BookNode = { hash: bigint; ask: bigint; bid: bigint };
 
 /** The aggregate order-book tree (SPEC.md §6.5). */
 export class BookTree {
   readonly height: number;
-  private readonly api: Barretenberg;
-  private empty: bigint[] = [];
-  private nodes = new Map<string, BookNode>();
+  private readonly t: NativeBookTree;
 
-  constructor(api: Barretenberg, height = 80) {
-    this.api = api;
+  constructor(_api: Barretenberg, height = 80) {
     this.height = height;
+    this.t = new native.BookTree(height, DS.BOOK);
   }
 
   async init(): Promise<this> {
-    let e = 0n;
-    this.empty = [e];
-    for (let i = 0; i < this.height; i++) {
-      e = await bookNode(this.api, e, e, 0n, 0n);
-      this.empty.push(e);
-    }
     return this;
   }
 
-  private node(level: number, index: bigint): BookNode {
-    return this.nodes.get(`${level}:${index}`) ?? { hash: this.empty[level], ask: 0n, bid: 0n };
-  }
-
   get root(): bigint {
-    return this.node(this.height, 0n).hash;
+    return this.t.root;
   }
 
   get totals(): { ask: bigint; bid: bigint } {
-    const r = this.node(this.height, 0n);
-    return { ask: r.ask, bid: r.bid };
+    const [ask, bid] = this.t.totals();
+    return { ask, bid };
   }
 
   path(index: bigint): BookSibling[] {
+    const f = this.t.path(index);
     const out: BookSibling[] = [];
-    let idx = index;
-    for (let level = 0; level < this.height; level++) {
-      out.push(this.node(level, idx ^ 1n));
-      idx >>= 1n;
-    }
+    for (let i = 0; i < f.length; i += 3) out.push({ hash: f[i], ask: f[i + 1], bid: f[i + 2] });
     return out;
   }
 
-  snapshot(): Map<string, BookNode> {
-    return new Map(this.nodes);
+  snapshot(): NativeBookTree {
+    return this.t.copy();
   }
 
-  restore(nodes: Map<string, BookNode>) {
-    this.nodes = new Map(nodes);
+  restore(nodes: NativeBookTree) {
+    this.t.restore(nodes);
   }
 
   /** Writes a leaf with its ask and bid lots and updates the path. */
   async set(index: bigint, leaf: bigint, ask: bigint, bid: bigint): Promise<void> {
-    let cur: BookNode = { hash: leaf, ask, bid };
-    if (leaf === 0n) this.nodes.delete(`0:${index}`);
-    else this.nodes.set(`0:${index}`, cur);
-    let idx = index;
-    for (let level = 0; level < this.height; level++) {
-      const sib = this.node(level, idx ^ 1n);
-      const [l, r] = idx & 1n ? [sib, cur] : [cur, sib];
-      const a = l.ask + r.ask;
-      const b = l.bid + r.bid;
-      cur = { hash: await bookNode(this.api, l.hash, r.hash, a, b), ask: a, bid: b };
-      idx >>= 1n;
-      this.nodes.set(`${level + 1}:${idx}`, cur);
-    }
+    this.t.set(index, leaf, ask, bid);
   }
 
   /** Leaf indices of resting orders, in index order. */
   leaves(): bigint[] {
-    return [...this.nodes.keys()]
-      .filter((k) => k.startsWith('0:'))
-      .map((k) => BigInt(k.slice(2)))
-      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return this.t.leaves();
   }
 }

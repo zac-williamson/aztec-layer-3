@@ -1,0 +1,4 @@
+# The addon runs where it is built: let the compiler use the host's instructions (ark-ff's
+# assembly multiplication needs BMI2 and ADX on x86-64).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]

@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), and a master-key rotation (P2.22), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), and the operator's cryptography in process (P2.23), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -742,6 +742,18 @@ P0 measurements, taken in this repository on one Apple Silicon laptop (12 thread
 | M6 | P1, without RAM caching (each touched leaf costs Merkle paths): `seg_trade` is 276,126 gates for 2 actions with up to 2 fills each (≈ 138k per action slot); `seg_priority` 94,286 for 4 requests; `seg_block` 6,996 including one Schnorr verification; `seg_refresh` 26,917 for 4 accounts. Each proves in under 2 s. P2.1 (four markets, k-of-n oracles, funding, fees): `seg_trade` 339,934 gates; `seg_block` 161,955 for up to four index updates with three signatures and two 80-level top-of-book walks each; `seg_priority` 99,717; `seg_refresh` with the sweep 47,828. P2.2: `seg_liquidate` 327,161 gates for two liquidation steps (each any of cancel, close with two matching steps, takeover, deficit, ADL); its segments prove in 3.6–6.3 s under load. P2.3 (session keys, GTT, forced requests): `seg_trade` 430,513; `seg_priority` 155,159; `seg_liquidate` 386,374; `seg_forced` 221,271. Risk-sweep costs await phase 3. |
 | M7 | Merge: 1,479,481 gates, 5.1–6.7 s, verifying two RollupHonk children and accumulating their IPA claims. X-segments enter the merge tree directly as RollupHonk proofs with bb's default IPA claim; the P0 X-segment stub is 680,499 gates (2.3–3.9 s), dominated by a 4,080-field DA absorption loop. Padding: 3,663 gates. |
 
+Operator measurements (P2.23), on zac-box: a shared AMD EPYC 7R13 host (188 cores, load 150–250 from other jobs), one thread, single runs:
+
+| Operation | Before P2.23 | `l3x-native` |
+| --- | --- | --- |
+| Poseidon2 permutation | 117 µs through bb.js's bb process (36 µs over its shared-memory backend, 47 µs in WASM) | 14 µs |
+| Tree write, height 32 / 80 | 32 / 80 permutations at 117 µs | 0.48–0.55 ms / 1.1–1.4 ms |
+| Grumpkin scalar multiplication | 26 ms (affine bigint in the scripts); 261–576 µs through bb.js | 92 µs; 25 µs for k·G from a fixed-base table |
+| Schnorr verification / signature | about 52 ms / 36 ms | 155 µs / 135 µs |
+| Engine: signed actions a second, building witnesses (16 makers, 8 takers) | 21 | 260 |
+
+With the addon the engine is bound by Poseidon2: a signed action costs a few hundred permutations of tree writes.
+
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
 
 Measure before fixing circuit shapes (M1–M4 above are first P0 results):
@@ -1375,6 +1387,26 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Effect.** The account's `master_auth` is replaced, and the account is republished in full under a fresh blind (`TAG_FULL`), so DA readers and exit clients learn it. The master nonce continues, so the next master action must be signed by the new key. Session keys and orders stay.
 - **Not built.** A lane-P account cannot sign it, since the tube applies only key changes and withdrawals, and a signed `RotateEncKey` would need the new key to reach the operator. Both use the owner's `Rekey` (P2.17), which is also the way back if a master key is lost or stolen.
 - **Cost.** `SetMasterAuth` shares `set_key`'s account and activity updates; `seg_trade` 461,991 gates (+10.5k, for the full entry).
+
+**In-process cryptography** (P2.23, §14):
+
+- **Why.** The scripts hashed through bb.js, which sends every Poseidon2 permutation to a bb process and back, and did Grumpkin arithmetic in affine bigint coordinates. On zac-box that cost 117 µs a permutation and about 50 ms a signature check, so the engine built witnesses for about 21 signed actions a second.
+- **Addon.** `native/` is `l3x-native`, a Rust N-API addon on arkworks fields:
+  - the Poseidon2 permutation with barretenberg's `Poseidon2Bn254ScalarFieldParams`, generated from its source, and the L3X sponge of `l3x_types/src/hash.nr`;
+  - the binary Merkle trees (accounts, activity, session keys) and the order book's aggregate tree, holding only written nodes, with their paths;
+  - Grumpkin scalar multiplication, with a 4-bit fixed-base table for G, and Schnorr signing and verification with the Poseidon2 challenge of noir-lang/schnorr v0.4.0.
+- **Use.** `l3xHash`, `permute`, the engine's trees and the scripts' signatures call the addon; `npm run build:native` builds it for the host. Witnesses, roots and signatures are unchanged, bit for bit, so every circuit test also checks the addon.
+
+**Tests** (P2.23):
+
+- **Native check**, 2,531 comparisons with bb.js and the TypeScript the addon replaced:
+  - 1,000 permutations, including zero, p − 1, values at or above p and negative values, which bb.js reduces;
+  - the sponge over 0 to 12 inputs;
+  - 120 writes each to trees of height 32 and 8, comparing roots, paths and leaves, with a snapshot restored;
+  - 150 order-book writes and removals, comparing roots, paths, totals and the leaf set;
+  - Grumpkin multiplications from the fixed-base table and of a general point, against the affine reference and bb.js, and a point off the curve refused;
+  - signatures that the reference verifies, and a wrong challenge, message or key refused.
+- **Every suite** ran on the addon on zac-box: build, contracts, circuits, adversarial (100), VK substitution, prove, M1, native (15 batches proved), e2e and l1bridge.
 
 **Tests** (P2.22):
 

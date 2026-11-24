@@ -6,6 +6,8 @@
     "node": ">=24"
   },
   "scripts": {
+    "build:native": "node src/build_native.ts",
+    "native-check": "node src/perf/native_check.ts",
     "build:circuits": "node src/build.ts",
     "prove": "node src/prove.ts",
     "vk-substitution": "node src/vk_substitution.ts",

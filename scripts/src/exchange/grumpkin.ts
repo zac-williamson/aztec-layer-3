@@ -1,7 +1,10 @@
 // Grumpkin (y^2 = x^3 - 17 over the BN254 scalar field) and Schnorr signatures with a Poseidon2
 // challenge, matching noir-lang/schnorr v0.4.0 (SPEC.md §7.1):
 //   R = s·G + e·PK,  e = Poseidon2(DST, R.x, PK.x, PK.y, msg).
+// The curve arithmetic runs in l3x-native (native/src/grumpkin.rs, P2.23); before it, affine
+// bigint arithmetic here took about 26 ms a scalar multiplication.
 import { R as P, hex, randomField } from '../lib.ts';
+import { native } from '../native.ts';
 import type { H } from './model.ts';
 
 /** Grumpkin group order (the BN254 base field modulus). */
@@ -9,74 +12,32 @@ export const N = 218882428718392752222464057452572750886963111572978236626890378
 export type Point = { x: bigint; y: bigint } | null;
 export const G: Point = { x: 1n, y: 17631683881184975370165255887551781615748388533673675138860n };
 export const SCHNORR_DST = 0x024c76938ed06b8ec1d9094b1013d190baa4011372f0604643bda812a63b832en;
-const DS_NONCE = 0x6c33782e6e6f6e6365n; // "l3x.nonce"
 const DS_SK = 0x6c33782e736bn; // "l3x.sk"
 const DS_KENC = 0x6c33782e6b656e63n; // "l3x.kenc"
+// The signing nonce's domain separator, "l3x.nonce", lives in native/src/grumpkin.rs.
 
 const mod = (a: bigint, m = P) => ((a % m) + m) % m;
+const point = (r: bigint[]): Point => (r.length ? { x: r[0], y: r[1] } : null);
 
-function inv(a: bigint, m = P): bigint {
-  let [r0, r1] = [mod(a, m), m];
-  let [s0, s1] = [1n, 0n];
-  while (r1 !== 0n) {
-    const q = r0 / r1;
-    [r0, r1] = [r1, r0 - q * r1];
-    [s0, s1] = [s1, s0 - q * s1];
-  }
-  if (r0 !== 1n) throw new Error('not invertible');
-  return mod(s0, m);
-}
-
-export function add(p: Point, q: Point): Point {
-  if (!p) return q;
-  if (!q) return p;
-  if (p.x === q.x) {
-    if (mod(p.y + q.y) === 0n) return null;
-    return double(p);
-  }
-  const l = mod((q.y - p.y) * inv(q.x - p.x));
-  const x = mod(l * l - p.x - q.x);
-  return { x, y: mod(l * (p.x - x) - p.y) };
-}
-
-export function double(p: Point): Point {
-  if (!p || p.y === 0n) return null;
-  const l = mod(3n * p.x * p.x * inv(2n * p.y));
-  const x = mod(l * l - 2n * p.x);
-  return { x, y: mod(l * (p.x - x) - p.y) };
-}
-
+/** k·p; null for the point at infinity (and for a p off the curve). */
 export function mul(p: Point, k: bigint): Point {
-  let acc: Point = null;
-  let base = p;
-  let n = mod(k, N);
-  while (n > 0n) {
-    if (n & 1n) acc = add(acc, base);
-    base = double(base);
-    n >>= 1n;
-  }
-  return acc;
+  if (!p) return null;
+  if (p.x === G!.x && p.y === G!.y) return point(native.grumpkinBaseMul(mod(k, N)));
+  return point(native.grumpkinMul(p.x, p.y, mod(k, N)));
 }
 
 export type Sig = { s: bigint; e: bigint };
 
-export async function sign(h: H, sk: bigint, msg: bigint): Promise<Sig> {
-  const pk = mul(G, sk)!;
+/** A hedged deterministic nonce from the key, the message and fresh randomness (SPEC.md §7.1). */
+export async function sign(_h: H, sk: bigint, msg: bigint): Promise<Sig> {
   for (;;) {
-    // Hedged deterministic nonce: key, message and fresh randomness (SPEC.md §7.1).
-    const k = mod(await h([DS_NONCE, sk, msg, randomField()]), N);
-    const r = mul(G, k);
-    if (!r || k === 0n) continue;
-    const e = await h([SCHNORR_DST, r.x, pk.x, pk.y, msg]);
-    const s = mod(k - e * sk, N);
-    if (s !== 0n && e !== 0n) return { s, e };
+    const r = native.schnorrSign(mod(sk, N), msg, randomField());
+    if (r.length) return { s: r[0], e: r[1] };
   }
 }
 
-export async function verify(h: H, pk: Point, sig: Sig, msg: bigint): Promise<boolean> {
-  const r = add(mul(G, sig.s), mul(pk, sig.e));
-  if (!r || !pk) return false;
-  return (await h([SCHNORR_DST, r.x, pk.x, pk.y, msg])) === sig.e;
+export async function verify(_h: H, pk: Point, sig: Sig, msg: bigint): Promise<boolean> {
+  return !!pk && native.schnorrVerify(pk.x, pk.y, sig.s, sig.e, msg);
 }
 
 const MASK_128 = (1n << 128n) - 1n;

@@ -42,8 +42,9 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.20**: stops that open a position. A trigger may be an entry stop: it fires as an IOC order for its full size, and only if its owner can then cover initial margin; otherwise the firing is consumed without effect.
 - **P2.21**: resting reduce-only orders. A reduce-only order may rest; it holds no open lots, and when it executes it fills at most its owner's remaining position, with the rest trimmed.
 - **P2.22**: a rotation signed by the master key. `SetMasterAuth` replaces an account's master authorization and republishes the account in full; the owner's rekey stays the path for lost keys and new encryption keys.
+- **P2.23**: the operator's cryptography in process. A Rust addon (`native/`) computes Poseidon2, the state trees, Grumpkin and Schnorr in the calling thread instead of in a bb process: the engine builds witnesses 12× faster and signatures are checked about 300× faster, with bit-identical results.
 
-Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
+Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The `l3x-native` addon needs Rust (cargo 1.89 or newer). The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
 
 ## Layout
 
@@ -75,6 +76,8 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `contracts/ctbridge` | `ConfidentialTokenBridge`, the token's minter and the L2 half of its bridge to L1 (Aztec's `TokenPortal` is the L1 half); TXE tests |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
 | `scripts/src/exchange` | Engine (mirrors the circuits and builds witnesses), trees, Grumpkin Schnorr, DA decoding, exit client, and the exchange tests |
+| `scripts/src/perf` | Measurements: the addon's checks and timings, and the primitives' costs through each bb.js backend |
+| `native` | `l3x-native`, a Rust N-API addon: Poseidon2 with barretenberg's parameters, the state trees, Grumpkin and Schnorr, for the scripts and the operator |
 | `scripts/out` | Generated: VK manifest, batch, measurements and settlement reports (git-ignored) |
 | `deployments/aztec-testnet.json` | The public record of the testnet run: addresses, configuration, transactions and results |
 
@@ -89,6 +92,18 @@ aztec-up install 6.0.0
 ```bash
 cd scripts && npm install
 ```
+
+```bash
+npm run build:native
+```
+
+This builds `l3x-native` with the host's instructions and installs it as `native/l3x_native.node`. Every script that hashes loads it.
+
+```bash
+npm run native-check
+```
+
+This checks the addon against bb.js and the TypeScript it replaced (permutations, the sponge, tree roots and paths, Grumpkin, Schnorr), then times it.
 
 ```bash
 npm run build:circuits
@@ -249,12 +264,14 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.21: tests | Native batch 14 trims one reduce-only ask as it fills and removes another; 2 more adversarial witnesses (99 in all). |
 | P2.22: signed rotation | `SetMasterAuth`, a master-key action, replaces the master authorization and republishes the account in full; it shares the key-change updates in `seg_trade`. |
 | P2.22: tests | Native batch 15 rotates Bob's master key; 1 more adversarial witness (100 in all). |
+| P2.23: in-process cryptography | `l3x-native` (Rust, arkworks): Poseidon2, the L3X sponge, the account, activity, key and order-book trees, Grumpkin with a fixed-base table, Schnorr. On zac-box a permutation takes 14 µs (117 µs through bb.js), a signature check 155 µs (about 50 ms before), and the engine builds witnesses for 260 signed actions a second (21 before). |
+| P2.23: tests | `native-check`: 2,531 comparisons with bb.js and the replaced TypeScript; every suite passes on the addon. |
 | P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats
 
 - The local network settles epochs synthetically, so a receipt status of `proven` there does not mean an epoch proof was verified. What is real in the end-to-end test: the settlement transaction's client-side Chonk proof, which includes verifying the root proof in-circuit, and the node's check of transaction proofs (`realProofs`).
 - TXE does not prove, so the Bridge's TXE tests use a dummy root proof; the proof binding is tested in the end-to-end test.
-- Timings come from one laptop run each and are not benchmarks.
+- Timings come from single runs and are not benchmarks: on a 12-thread laptop up to P2.22, and from P2.23 on zac-box, a shared 188-core AMD EPYC 7R13 host whose load from other jobs (often 150–250) varies from run to run.
 - The local network's sequencer builds each block at the next slot, so the end-to-end test moves L2 time with the node's debug API instead of waiting.
 - The P-segment lane executes only AddKey, RevokeKey and Withdraw, and any client circuit in the subtree may authorize any of them. The P-256 circuit takes a raw digest, so it suits hardware keys but not yet WebAuthn passkeys.

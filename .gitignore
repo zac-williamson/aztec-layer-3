@@ -4,3 +4,4 @@ scripts/out/
 codegenCache.json
 .DS_Store
 Prover.toml
+*.node
