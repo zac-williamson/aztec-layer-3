@@ -11,6 +11,8 @@ pub global ROLE_CHONK: u32 = 1;
 pub global ROLE_TUBE: u32 = 2;
 pub global ROLE_SEGMENT: u32 = 3;
 pub global ROLE_MERGE: u32 = 4;
+/// Segments beyond the first role's eight slots (P2.25: seg_quote).
+pub global ROLE_SEGMENT2: u32 = 5;
 
 pub struct VkMembership {
     pub index: u32,
@@ -46,12 +48,12 @@ pub struct Child {
     pub out: NodeOutput,
 }
 
-/// Merges and the root accept tubes, segments and merges as children, and nothing else, so a
-/// client, Chonk or root proof can never stand in for a segment.
+/// Merges and the root accept tubes, segments (both segment roles) and merges as children, and
+/// nothing else, so a client, Chonk or root proof can never stand in for a segment.
 pub fn assert_merge_child_vk(vk_hash: Field, m: VkMembership, vk_tree_root: Field) {
     let role = m.index / VK_ROLE_SLOTS;
     assert(
-        (role == ROLE_TUBE) | (role == ROLE_SEGMENT) | (role == ROLE_MERGE),
+        (role == ROLE_TUBE) | (role == ROLE_SEGMENT) | (role == ROLE_SEGMENT2) | (role == ROLE_MERGE),
         "child VK role not allowed",
     );
     assert(vk_tree_root_from(vk_hash, m) == vk_tree_root, "child VK not in VK tree");

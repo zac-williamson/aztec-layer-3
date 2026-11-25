@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), the operator's cryptography in process (P2.23), and the operator's sequencer with gateway threads, receipts and a journal (P2.24), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), the operator's cryptography in process (P2.23), the operator's sequencer with gateway threads, receipts and a journal (P2.24), and quote segments (P2.25), parallel batch proving (P2.26), and a proving service that follows the journal (P2.27), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -408,6 +408,7 @@ Bridge     Aztec private function    verify_honk_proof against root_vk_hash
 - Every merge-tree node, segment or merge, has the same public output, `NodeOutput = (config_hash, start: Running, end: Running)`. A merge can therefore verify any child; the child's VK-tree role decides what is allowed (§9.3).
 - The root is the top merge. bb requires it to accumulate exactly two IPA claims, so it always verifies two RollupHonk proofs. A batch with a single segment pairs it with a padding segment: a trivial circuit whose transition is the identity, proved with the rollup target, which carries bb's default IPA claim.
 - Segments without client proofs SHOULD be X-segments, which avoid Chonk and the tube. X-segments enter the merge tree directly: a circuit proved with the rollup target that verifies no proof carries bb's default IPA claim, as padding does [M7, measured in P0].
+- Signed actions that move only resting orders SHOULD go to quote segments (P2.25). ACIR evaluates every branch, so each `seg_trade` slot pays for every kind of action: two fills, a resting walk, a cancellation walk, a trigger walk, a transfer's destination and their DA. A quote slot pays for one book replace.
 - Within a segment, touched leaves and tree nodes are read once into in-circuit RAM, mutated there, and written back once at the end. A market maker's repeated actions on its own account cost RAM operations, not Merkle paths. Order-book paths still cost one 80-level path per matching step.
 - Segments are proved in parallel: the engine has already computed every intermediate root.
 
@@ -417,9 +418,9 @@ The VK tree, whose root is committed in `config_hash`, is partitioned by role: s
 
 As built in P0:
 
-- The tree has height 6: eight roles (client, Chonk, tube, segment, merge, and three reserved) of eight slots each, at leaf index `role·8 + slot`. Leaves are VK hashes; empty slots are zero.
+- The tree has height 6: eight roles (client, Chonk, tube, segment, merge, a second segment role from P2.25, and two reserved) of eight slots each, at leaf index `role·8 + slot`. Leaves are VK hashes; empty slots are zero.
 - `config_hash = H(DS_CONFIG, vk_tree_root, params_hash)`.
-- Merges and the root accept children in the tube, segment and merge subtrees only. A merge verifies merges, so it cannot contain its own VK hash as a constant; it takes the VK tree root as a witness bound by `config_hash`.
+- Merges and the root accept children in the tube, segment (both roles) and merge subtrees only. A merge verifies merges, so it cannot contain its own VK hash as a constant; it takes the VK tree root as a witness bound by `config_hash`.
 - Circuits with a single possible child, the Chonk chain and the tube, pin that child's VK hash as a constant.
 - bb constrains `hash(vk) == vk_hash` inside every recursive verification, so a child cannot present one VK and claim another's tree slot.
 
@@ -770,7 +771,22 @@ The sequencer (P2.24), on zac-box, load 140–200:
 | Burst: 20,000 a second for 5 s | 18,000–20,200 applied a second; p50 8 ms, p99 84 ms while the queue drains |
 | 15,000 a second for 15 s (journal off) | about 14,500 applied a second; p50 2.4 ms, p99 46 ms |
 
-So the receipt latency and sustained throughput targets above are met on this host at 5,000 actions a second. Bursts near 20,000 a second saturate the sequencer thread, whose work per action in the server, about 40 µs with messaging, is the limit; the longest tails (p99.9) come from garbage-collection pauses and from the host's other load.
+Proving (P2.25–P2.26), on zac-box at load 240–310, one batch of a synthetic market (16 makers resting and cancelling quotes, 4 takers crossing, a block a round): 234 signed actions in 23 segments (11 `seg_quote`, 8 `seg_trade`, 4 `seg_block`), proved on six provers of 16 threads:
+
+| Proof | Time |
+| --- | --- |
+| `seg_quote` (30 actions, 2^20) | 18.5 s |
+| `seg_trade` (2 actions, 2^19) | 7.6 s |
+| `seg_block` | 7.9 s |
+| merge | 16.2 s |
+| root | 84 s |
+| the batch, on the pool | 356 s wall; 720 s on one prover |
+
+So the pool proves about 0.7 signed actions a second of wall time, and one 16-thread prover about 0.33. The latency of a batch's proof is bounded below by one segment, the merge tree's depth (five levels for 23 segments) and the root: about three minutes here, inside the five-minute F1 target. Merges are now the largest share of the work (340 of 720 s), because segments other than `seg_quote` carry at most two actions, and a block segment none.
+
+End to end (P2.27): the operator with 100 demo accounts, a block every 5 s and a batch every 30 s, driven at 2 signed actions a second, and the proving service following its journal on the same six provers. Each 30-second batch held 60 actions in 39 segments (6 block, 18 quote, 15 trade): at this rate quotes, takers and blocks interleave in sequence order, so quote segments averaged under four actions. Two batches proved in 848 s and 832 s from their close, concurrently, at host load 270–320: an F0→F1 lag of about 14 minutes, three times the target. Per prover-second, a quote action costs about 1.2 s with its share of a merge when its segment is full, a taker action about 12 s, and every block about 24 s.
+
+So the receipt latency and sustained throughput targets above are met on this host at 5,000 actions a second, but the proof lag target is not: proving capacity, not sequencing, bounds L3X's sustained throughput. Bursts near 20,000 a second saturate the sequencer thread, whose work per action in the server, about 40 µs with messaging, is the limit; the longest tails (p99.9) come from garbage-collection pauses and from the host's other load.
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
 
@@ -1427,6 +1443,34 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Durability.** By default a batch's replies wait for its journal lines to be written to the operating system; with `--fsync` they wait for the lines to reach the disk.
 - **Not built.** Envelope encryption to the operator key (§7.1) and the encrypted execution result of §11's receipt; a deployment's start from its journal and the Bridge rather than from demo accounts; the witness builder and provers as services fed by the journal.
 
+**Quote segments** (P2.25, §9.2):
+
+- **Why.** `seg_trade` performs 4,640 Poseidon2 permutations for its two slots, 73 gates each, about 339k of its 462k gates, because every slot evaluates every kind of action. A resting order or a cancellation needs about 300.
+- **Circuit.** `seg_quote` executes up to 30 signed actions that move resting orders and no balances, in order: a PlaceOrder that rests without filling (GTC, post-only or GTT), CancelOrder, ModifyOrder and CancelAll, signed by the master key or a session key. Each slot is:
+  - one signature check (`seg_trade` checks the signature in both the master-key and the session-key branch);
+  - one proof of the account's leaf, read for the master authorization and for margin, never written;
+  - one book replace: a placement replaces the empty slot at the market's next sequence number, and the walk from that empty slot proves that no opposite order crosses it, by book.nr's index order; a cancellation or modification replaces the order; CancelAll replaces market 0's rightmost slot, which is never an order, by itself;
+  - one activity update, and margin for a placement that raises the worst-case size.
+- **Receipts.** Each action's receipt leaf is in the segment's 32-leaf receipts tree; receipt paths start in the segment's subtree (depth 5, or 1 for `seg_trade`).
+- **Cost.** 1,043,851 gates for 30 actions, under 2^20: about 34.3k a slot and 13.9k fixed. A 2^20 proof for 30 actions is about 35k gates of proving an action, against 262k (2^19 for two) in `seg_trade`, and one merge for 30 actions instead of one for two: about 84k gates an action with its share of the merge tree, against about 970k.
+- **VK tree.** The segment role's eight slots are taken, so `seg_quote` is slot 0 of a second segment role (5), which merges and the root accept.
+- **Engine.** `trade` sends a run of actions to `seg_quote` while each is eligible in the state it meets: a placement that rests, in a listed market with no trigger due, that does not cross the best opposite order (a void or expired order at the top still crosses, since only matching removes it). The actions execute first with their DA deferred, then the segment's log is written and the segment opened under its DA nonce, as the circuit does. The sequencer is unchanged: segments are the witness builder's concern.
+
+**Parallel proving** (P2.26, §9.2):
+
+- `ProverPool` holds provers that each own a bb process. `proveBatchParallel` proves every segment of a batch at once (each segment's start is the engine's end of the one before), each merge as soon as both its children are proved, in `proveBatch`'s pairing, then the root, with `proveBatch`'s checks of every output and of the header.
+- `npm run prove-bench` builds one batch of a synthetic market and proves it on a pool (§14).
+
+**Proving service** (P2.27, §5):
+
+- `Replayer` (replay.ts) feeds journal lines one at a time into the witness builder, and returns each batch when the journal closes it; the journal's batch entries carry the sequencer's clock, so the service knows when each batch opened and closed.
+- `prover.ts` follows the journal file as the operator writes it, replays every line, and proves each closed batch from `--from` on a shared `ProverPool`, several batches at once, reporting each one's segments, proving time and F0→F1 lag (§14).
+
+**Tests** (P2.25):
+
+- **Native**, with every batch: 41 quote segments across the fifteen batches, each output equal to the engine's, and every receipt's path through a quote segment's subtree checked against its batch's receipts root.
+- **Adversarial**, 5 new cases (105 in all): a placement that would fill, an IOC order presented as a quote, a quote beyond its margin, a replayed nonce, and a cancellation that misstates the order.
+
 **Tests** (P2.24):
 
 - **Sequencer check**, against the witness builder: a seeded workload of 80 rounds through both engines, with places of every time in force, reduce-only and displayed orders, cancels, modifications, cancel-all, withdrawals, transfers, session keys, triggers, stale nonces and forged signatures, blocks that move the index and fire triggers, liquidations and sweeps. After every one of about 200 steps, both have refused the same actions for the same reasons (467 refusals, 16 reasons) and hold the same state in everything that decides outcomes.
@@ -1584,9 +1628,10 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 
 **Next increments.** The operator's next steps are proving throughput and F1 latency (§14):
 
-1. The witness builder and segment provers as services fed by the journal, with segments proved in parallel and merged as they finish, and a settler per batch.
-2. Larger trade segments. A segment proves two signed actions, but a merge costs about 1.5M gates, so with two actions a segment the merge tree costs more per action than the segments. Every action slot also carries every kind of action.
-3. Envelope encryption to the operator key, and the encrypted execution result in the receipt (§11).
+1. Packing. In sequence order, quotes, takers and blocks interleave, so at low rates segments are nearly empty. Options: maker-first ordering within an L3 block (cancels and resting orders before takers, as some exchanges do), which keeps receipts per action only if sequence numbers are reserved by class; a block folded into the segment after it; and time-only blocks dropped when no action falls between them.
+2. A taker segment: a slot that only places with fills, without the cancellation, trigger, transfer and key branches every `seg_trade` slot pays for, eight to a 2^20 proof.
+3. Wider merges, or larger leaves, since the merge tree is now the largest share of proving.
+4. The settler: settling each proved batch on Aztec as the service proves it.
 
 v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 

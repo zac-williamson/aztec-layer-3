@@ -79,6 +79,9 @@ type BookOrder = X.Order & { market: bigint };
 
 const PRIORITY_PER_SEGMENT = 4;
 const TRADE_PER_SEGMENT = 2;
+/** seg_quote (P2.25): signed actions per segment, and the leaves of its receipts tree. */
+const QUOTES_PER_SEGMENT = 30;
+const QUOTE_RECEIPT_LEAVES = 32;
 const UPDATES_PER_BLOCK = 4;
 const REFRESH_PER_SEGMENT = 4;
 const CLEANUPS_PER_SEGMENT = 4;
@@ -88,6 +91,12 @@ const LIQ_PER_SEGMENT = 2;
 const FILLS = 2;
 const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
 const zeros = (n: number) => Array<string>(n).fill(hex(0n));
+/** An action of a kind seg_quote takes: a cancellation or modification, or a placement that rests. */
+const quoteKind = (a: { kind: bigint; p: bigint[] }) =>
+  a.kind === X.KIND_ACT.CANCEL ||
+  a.kind === X.KIND_ACT.MODIFY ||
+  a.kind === X.KIND_ACT.CANCEL_ALL ||
+  (a.kind === X.KIND_ACT.PLACE && (a.p[4] === X.TIF.GTC || a.p[4] === X.TIF.POST_ONLY || a.p[4] === X.TIF.GTT));
 const noirCache = new WeakMap<object, any>();
 /** A null tree's shared path is encoded once (sequencer mode keeps no Merkle state). */
 const cached = <T>(path: object, f: () => T): T => {
@@ -144,6 +153,16 @@ export class Engine {
    */
   readonly lite: boolean;
   readonly undo = new Undo();
+  /**
+   * While a quote segment selects its actions, their DA (display entries) waits here: the segment's
+   * DA nonce depends on its action log, so the segment opens after its actions are chosen.
+   */
+  private daDefer?: bigint[];
+  /**
+   * Whether `trade` puts runs of quote actions in seg_quote segments (P2.25). Tests that build
+   * seg_trade witnesses of quote actions turn it off.
+   */
+  quoteSegments = true;
   /** Called for every fill, maker by maker, and for an order that rests (the sequencer's execution reports). */
   onFill?: (f: FillEvent) => void;
   onRest?: (r: NonNullable<Execution['rested']>) => void;
@@ -306,6 +325,10 @@ export class Engine {
 
   private async absorb(x: bigint) {
     if (this.lite) return;
+    if (this.daDefer) {
+      this.daDefer.push(x);
+      return;
+    }
     const [da, len] = await daAbsorb(this.api, this.running.da, this.running.daLen, x);
     this.running.da = da;
     this.running.daLen = len;
@@ -370,6 +393,7 @@ export class Engine {
       this.setRec(rec, { priv: { ...priv, blind: 0n } });
       return 0n;
     }
+    if (this.daDefer) throw new Error('a quote action changes no account');
     rec.priv = { ...priv, blind: await M.blindOf(this.h, rec.kEnc, rec.index, daNonce, this.running.daLen) };
     const leaf = await M.accountLeaf(this.h, rec.pub, rec.priv);
     await this.accounts.set(rec.index, leaf);
@@ -390,7 +414,16 @@ export class Engine {
   private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>, receiptLeaves?: bigint[], clientProofs?: ClientProof[]) {
     if (this.lite) return;
     this.running.state = await this.trees();
-    const receiptsRoot = receiptLeaves ? await this.h([DS0.RECEIPT_NODE, receiptLeaves[0], receiptLeaves[1]]) : 0n;
+    let receiptsRoot = 0n;
+    if (receiptLeaves) {
+      let level = receiptLeaves;
+      while (level.length > 1) {
+        const next: bigint[] = [];
+        for (let i = 0; i < level.length; i += 2) next.push(await this.h([DS0.RECEIPT_NODE, level[i], level[i + 1]]));
+        level = next;
+      }
+      receiptsRoot = level[0];
+    }
     this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running), receiptsRoot, receiptLeaves, clientProofs });
   }
 
@@ -1014,6 +1047,140 @@ export class Engine {
     }
   }
 
+  // ---- Quotes (seg_quote, P2.25) ----
+
+  /**
+   * Whether seg_quote can take `a` in the state it would meet: CancelOrder, ModifyOrder and
+   * CancelAll, and a placement that rests without filling: GTC, post-only or GTT, in a listed market
+   * with no trigger due, not crossing the best opposite order. A void or expired order at the top
+   * still crosses: matching would remove it, which only seg_trade does.
+   */
+  private quoteEligible(a: SignedAction): boolean {
+    const K = X.KIND_ACT;
+    if (a.kind === K.CANCEL || a.kind === K.MODIFY || a.kind === K.CANCEL_ALL) return true;
+    if (a.kind !== K.PLACE) return false;
+    const [mk, side, price, , tif] = a.p;
+    if (mk < 0n || mk >= BigInt(M.MARKETS) || (side !== M.SIDE.BID && side !== M.SIDE.ASK)) return false;
+    const m = Number(mk);
+    if (tif !== X.TIF.GTC && tif !== X.TIF.POST_ONLY && tif !== X.TIF.GTT) return false;
+    if (this.markets[m].triggerPending) return false;
+    return !this.crosses(side, price, this.best(m, side === M.SIDE.BID ? M.SIDE.ASK : M.SIDE.BID));
+  }
+
+  /**
+   * One seg_quote segment: takes actions from the front of `queue` while each is eligible in the
+   * state it meets, up to QUOTES_PER_SEGMENT. They execute first, with their DA deferred; then the
+   * segment's action log is written, the segment opened under its DA nonce and the DA released in
+   * order, as the circuit does. A refused action is dropped and the segment rebuilt without it.
+   */
+  private async quoteSegment(queue: SignedAction[]) {
+    for (;;) {
+      const snap = this.snapshot();
+      const start = copyRunning(this.running);
+      const before = this.state();
+      const taken: SignedAction[] = [];
+      const items: unknown[] = [];
+      this.daDefer = [];
+      try {
+        while (taken.length < QUOTES_PER_SEGMENT && queue.length && this.quoteEligible(queue[0])) {
+          const a = queue[0];
+          // CancelAll's book replace is market 0's rightmost slot, which never holds an order.
+          const allPath = a.kind === X.KIND_ACT.CANCEL_ALL ? siblingsToNoir(this.books[0].path(X.RIGHTMOST)) : undefined;
+          a.seq = this.lastSeq + 1n;
+          const w: any = await this.execAction(a, 0n);
+          this.lastSeq = a.seq;
+          items.push({
+            kind: w.kind,
+            account_index: w.account_index,
+            key_id: w.key_id,
+            seq: a.seq.toString(),
+            nonce: w.nonce,
+            p: w.p,
+            pk_x: w.pk_x,
+            pk_y: w.pk_y,
+            sig: w.sig,
+            key: w.key,
+            key_path: w.key_path,
+            acct_pub: w.taker_pub,
+            acct_priv: w.taker_priv,
+            acct_path: w.taker_acct_path,
+            actv: w.taker_actv,
+            actv_path: w.taker_actv_path,
+            book_path: allPath ?? w.rest_path,
+            order_lots: w.cancel_lots,
+            order_expiry: w.cancel_expiry,
+            order_display: w.cancel_display,
+            order_reduce_only: w.cancel_reduce_only,
+          });
+          taken.push(queue.shift()!);
+        }
+      } catch (e: any) {
+        this.daDefer = undefined;
+        this.restore(snap);
+        this.rejected.push({ action: queue.shift()!, reason: String(e.message ?? e) });
+        queue.unshift(...taken);
+        if (!queue.length || !this.quoteEligible(queue[0])) return;
+        continue;
+      }
+      const deferred = this.daDefer!;
+      this.daDefer = undefined;
+      const r = this.running;
+      const msgs: bigint[] = [];
+      for (const a of taken) {
+        const msg = await X.actionMsg(this.h, this.domain, a.kind, a.account, a.keyId, a.nonce, a.p);
+        msgs.push(msg);
+        r.actionLog = await M.logAppend(this.h, r.actionLog, msg, M.LOG.SIGNED);
+      }
+      const daNonce = await M.segmentNonce(this.h, start.batch, r.actionLog, start.daLen);
+      await this.absorb(M.TAG.SEG);
+      await this.absorb(daNonce);
+      for (const x of deferred) await this.absorb(x);
+      const leaves = Array<bigint>(QUOTE_RECEIPT_LEAVES).fill(0n);
+      for (const [i, a] of taken.entries()) {
+        leaves[i] = await this.h([DS0.RECEIPT, a.seq!, msgs[i]]);
+        this.receipts.push({ msg: msgs[i], seq: a.seq!, segment: this.segments.length, slot: i });
+      }
+      const label = (a: SignedAction) => {
+        const by = a.keyId === M.MASTER_KEY ? '' : ` by key ${a.keyId}`;
+        const K = X.KIND_ACT;
+        return (a.kind === K.CANCEL_ALL ? 'cancel all' : `${a.kind === K.PLACE ? 'place' : a.kind === K.CANCEL ? 'cancel' : 'modify'} m${a.p[0]}`) + by;
+      };
+      await this.finishSegment(
+        'seg_quote',
+        `quote [${taken.map(label).join(', ')}]`,
+        { ...this.base(start, before), n: taken.length, actions: pad(items, QUOTES_PER_SEGMENT, () => this.emptyQuote()) },
+        leaves,
+      );
+      return;
+    }
+  }
+
+  private emptyQuote() {
+    return {
+      kind: hex(0n),
+      account_index: '0',
+      key_id: '0',
+      seq: '0',
+      nonce: '0',
+      p: zeros(X.ACTION_PAYLOAD),
+      pk_x: hex(0n),
+      pk_y: hex(0n),
+      sig: zeroSig(),
+      key: M.keyToNoir(M.emptyKey()),
+      key_path: zeros(M.KEYS_HEIGHT),
+      acct_pub: M.pubToNoir(M.zeroPub()),
+      acct_priv: M.privToNoir(M.emptyPriv()),
+      acct_path: zeros(M.ACCOUNTS_HEIGHT),
+      actv: M.activityToNoir(M.newActivity()),
+      actv_path: zeros(M.ACCOUNTS_HEIGHT),
+      book_path: emptyBookPath(),
+      order_lots: '0',
+      order_expiry: '0',
+      order_display: false,
+      order_reduce_only: false,
+    };
+  }
+
   // ---- Trading (seg_trade, SPEC.md §8) ----
 
   snapshot(): Snapshot {
@@ -1133,10 +1300,16 @@ export class Engine {
     }
     const queue = [...actions];
     while (queue.length) {
-      // Fill a segment from the queue; a rejected action is dropped and its slot refilled.
+      // Runs of actions that move resting orders and no balances go to seg_quote (P2.25).
+      if (this.quoteSegments && this.quoteEligible(queue[0])) {
+        await this.quoteSegment(queue);
+        continue;
+      }
+      // Fill a segment from the queue; a rejected action is dropped and its slot refilled. A second
+      // action joins only if it is not of a kind seg_quote takes.
       const batch: SignedAction[] = [];
       for (;;) {
-        while (batch.length < TRADE_PER_SEGMENT && queue.length) batch.push(queue.shift()!);
+        while (batch.length < TRADE_PER_SEGMENT && queue.length && (batch.length === 0 || !this.quoteSegments || !quoteKind(queue[0]))) batch.push(queue.shift()!);
         if (!batch.length) break;
         const snap = this.snapshot();
         try {

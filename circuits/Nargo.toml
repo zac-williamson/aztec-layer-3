@@ -13,6 +13,7 @@ members = [
     "seg_block",
     "seg_priority",
     "seg_trade",
+    "seg_quote",
     "seg_refresh",
     "seg_liquidate",
     "seg_forced",

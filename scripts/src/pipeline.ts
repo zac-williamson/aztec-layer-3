@@ -590,8 +590,18 @@ async function receiptsOf(api: Barretenberg, w: BatchWitness) {
  */
 export async function receiptPath(api: Barretenberg, b: Pick<ProvedBatch, 'segmentRoots' | 'segmentLeaves'>, segment: number, slot: number) {
   const node = (l: bigint, r: bigint) => l3xHash(api, [DS.RECEIPT_NODE, l, r]);
-  const path: bigint[] = [b.segmentLeaves[segment][slot ^ 1]];
-  let bits = slot;
+  // First up the segment's own receipts tree: two leaves for seg_trade, 32 for seg_quote.
+  const path: bigint[] = [];
+  let bits = 0;
+  let leaves = b.segmentLeaves[segment];
+  for (let j = slot; leaves.length > 1; j >>= 1) {
+    if (j & 1) bits |= 1 << path.length;
+    path.push(leaves[j ^ 1]);
+    const up: bigint[] = [];
+    for (let k = 0; k < leaves.length; k += 2) up.push(await node(leaves[k], leaves[k + 1]));
+    leaves = up;
+  }
+  // Then up the merge tree from the segment's root.
   let level = b.segmentRoots.length === 1 ? [b.segmentRoots[0], 0n] : [...b.segmentRoots];
   let i = segment;
   while (level.length > 2) {
@@ -617,6 +627,106 @@ export async function foldReceipt(api: Barretenberg, leaf: bigint, p: { depth: n
 }
 
 export const receiptLeaf = (api: Barretenberg, seq: bigint, msg: bigint) => l3xHash(api, [DS.RECEIPT, seq, msg]);
+
+/**
+ * Provers that work at once, each with its own bb process (P2.26, SPEC.md §9.2): `run` lends one
+ * out, or waits for one to come back.
+ */
+export class ProverPool {
+  readonly provers: Prover[];
+  private free: Prover[];
+  private waiting: ((p: Prover) => void)[] = [];
+
+  constructor(provers: Prover[]) {
+    this.provers = provers;
+    this.free = [...provers];
+  }
+
+  /** `n` provers whose bb processes use `threads` threads each. */
+  static async create(n: number, threads: number, manifest: any, paramsHash?: bigint): Promise<ProverPool> {
+    const { Barretenberg } = await import('@aztec-foundation/bb.js');
+    const provers: Prover[] = [];
+    for (let i = 0; i < n; i++) provers.push(await Prover.create(await Barretenberg.new({ threads }), manifest, paramsHash));
+    return new ProverPool(provers);
+  }
+
+  async run<T>(f: (p: Prover) => Promise<T>): Promise<T> {
+    const p = this.free.pop() ?? (await new Promise<Prover>((ok) => this.waiting.push(ok)));
+    try {
+      return await f(p);
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next(p);
+      else this.free.push(p);
+    }
+  }
+
+  async destroy() {
+    for (const p of this.provers) await p.api.destroy();
+  }
+}
+
+/**
+ * Proves a batch on a pool (P2.26): every segment at once, since each one's start is the engine's
+ * end of the one before; each merge as soon as both its children are proved, in `proveBatch`'s
+ * pairing; then the root. The checks are `proveBatch`'s.
+ */
+export async function proveBatchParallel(pool: ProverPool, w: BatchWitness, log = console.log): Promise<ProvedBatch & { wallMs: number }> {
+  const t0 = performance.now();
+  const ms: Record<string, number> = {};
+  const configHash = pool.provers[0].configHash;
+  const leafPs = w.segments.map((seg, i) =>
+    pool.run(async (prover) => {
+      const node = seg.pkg === 'tube' ? (await prover.proveTube(seg.inputs, seg.clientProofs ?? [], log)).node : await prover.proveNode(seg.pkg, seg.inputs);
+      const start = i === 0 ? w.start : w.segments[i - 1].expectedEnd;
+      const got = nodeFields(node.out);
+      const want = nodeFields({ configHash, start, end: seg.expectedEnd, receiptsRoot: seg.receiptsRoot ?? 0n });
+      const bad = got.findIndex((x, j) => x !== want[j]);
+      assert(bad < 0, `${seg.label}: circuit output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
+      ms[`${seg.pkg}_${i}`] = node.ms;
+      return node;
+    }),
+  );
+  let level: Promise<ProvedNode>[] = leafPs;
+  let shape = w.segments.map((s) => s.pkg.replace('seg_', ''));
+  if (level.length === 1) {
+    level = [level[0], level[0].then((n) => pool.run((p) => p.padding(n.out.end)))];
+    shape = [shape[0], 'pad'];
+  }
+  let merges = 0;
+  while (level.length > 2) {
+    const next: Promise<ProvedNode>[] = [];
+    const nextShape: string[] = [];
+    for (let i = 0; i < level.length; i += 2) {
+      if (i + 1 < level.length) {
+        const k = merges++;
+        next.push(
+          Promise.all([level[i], level[i + 1]]).then(([a, b]) =>
+            pool.run(async (p) => {
+              const m = await p.merge(a, b);
+              ms[`merge_${k}`] = m.ms;
+              return m;
+            }),
+          ),
+        );
+        nextShape.push(`merge(${shape[i]}, ${shape[i + 1]})`);
+      } else {
+        next.push(level[i]);
+        nextShape.push(shape[i]);
+      }
+    }
+    level = next;
+    shape = nextShape;
+  }
+  const leaves = await Promise.all(leafPs);
+  const top = await Promise.all(level);
+  const root = await pool.run((p) => p.proveRoot(p.rootInputs(top[0], top[1], w.endState, w.withdrawalRecords, w.batchNumber)));
+  assert(root.verified, 'root proof does not verify');
+  ms.root_prove = root.ms;
+  const wallMs = performance.now() - t0;
+  log(`  ${leaves.length} segments, ${merges} merges and the root on ${pool.provers.length} provers in ${(wallMs / 1000).toFixed(1)} s (root ${(root.ms / 1000).toFixed(1)} s)`);
+  return { ...(await finishBatch(pool.provers[0], w, leaves, top, shape, root, ms)), wallMs };
+}
 
 /**
  * Proves a batch: every segment (checking the circuit's output against the engine's expected
@@ -681,8 +791,20 @@ export async function proveBatch(prover: Prover, w: BatchWitness, log = console.
   assert(root.verified, 'root proof does not verify');
   ms.root_prove = root.ms;
   log(`  root: ${root.ms.toFixed(0)} ms`);
+  return finishBatch(prover, w, leaves, level, shape, root, ms);
+}
 
-  // Rebuild the header in TS; it must hash to the root's public input.
+/** Rebuilds a proved batch's header in TS, which must hash to the root's public input. */
+async function finishBatch(
+  prover: Prover,
+  w: BatchWitness,
+  leaves: ProvedNode[],
+  level: ProvedNode[],
+  shape: string[],
+  root: Awaited<ReturnType<Prover['proveRoot']>>,
+  ms: Record<string, number>,
+): Promise<ProvedBatch> {
+  const api = prover.api;
   const s = leaves[0].out.start;
   const e = level[1].out.end;
   const n = w.batchNumber;

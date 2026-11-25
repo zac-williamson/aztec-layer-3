@@ -179,7 +179,8 @@ if (isMainThread) {
       const now = performance.now();
       const due = Math.floor(((now - phaseStart) / 1000) * ph.rate);
       while (sentInPhase < due) {
-        const sched = phaseStart + (sentInPhase / ph.rate) * 1000;
+        // Action k is due once k + 1 actions' worth of time has passed (`due` above).
+        const sched = phaseStart + ((sentInPhase + 1) / ph.rate) * 1000;
         sentInPhase++;
         await sendOne(sched);
       }

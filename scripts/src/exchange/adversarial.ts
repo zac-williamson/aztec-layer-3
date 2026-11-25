@@ -41,6 +41,9 @@ async function main() {
   const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
   const protocol = await protocolAccounts(h);
   const engine = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  // The cases below tamper with seg_trade witnesses of resting orders and cancellations, which the
+  // engine would otherwise put in seg_quote segments; the seg_quote cases come last.
+  engine.quoteSegments = false;
   const now = BigInt(Math.floor(Date.now() / 1000));
   const update = (e: Engine, market: bigint, price: bigint, time: bigint, signers = [0, 1]) =>
     signUpdate(h, e.domain, oracleSks, signers, market, price, price, time);
@@ -181,6 +184,7 @@ async function main() {
   t.updates[0].price = '2002';
   await expectFail('oracle price not as signed', 'seg_block', t);
   const under = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  under.quoteSegments = false; // seg_trade witnesses, as below
   under.relax.add('oracle-sigs');
   await under.beginBatch(1n, 0n, 0n, 0n);
   await under.block(now, [await update(under, 0n, 2000n, now, [2])]);
@@ -188,6 +192,7 @@ async function main() {
   // An engine that tolerates a 100% move builds the witness; the circuit applies the committed 10%.
   const looseParams = { ...params, markets: params.markets.map((m, i) => (i === 0 ? { ...m, maxJumpPpm: 2_000_000n } : m)) };
   const loose = await Engine.create(api, looseParams, prover.vkTreeRoot, protocol);
+  loose.quoteSegments = false; // seg_trade witnesses, as below
   await loose.beginBatch(1n, 0n, 0n, 0n);
   await loose.block(now, [await update(loose, 0n, 1000n, now)]);
   await loose.block(now + 1n, [await update(loose, 0n, 2000n, now + 1n)]);
@@ -231,6 +236,7 @@ async function main() {
   // 1 in market 1, with an ask resting) and W (long 5) go underwater when market 0 falls 13%. The
   // insurance account holds 10,000: enough to take over W, not V.
   const L = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  L.quoteSegments = false; // seg_trade witnesses, as below
   const lu = await Promise.all([11n, 12n, 13n].map((x) => keysFromSeed(h, x)));
   const [P, V, W] = [2n, 3n, 4n];
   const lreqs: M.Request[] = [];
@@ -362,6 +368,7 @@ async function main() {
   // Session keys, GTT and forced requests (SPEC.md §6.5, §7.2, §7.3). Q provides liquidity; R gives
   // a session key market 0 only, a 100,000 notional cap and an expiry, and its key rests a bid.
   const K = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  K.quoteSegments = false; // seg_trade witnesses, as below
   const ku = await Promise.all([21n, 22n].map((x) => keysFromSeed(h, x)));
   const [Q, Rk] = [2n, 3n];
   const kaddr = [randomField(), randomField()];
@@ -464,6 +471,7 @@ async function main() {
   // what an operator would need to apply actions no client proof authorized. The tube runs without its Chonk proof here (witness
   // generation does not check it), so each case shows the check the tube itself makes.
   const PE = await Engine.create(api, params, prover.vkTreeRoot, protocol, prover.clientVks);
+  PE.quoteSegments = false; // seg_trade witnesses, as below
   const pSecret = randomField();
   const pu = await Promise.all([41n, 42n].map((x) => keysFromSeed(h, x)));
   const [S, U] = [2n, 3n];
@@ -577,6 +585,7 @@ async function main() {
   // Triggers (SPEC.md §6.5). A fresh exchange: account 3 buys 20 in market 0 from account 2 and
   // sets two stop-losses (at 1960 and 1955) and a take-profit (at 2100); account 2 bids at 1950.
   const T = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  T.quoteSegments = false; // seg_trade witnesses, as below
   const tu = await Promise.all([21n, 22n].map((x) => keysFromSeed(h, x)));
   const treqs: M.Request[] = [];
   for (const [i, k] of tu.entries()) {
@@ -660,6 +669,7 @@ async function main() {
   // Rekey (SPEC.md §7.3). A fresh exchange: account R0 grants a session key, then its owner rekeys
   // it through the Bridge, which delivered the new encryption key to the operator.
   const R = await Engine.create(api, params, prover.vkTreeRoot, protocol);
+  R.quoteSegments = false; // seg_trade witnesses, as below
   const rKeys = await Promise.all([31n, 32n].map((s) => keysFromSeed(h, s)));
   const rOwners = [randomField(), randomField()];
   const rReqs: M.Request[] = [];
@@ -785,6 +795,39 @@ async function main() {
   await resign(t, 0, 2, 2n, X.KIND_ACT.SET_MASTER_AUTH, [0n]);
   t.actions[0].kind = hex(X.KIND_ACT.SET_MASTER_AUTH);
   await expectFail('a rotation to an empty master authorization', 'seg_trade', t, 'empty master authorization');
+
+  // Quote segments (P2.25): an honest resting bid and an honest cancellation, then tampered with.
+  engine.quoteSegments = true;
+  const nonceOf = (u: number) => engine.actv.get(idx(u))!.nonce;
+  await engine.trade([await act(0, nonceOf(0) + 1n, PLACE, [0n, ASK, 2005n, 5n, GTC, 0n])]); // an ask for the crossing case
+  const bestAsk = [...engine.orders[0].values()].filter((o) => o.side === ASK).reduce((m, o) => (o.price < m ? o.price : m), X.MAX_PRICE);
+  const seq0 = engine.markets[0].nextSeq;
+  const crossPath = engine.books[0].path(X.orderIndex(BID, bestAsk, seq0)).map((x) => ({ hash: hex(x.hash), ask: x.ask.toString(), bid: x.bid.toString() }));
+  const nq = nonceOf(1) + 1n;
+  const qs = engine.segments.length;
+  await engine.trade([await act(1, nq, PLACE, [0n, BID, 1980n, 2n, GTC, 0n])]);
+  await engine.trade([await act(1, nq + 1n, X.KIND_ACT.CANCEL, [0n, BID, 1980n, seq0])]);
+  assert(engine.segments[qs].pkg === 'seg_quote' && engine.segments[qs + 1].pkg === 'seg_quote' && engine.rejected.length === 0, 'quote setup');
+  const quote = engine.segments[qs].inputs as any;
+  const cancelQ = engine.segments[qs + 1].inputs as any;
+  await execute('seg_quote', quote);
+  await execute('seg_quote', cancelQ);
+  t = clone(quote);
+  await resign(t, 0, 1, nq, PLACE, [0n, BID, bestAsk, 2n, GTC, 0n]);
+  t.actions[0].book_path = crossPath;
+  await expectFail('a quote that would fill', 'seg_quote', t, 'the order would fill');
+  t = clone(quote);
+  await resign(t, 0, 1, nq, PLACE, [0n, BID, 1980n, 2n, IOC, 0n]);
+  await expectFail('an IOC order as a quote', 'seg_quote', t, 'a quote rests');
+  t = clone(quote);
+  await resign(t, 0, 1, nq, PLACE, [0n, BID, 1980n, 10_000_000n, GTC, 0n]);
+  await expectFail('a quote beyond its margin', 'seg_quote', t, 'insufficient margin');
+  t = clone(quote);
+  await resign(t, 0, 1, nq - 1n, PLACE, [0n, BID, 1980n, 2n, GTC, 0n]);
+  await expectFail('a quote with a replayed nonce', 'seg_quote', t, 'nonce');
+  t = clone(cancelQ);
+  t.actions[0].order_lots = '1';
+  await expectFail('a cancellation that misstates the order', 'seg_quote', t, 'book path does not match root');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

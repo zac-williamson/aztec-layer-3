@@ -42,6 +42,9 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.20**: stops that open a position. A trigger may be an entry stop: it fires as an IOC order for its full size, and only if its owner can then cover initial margin; otherwise the firing is consumed without effect.
 - **P2.21**: resting reduce-only orders. A reduce-only order may rest; it holds no open lots, and when it executes it fills at most its owner's remaining position, with the rest trimmed.
 - **P2.22**: a rotation signed by the master key. `SetMasterAuth` replaces an account's master authorization and republishes the account in full; the owner's rekey stays the path for lost keys and new encryption keys.
+- **P2.27**: a proving service. It follows the operator's journal, replays it, and proves each batch as the journal closes it. End to end on a loaded shared host at 2 actions a second, batches proved 14 minutes after they closed: proving, not sequencing, is what bounds sustained throughput (SPEC.md §14).
+- **P2.26**: parallel proving. A pool of provers proves a batch's segments at once and each merge as soon as its children are done: on six provers a 234-action batch proved in 356 s instead of 720 s.
+- **P2.25**: quote segments. `seg_quote` proves up to 30 resting orders, cancellations and modifications in one 2^20 circuit, each one signature, one book replace and one activity update: about 84k gates of proving an action with its share of the merge tree, against about 970k through `seg_trade`, whose every slot pays for fills, transfers and triggers.
 - **P2.24**: the operator's sequencer. Gateway threads check signatures and sign receipts on a Rust thread pool; one sequencer thread runs the engine in sequencer mode, applying each action atomically in about 16 µs, and journals every step; the journal replays into the witness builder. On a shared host it applied 5,000 signed actions a second with replies in 0.8 ms at the median and 5.4 ms at p99, and absorbed bursts of 18,000–20,000 a second.
 - **P2.23**: the operator's cryptography in process. A Rust addon (`native/`) computes Poseidon2, the state trees, Grumpkin and Schnorr in the calling thread instead of in a bb process: the engine builds witnesses 12× faster and signatures are checked about 300× faster, with bit-identical results.
 
@@ -55,6 +58,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `circuits/l3x_exchange` | Exchange rules: accounts and positions, activity, markets, order-book tree, signatures, DA encryption, matching, funding, fees, margin, mark ticks, liquidation |
 | `circuits/seg_block` | X-segment: L3 block time and up to four k-of-n signed index updates, each a mark and funding tick that also flags due triggers |
 | `circuits/seg_priority` | X-segment: Register, Deposit, ForcedWithdraw and Rekey requests in queue order (refunds for missing accounts) |
+| `circuits/seg_quote` | X-segment (P2.25): up to 30 PlaceOrder (resting, without fills), CancelOrder, ModifyOrder and CancelAll, each one book replace and one activity update; VK slot 0 of the second segment role |
 | `circuits/seg_trade` | X-segment: PlaceOrder (GTC, GTT, IOC, FOK, post-only, reduce-only; matching, fees, funding), CancelOrder, ModifyOrder, CancelAll, PlaceTrigger, CancelTrigger, Withdraw, Transfer, AddKey, RevokeKey, signed by the master key or a session key |
 | `circuits/seg_refresh` | X-segment (maintenance): removes void and expired orders, sets fee tiers, sweeps fees, liquidation fees and funding remainders into the protocol accounts, republishes accounts under fresh keystreams |
 | `circuits/seg_liquidate` | X-segment: liquidation steps (cancel, close, insurance takeover, deficit, auto-deleverage), each with its precondition |
@@ -179,10 +183,22 @@ npm run replay -- /tmp/l3x.jsonl --execute 1
 This replays a journal into the witness builder and executes the listed batches' segments in their circuits.
 
 ```bash
+npm run prover -- --journal /tmp/l3x.jsonl --provers 6 --from 2
+```
+
+This follows a running operator's journal, proves each batch as it closes on a pool of provers, and reports each batch's proving time and its lag from its opening and its close.
+
+```bash
 npm run operator-check
 ```
 
 This runs the operator, drives it, stops it, and replays its journal, executing a trading batch in the circuits.
+
+```bash
+npm run prove-bench -- 4 16 4 6 16
+```
+
+This builds one batch of a synthetic market (rounds, makers, takers) and proves it on a pool of provers (count, threads each), reporting each kind of proof's time, the wall time and the one-prover time.
 
 ```bash
 npm run adversarial
@@ -298,7 +314,11 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.23: tests | `native-check`: 2,531 comparisons with bb.js and the replaced TypeScript; every suite passes on the addon. |
 | P2.24: sequencer | The engine in sequencer mode (no trees or witnesses; each action atomic through an undo journal; orders indexed by price level), gateway threads with batched signature checks and receipt signatures on the crypto pool, the journal and its replay into the witness builder. On zac-box: 5,000 actions a second with p50 0.81 ms and p99 5.4 ms; bursts of 18,000–20,200 a second (SPEC.md §14). |
 | P2.24: tests | `sequencer-check` (about 200 steps, 467 refusals, the same state after each); the gateway's batch checks in `native-check`; `operator-check` (operator, load, journal replay, a batch executed in the circuits). |
-| P2: next | Proving throughput: the witness builder and provers as services fed by the journal, with segments proved in parallel, and larger trade segments; from P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
+| P2.25: quote segments | `seg_quote` (1,043,851 gates for 30 actions); the engine routes runs of resting orders, cancellations, modifications and cancel-alls to it; receipts in 32-leaf subtrees; merges accept a second segment role. |
+| P2.25: tests | Native: 41 quote segments, each equal to the engine's output, receipts checked through their subtrees; 5 more adversarial witnesses (105 in all). |
+| P2.26: parallel proving | `ProverPool` and `proveBatchParallel`: segments at once, merges as their children finish, then the root. A 234-action batch (11 quote, 8 trade, 4 block segments) proved in 356 s on six provers against 720 s on one, at host load 240–310. |
+| P2.27: proving service | `Replayer` feeds journal lines into the witness builder; `prover.ts` follows the journal and proves batches as they close. End to end at 2 actions a second: 39 segments for 60 actions a batch, proved about 14 minutes after each batch closed, at host load about 300. |
+| P2: next | Proving throughput and lag: packing (maker-first ordering within a block, blocks folded into segments), a taker segment, wider merges or larger leaves, and the settler; from P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats
 

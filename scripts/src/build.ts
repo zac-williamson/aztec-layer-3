@@ -53,6 +53,7 @@ const STEPS: Step[] = [
   { pkg: 'seg_liquidate', vk: ROLLUP },
   { pkg: 'seg_forced', vk: ROLLUP },
   { pkg: 'seg_trigger', vk: ROLLUP },
+  { pkg: 'seg_quote', vk: ROLLUP },
   { pkg: 'merge', vk: ROLLUP },
   { pkg: 'root', vk: { scheme: 'ultra_honk', target: 'noir-recursive' } },
   { pkg: 'rogue_app', vk: { scheme: 'chonk', kind: 'app' } },
@@ -79,6 +80,7 @@ const PUBLISHES: Record<string, string> = {
   seg_liquidate: 'SEG_LIQUIDATE_VK_HASH',
   seg_forced: 'SEG_FORCED_VK_HASH',
   seg_trigger: 'SEG_TRIGGER_VK_HASH',
+  seg_quote: 'SEG_QUOTE_VK_HASH',
   merge: 'MERGE_VK_HASH',
   root: 'ROOT_VK_HASH',
   rogue_app: 'ROGUE_APP_VK_HASH',
@@ -107,6 +109,7 @@ const VK_SLOTS: Record<string, number> = {
   seg_liquidate: ROLE.SEGMENT * S + 5,
   seg_forced: ROLE.SEGMENT * S + 6,
   seg_trigger: ROLE.SEGMENT * S + 7,
+  seg_quote: ROLE.SEGMENT2 * S + 0,
   merge: ROLE.MERGE * S + 0,
 };
 

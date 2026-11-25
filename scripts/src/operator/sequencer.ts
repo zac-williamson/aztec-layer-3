@@ -203,7 +203,7 @@ export class Sequencer {
         const r = e.running;
         await e.beginBatch(n, r?.priorityHead ?? 0n, r?.priorityCursor ?? 0n, r?.time ?? 0n);
       },
-      { n },
+      { n, ms: Date.now() },
     );
   }
 

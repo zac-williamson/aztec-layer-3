@@ -21,8 +21,10 @@
     "operator": "node src/operator/server.ts",
     "load": "node src/operator/load.ts",
     "replay": "node src/operator/replay.ts",
+    "prover": "node src/operator/prover.ts",
     "operator-check": "node src/operator/check.ts",
-    "engine-bench": "node src/perf/engine_bench.ts"
+    "engine-bench": "node src/perf/engine_bench.ts",
+    "prove-bench": "node src/perf/prove_bench.ts"
   },
   "dependencies": {
     "@aztec-foundation/bb.js": "6.0.0",
