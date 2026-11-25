@@ -42,6 +42,7 @@ A confidential order-book exchange rollup on Aztec. [`SPEC.md`](SPEC.md) is the 
 - **P2.20**: stops that open a position. A trigger may be an entry stop: it fires as an IOC order for its full size, and only if its owner can then cover initial margin; otherwise the firing is consumed without effect.
 - **P2.21**: resting reduce-only orders. A reduce-only order may rest; it holds no open lots, and when it executes it fills at most its owner's remaining position, with the rest trimmed.
 - **P2.22**: a rotation signed by the master key. `SetMasterAuth` replaces an account's master authorization and republishes the account in full; the owner's rekey stays the path for lost keys and new encryption keys.
+- **P2.24**: the operator's sequencer. Gateway threads check signatures and sign receipts on a Rust thread pool; one sequencer thread runs the engine in sequencer mode, applying each action atomically in about 16 µs, and journals every step; the journal replays into the witness builder. On a shared host it applied 5,000 signed actions a second with replies in 0.8 ms at the median and 5.4 ms at p99, and absorbed bursts of 18,000–20,000 a second.
 - **P2.23**: the operator's cryptography in process. A Rust addon (`native/`) computes Poseidon2, the state trees, Grumpkin and Schnorr in the calling thread instead of in a bb process: the engine builds witnesses 12× faster and signatures are checked about 300× faster, with bit-identical results.
 
 Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bundled `aztec-nargo` (Noir 1.0.0-rc.3) and `aztec-bb`. The scripts run on Node 24, which executes the TypeScript directly, and use the `@aztec-labs` 6.0.0 packages from npm. The `l3x-native` addon needs Rust (cargo 1.89 or newer). The spec targets 6.1.0, but neither the installer nor npm publishes its toolchain yet. The v6.0.0 proof-type and size constants match those checked for v6.1 in SPEC.md §3.
@@ -76,6 +77,7 @@ Toolchain: Aztec **6.0.0** (`.aztecrc`), installed with `aztec-up`, with its bun
 | `contracts/ctbridge` | `ConfidentialTokenBridge`, the token's minter and the L2 half of its bridge to L1 (Aztec's `TokenPortal` is the L1 half); TXE tests |
 | `scripts/src` | `build.ts`, `prove.ts`, `vk_substitution.ts`, `m1.ts`, and `pipeline.ts` (the batch prover) |
 | `scripts/src/exchange` | Engine (mirrors the circuits and builds witnesses), trees, Grumpkin Schnorr, DA decoding, exit client, and the exchange tests |
+| `scripts/src/operator` | The operator node: gateway threads (`gateway.ts`), the sequencer and journal (`sequencer.ts`), the server (`server.ts`), the wire format, the load generator (`load.ts`), journal replay into the witness builder (`replay.ts`), and the end-to-end operator check |
 | `scripts/src/perf` | Measurements: the addon's checks and timings, and the primitives' costs through each bb.js backend |
 | `native` | `l3x-native`, a Rust N-API addon: Poseidon2 with barretenberg's parameters, the state trees, Grumpkin and Schnorr, for the scripts and the operator |
 | `scripts/out` | Generated: VK manifest, batch, measurements and settlement reports (git-ignored) |
@@ -153,6 +155,34 @@ This runs fifteen batches natively across markets 0–2. They cover:
 Each segment's circuit output is checked against the engine, and conservation is checked exactly, in micro-units, after every batch. Every account is then reopened from the DA alone. The run writes `scripts/out/native.json`.
 
 With `EXECUTE_ONLY=1`, the segments are executed and compared with the engine but not proved, which takes seconds instead of minutes.
+
+```bash
+npm run sequencer-check
+```
+
+This drives one seeded random workload, valid and refused actions mixed, through the engine in sequencer mode and through the witness builder's engine, and requires the same decisions and the same state after every step.
+
+```bash
+npm run operator -- --accounts 12000 --journal /tmp/l3x.jsonl
+```
+
+```bash
+npm run load -- --accounts 12000 --rate 5000 --seconds 30 --burst-rate 20000 --burst-seconds 5
+```
+
+The first starts the operator node on port 7300 with demo accounts registered and funded at genesis, a block with signed index updates every second and a batch every 72 seconds. The second drives it from worker threads on a fixed schedule, makers quoting and cancelling and takers crossing, and reports throughput and latency percentiles per phase, measured from each action's scheduled time and from its write.
+
+```bash
+npm run replay -- /tmp/l3x.jsonl --execute 1
+```
+
+This replays a journal into the witness builder and executes the listed batches' segments in their circuits.
+
+```bash
+npm run operator-check
+```
+
+This runs the operator, drives it, stops it, and replays its journal, executing a trading batch in the circuits.
 
 ```bash
 npm run adversarial
@@ -266,7 +296,9 @@ P0 is complete, P1 is complete, and P2 is in progress (SPEC.md §15 has the prof
 | P2.22: tests | Native batch 15 rotates Bob's master key; 1 more adversarial witness (100 in all). |
 | P2.23: in-process cryptography | `l3x-native` (Rust, arkworks): Poseidon2, the L3X sponge, the account, activity, key and order-book trees, Grumpkin with a fixed-base table, Schnorr. On zac-box a permutation takes 14 µs (117 µs through bb.js), a signature check 155 µs (about 50 ms before), and the engine builds witnesses for 260 signed actions a second (21 before). |
 | P2.23: tests | `native-check`: 2,531 comparisons with bb.js and the replaced TypeScript; every suite passes on the addon. |
-| P2: next | From P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
+| P2.24: sequencer | The engine in sequencer mode (no trees or witnesses; each action atomic through an undo journal; orders indexed by price level), gateway threads with batched signature checks and receipt signatures on the crypto pool, the journal and its replay into the witness builder. On zac-box: 5,000 actions a second with p50 0.81 ms and p99 5.4 ms; bursts of 18,000–20,200 a second (SPEC.md §14). |
+| P2.24: tests | `sequencer-check` (about 200 steps, 467 refusals, the same state after each); the gateway's batch checks in `native-check`; `operator-check` (operator, load, journal replay, a batch executed in the circuits). |
+| P2: next | Proving throughput: the witness builder and provers as services fed by the journal, with segments proved in parallel, and larger trade segments; from P3, ADL ranking. A testnet load test and an external audit remain P2's exit criteria. |
 
 ## Caveats
 

@@ -16,7 +16,13 @@
     "e2e": "node src/exchange/e2e.ts",
     "l1bridge": "node src/exchange/l1bridge.ts",
     "adversarial": "node src/exchange/adversarial.ts",
-    "testnet": "node src/exchange/testnet.ts"
+    "testnet": "node src/exchange/testnet.ts",
+    "sequencer-check": "node src/exchange/sequencer_check.ts",
+    "operator": "node src/operator/server.ts",
+    "load": "node src/operator/load.ts",
+    "replay": "node src/operator/replay.ts",
+    "operator-check": "node src/operator/check.ts",
+    "engine-bench": "node src/perf/engine_bench.ts"
   },
   "dependencies": {
     "@aztec-foundation/bb.js": "6.0.0",

@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), and the operator's cryptography in process (P2.23), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), the operator's cryptography in process (P2.23), and the operator's sequencer with gateway threads, receipts and a journal (P2.24), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -141,6 +141,12 @@ This is confidentiality against the public, not against the operator. Removing o
 | F2 settled | settlement in an Aztec L2 block | + one Aztec block |
 | F3 checkpointed | Aztec checkpoint on L1 | ≤ one 72 s slot + L1 inclusion |
 | F4 final | Aztec epoch proof on L1 | ≤ 32 slots (≈ 38 min) + proving |
+
+As built (P2.24), the operator node is one process (`scripts/src/operator`):
+
+- **Gateway threads** (`gateway.ts`, four by default) share the port; the kernel spreads connections across them. Each parses requests, checks each action's message, signer and signature on the crypto pool (`l3x-native`'s Rust threads), passes the checked actions to the sequencer thread in arrival order, then signs the receipts of the applied ones on the crypto pool and answers.
+- **The sequencer thread** (`sequencer.ts`) runs the engine in sequencer mode (§15, P2.24): the same rules as the witness builder's engine, without trees, DA or witnesses, each action applied atomically or refused with nothing changed. Batches from all gateways are sequenced in arrival order through one queue, with blocks and the operator's duties at each block (due triggers, due liquidations). It journals every step.
+- **The journal** records every sequenced step in order: batch boundaries, delivered encryption keys, blocks with their updates and duties, priority requests, and each applied action with its sequence number and time. Replayed into an engine that builds witnesses (`replay.ts`), it yields the batches to prove, and the replay refuses any journaled action that does not apply under its number.
 
 Trading uses F0. Withdrawals pay at F2 and are final at F4. A deposit is credited once the custody transaction that swept it reaches F3 (default) or F4 (safest). An Aztec prune between F3 and F4 can remove a credited deposit; the operator bears that residual risk.
 
@@ -753,6 +759,18 @@ Operator measurements (P2.23), on zac-box: a shared AMD EPYC 7R13 host (188 core
 | Engine: signed actions a second, building witnesses (16 makers, 8 takers) | 21 | 260 |
 
 With the addon the engine is bound by Poseidon2: a signed action costs a few hundred permutations of tree writes.
+
+The sequencer (P2.24), on zac-box, load 140–200:
+
+| Measurement | Result |
+| --- | --- |
+| Engine in sequencer mode, signed actions (32 makers, 16 takers, 1,054 resting orders) | 16 µs an action, about 62,800 a second; the witness builder's engine, on the same book, 148 a second |
+| Gateway checks (message, signer, Schnorr verification) and receipt signature | about 155 µs and 135 µs of CPU an action, on the crypto pool |
+| Load: 5,000 actions a second for 30 s, 12,000 accounts, journal on | all 5,000 applied each second; latency from the client's write to its reply p50 0.81 ms, p90 1.5 ms, p99 5.4 ms, p99.9 35 ms |
+| Burst: 20,000 a second for 5 s | 18,000–20,200 applied a second; p50 8 ms, p99 84 ms while the queue drains |
+| 15,000 a second for 15 s (journal off) | about 14,500 applied a second; p50 2.4 ms, p99 46 ms |
+
+So the receipt latency and sustained throughput targets above are met on this host at 5,000 actions a second. Bursts near 20,000 a second saturate the sequencer thread, whose work per action in the server, about 40 µs with messaging, is the limit; the longest tails (p99.9) come from garbage-collection pauses and from the host's other load.
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
 
@@ -1397,6 +1415,25 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
   - Grumpkin scalar multiplication, with a 4-bit fixed-base table for G, and Schnorr signing and verification with the Poseidon2 challenge of noir-lang/schnorr v0.4.0.
 - **Use.** `l3xHash`, `permute`, the engine's trees and the scripts' signatures call the addon; `npm run build:native` builds it for the host. Witnesses, roots and signatures are unchanged, bit for bit, so every circuit test also checks the addon.
 
+**Sequencer and gateways** (P2.24, §5, §11, §14):
+
+- **Sequencer mode.** `Engine.create(…, { lite: true })` decides every action, block and request with the witness builder's rules, but:
+  - it keeps no Merkle trees (null trees with shared zero paths) and builds no DA, blinds or witnesses, so its witness hasher returns zero;
+  - the hashes that decide outcomes (signers' master authorizations, signatures, oracle messages, deposit openings, client proofs) use a second, semantic hasher; with the gateway's checks attached to an action (`prepared`), it computes none of them;
+  - each action, block or request is one atomic step: the engine's containers (`journal.ts`) record undo entries while a step is open, account records change only through one journaled helper, and a refused step rolls back to its savepoint. The witness builder's deep-copy snapshots cost time in proportion to the state.
+- **Book index.** Resting orders are indexed by side and price level, so the best order is found in constant time and a removal costs one search within its level; before, `best` scanned every order in the market.
+- **Receipts** (§11) are signed by the gateway threads in batches: `Sign(H(DS_RECEIPT_SIG, domain, msg, seq, issued_at))`, `issued_at` in unix seconds, which `Bridge.challenge` verifies. A refused action gets no receipt and no sequence number.
+- **Wire.** Newline-delimited JSON over TCP (`wire.ts`): a signed action in, its receipt and execution report out (fills, and where the remainder rests), or a refusal with its reason.
+- **Durability.** By default a batch's replies wait for its journal lines to be written to the operating system; with `--fsync` they wait for the lines to reach the disk.
+- **Not built.** Envelope encryption to the operator key (§7.1) and the encrypted execution result of §11's receipt; a deployment's start from its journal and the Bridge rather than from demo accounts; the witness builder and provers as services fed by the journal.
+
+**Tests** (P2.24):
+
+- **Sequencer check**, against the witness builder: a seeded workload of 80 rounds through both engines, with places of every time in force, reduce-only and displayed orders, cancels, modifications, cancel-all, withdrawals, transfers, session keys, triggers, stale nonces and forged signatures, blocks that move the index and fire triggers, liquidations and sweeps. After every one of about 200 steps, both have refused the same actions for the same reasons (467 refusals, 16 reasons) and hold the same state in everything that decides outcomes.
+- **Native check**: the gateway's batch checks (message, master authorization, verdict, with forged signatures) and receipt signatures agree with the TypeScript and the Bridge's formula.
+- **Operator check**: the operator with two gateway threads and 120 demo accounts, driven for 8 s; every action is answered, and the journal replays every applied action under its sequence number into the witness builder, whose second batch executes in the circuits, every segment's output matching.
+- **Every suite** ran with the engine changes: native (15 batches proved), e2e, l1bridge, adversarial, VK substitution, prove, M1.
+
 **Tests** (P2.23):
 
 - **Native check**, 2,531 comparisons with bb.js and the TypeScript the addon replaced:
@@ -1545,7 +1582,13 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Native**, batch 6: Grace's second P-segment revokes her session key and withdraws 100,000 by client proof. The engine refuses a third proof, for a withdrawal beyond her collateral. Conservation holds with the withdrawal, and the DA reopens her account after it.
 - **Adversarial:** 3 more tube witnesses, 60 in all: a withdrawal sent to another recipient, a withdrawal above the collateral, and a withdrawal published under another key. The case of a proof whose action kind is not allowed now uses an order.
 
-**Next increments.** v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
+**Next increments.** The operator's next steps are proving throughput and F1 latency (§14):
+
+1. The witness builder and segment provers as services fed by the journal, with segments proved in parallel and merged as they finish, and a settler per batch.
+2. Larger trade segments. A segment proves two signed actions, but a merge costs about 1.5M gates, so with two actions a segment the merge tree costs more per action than the segments. Every action slot also carries every kind of action.
+3. Envelope encryption to the operator key, and the encrypted execution result in the receipt (§11).
+
+v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:
 
 1. The premium-EMA and impact-mid components of the mark (§8.4). The impact mid needs quote aggregates in the book's nodes, which would double the cost of every book walk.
 2. A rotation authorized by a client proof (lane P), and a signed `RotateEncKey`. Lane-P accounts and new encryption keys use the owner's `Rekey` until then.

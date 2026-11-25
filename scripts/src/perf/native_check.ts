@@ -218,6 +218,42 @@ for (let i = 0; i < 12; i++) {
 }
 console.log(`Schnorr agrees with the reference (${checks} checks)`);
 
+// The gateway's batch checks and receipt signatures (P2.24) against the TypeScript originals.
+{
+  const domain = randomField();
+  const keys = [...Array(6)].map(() => md(randomField(), N));
+  const acts = await Promise.all(
+    [...Array(24).keys()].map(async (i) => {
+      const sk = keys[i % keys.length];
+      const pk = refMul(G, sk)!;
+      const p = [...Array(8)].map(() => (i % 3 ? randomField() : BigInt(i)));
+      const msg = await refHash([DS.ACTION, domain, BigInt(i % 11), BigInt(i), 256n, BigInt(i + 1), ...p]);
+      const sig = await sign(null as any, sk, msg);
+      // Every fourth action is forged: its signature is another key's.
+      const bad = i % 4 === 3;
+      return { i, pk, p, msg, sig: bad ? await sign(null as any, keys[(i + 1) % keys.length], msg) : sig, ok: !bad || keys[(i + 1) % keys.length] === sk };
+    }),
+  );
+  const flat = acts.flatMap((a) => [BigInt(a.i % 11), BigInt(a.i), 256n, BigInt(a.i + 1), ...a.p, a.pk.x, a.pk.y, a.sig.s, a.sig.e]);
+  const out = await native.prepareActions(DS.ACTION, DS.MAUTH, domain, flat);
+  for (const [j, a] of acts.entries()) {
+    eq(out[3 * j], a.msg, 'prepared message');
+    eq(out[3 * j + 1], await refHash([DS.MAUTH, a.pk.x, a.pk.y]), 'prepared master authorization');
+    eq(out[3 * j + 2], a.ok ? 1n : 0n, 'prepared signature check');
+  }
+  const rk = md(randomField(), N);
+  const rpk = refMul(G, rk)!;
+  const items = acts.map((a, j) => [a.msg, BigInt(j + 1), 1_800_000_000n + BigInt(j)]);
+  const sigs = await native.signReceipts(DS.RECEIPT_SIG, domain, rk, randomField(), items.flat());
+  for (const [j, [msg, seq, at]] of items.entries()) {
+    const receipt = await refHash([DS.RECEIPT_SIG, domain, msg, seq, at]);
+    const sig = { s: sigs[2 * j], e: sigs[2 * j + 1] };
+    const r = refAdd(refMul(G, sig.s), refMul(rpk, sig.e))!;
+    eq(await refHash([SCHNORR_DST, r.x, rpk.x, rpk.y, receipt]), sig.e, 'receipt signature');
+  }
+  console.log(`the gateway's batch checks and receipt signatures agree (${checks} checks)`);
+}
+
 // ---- Timing ----
 function time(label: string, n: number, fn: (i: number) => unknown) {
   for (let i = 0; i < Math.min(n, 100); i++) fn(i);

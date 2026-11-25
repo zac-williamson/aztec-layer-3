@@ -14,6 +14,7 @@ const rpIdHash = (rpId: string) => BigInt(`0x${Buffer.from(sha256(new TextEncode
 import * as M from './model.ts';
 import type { ProtocolAccount } from './params.ts';
 import * as X from './rules.ts';
+import { JMap, NullBook, NullTree, Orders, Undo, isNullPath } from './journal.ts';
 import { type BookSibling, BookTree, MerkleTree } from './tree.ts';
 
 export type AccountRecord = { index: bigint; pub: M.AccountPub; priv: M.AccountPriv; kEnc: bigint };
@@ -23,7 +24,39 @@ export type OracleUpdate = { market: bigint; price: bigint; external: bigint; ti
  * An action as one of its account's keys signed it (SPEC.md §7.1): the master key (MASTER_KEY) or
  * a session-key slot. `seq` is the sequencer's number for it, assigned when it is sequenced.
  */
-export type SignedAction = { kind: bigint; account: bigint; keyId: bigint; nonce: bigint; p: bigint[]; sig: Sig; pk: { x: bigint; y: bigint }; seq?: bigint };
+export type SignedAction = {
+  kind: bigint;
+  account: bigint;
+  keyId: bigint;
+  nonce: bigint;
+  p: bigint[];
+  sig: Sig;
+  pk: { x: bigint; y: bigint };
+  seq?: bigint;
+  /**
+   * The gateway's checks, made before sequencing (P2.24): the action's message, its signer's
+   * master authorization and whether the signature verifies. The engine computes what is missing.
+   */
+  prepared?: { msg: bigint; masterAuth: bigint; ok: boolean };
+};
+/** One fill, maker by maker, as the sequencer reports it (P2.24). */
+export type FillEvent = { market: number; side: bigint; price: bigint; lots: bigint; maker: bigint; taker: bigint; makerLeft: bigint };
+/** What a sequenced action did, for its owner's execution report (P2.24). */
+export type Execution = { fills: FillEvent[]; rested?: { market: number; side: bigint; price: bigint; seq: bigint; lots: bigint } };
+type Scalars = {
+  markets: M.Market[];
+  feesPending: bigint;
+  insurancePending: bigint;
+  insuranceMicro: bigint;
+  lastSeq: bigint;
+  refreshCursor: bigint;
+  cycleStart: bigint;
+  numAccounts: bigint;
+  running: Running;
+  lengths: number[];
+};
+/** A sequencer-mode savepoint, or the witness builder's deep copy. */
+export type Snapshot = ({ lite: true; mark: number } & Scalars) | ReturnType<Engine['fullSnapshot']>;
 /** A receipt (SPEC.md §11): an action's message and sequence number, where its leaf sits in the batch. */
 export type Receipt = { msg: bigint; seq: bigint; segment: number; slot: number };
 /**
@@ -55,8 +88,21 @@ const LIQ_PER_SEGMENT = 2;
 const FILLS = 2;
 const CLIENT_PER_SEGMENT = SHAPE.MAX_CLIENT_PROOFS;
 const zeros = (n: number) => Array<string>(n).fill(hex(0n));
-const siblingsToNoir = (path: BookSibling[]) => path.map((s) => ({ hash: hex(s.hash), ask: s.ask.toString(), bid: s.bid.toString() }));
-const emptyBookPath = () => siblingsToNoir(Array.from({ length: M.BOOK_HEIGHT }, () => ({ hash: 0n, ask: 0n, bid: 0n })));
+const noirCache = new WeakMap<object, any>();
+/** A null tree's shared path is encoded once (sequencer mode keeps no Merkle state). */
+const cached = <T>(path: object, f: () => T): T => {
+  if (!isNullPath(path)) return f();
+  let c = noirCache.get(path);
+  if (!c) noirCache.set(path, (c = f()));
+  return c;
+};
+const siblingsToNoir = (path: BookSibling[]) => cached(path, () => path.map((s) => ({ hash: hex(s.hash), ask: s.ask.toString(), bid: s.bid.toString() })));
+const hexPath = (path: bigint[]): string[] => cached(path, () => path.map(hex));
+/** Sequencer mode's witness hasher: witnesses are never built there. */
+const zeroHash: M.H = async () => 0n;
+/** The empty book path's encoding, built once: every empty fill and probe slot shares it. */
+const EMPTY_BOOK_PATH = siblingsToNoir(Array.from({ length: M.BOOK_HEIGHT }, () => ({ hash: 0n, ask: 0n, bid: 0n })));
+const emptyBookPath = () => EMPTY_BOOK_PATH;
 const emptyOrder = () => ({ side: hex(0n), account_index: '0', lots: '0', expiry: '0', epoch: '0', display: false, reduce_only: false });
 const orderToNoir = (o: { side: bigint; account: bigint; lots: bigint; expiry: bigint; epoch: bigint; display?: boolean; reduceOnly?: boolean }) => ({
   side: hex(o.side),
@@ -84,7 +130,23 @@ const emptyOwnerActv = () => ({ actv: M.activityToNoir(M.newActivity()), actv_pa
 
 export class Engine {
   readonly api: Barretenberg;
+  /** The witness hasher: leaves, roots, DA and logs. Sequencer mode makes it return zero. */
   readonly h: M.H;
+  /**
+   * The hasher for the hashes that decide outcomes: signatures, signers' master authorizations,
+   * oracle messages, deposit openings and client proofs.
+   */
+  readonly hs: M.H;
+  /**
+   * Sequencer mode (P2.24, SPEC.md §5): the engine decides every action as the witness builder's
+   * engine will, but keeps no Merkle trees and builds no DA or witnesses, and applies each action,
+   * block or request atomically, undoing a refused one through `undo`.
+   */
+  readonly lite: boolean;
+  readonly undo = new Undo();
+  /** Called for every fill, maker by maker, and for an order that rests (the sequencer's execution reports). */
+  onFill?: (f: FillEvent) => void;
+  onRest?: (r: NonNullable<Execution['rested']>) => void;
   readonly params: M.Params;
   readonly vkTreeRoot: bigint;
   /**
@@ -96,8 +158,8 @@ export class Engine {
   accounts!: MerkleTree;
   activity!: MerkleTree;
   books: BookTree[] = [];
-  accts = new Map<bigint, AccountRecord>();
-  actv = new Map<bigint, M.Activity>();
+  accts = new JMap<bigint, AccountRecord>(this.undo);
+  actv = new JMap<bigint, M.Activity>(this.undo);
   markets: M.Market[] = [];
   refreshCursor = 0n;
   /** L3 time at which the refresh cursor last wrapped (SPEC.md §9.5). */
@@ -111,15 +173,15 @@ export class Engine {
   insurancePending = 0n;
   insuranceMicro = 0n;
   /** Resting orders, per market, by book index. */
-  orders: Map<bigint, BookOrder>[] = [];
+  orders: Orders<BookOrder>[] = [];
   /** Trigger trees and resting triggers, per market, by tree index (SPEC.md §6.5). */
   triggerTrees: BookTree[] = [];
-  triggers: Map<bigint, X.Trigger>[] = [];
+  triggers: JMap<bigint, X.Trigger>[] = [];
   /** Session keys per account: the slots in use and the account's keys tree (SPEC.md §6.4). */
-  keys = new Map<bigint, Map<number, M.Key>>();
-  keyTrees = new Map<bigint, MerkleTree>();
+  keys = new JMap<bigint, JMap<number, M.Key>>(this.undo);
+  keyTrees = new JMap<bigint, MerkleTree>(this.undo);
   /** Encryption keys the operator received at registration, by commitment (SPEC.md §10.1). */
-  keyring = new Map<bigint, bigint>();
+  keyring = new JMap<bigint, bigint>(this.undo);
   /** Actions the engine refused, with the reason (they were never sequenced). */
   rejected: Rejection[] = [];
   /**
@@ -135,9 +197,11 @@ export class Engine {
   wdRecords: bigint[] = [];
   segments: SegmentWitness[] = [];
 
-  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, clientVks: Record<string, bigint>) {
+  private constructor(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, clientVks: Record<string, bigint>, lite: boolean) {
     this.api = api;
-    this.h = M.hasher(api);
+    this.lite = lite;
+    this.hs = M.hasher(api);
+    this.h = lite ? zeroHash : this.hs;
     this.params = params;
     this.vkTreeRoot = vkTreeRoot;
     this.clientVks = new Map(Object.entries(clientVks));
@@ -147,16 +211,25 @@ export class Engine {
    * An engine at genesis, holding the protocol accounts (insurance at 0, fee at 1). Client-proof
    * actions need the build's client circuits (Prover.clientVks).
    */
-  static async create(api: Barretenberg, params: M.Params, vkTreeRoot: bigint, protocol: ProtocolAccount[], clientVks: Record<string, bigint> = {}): Promise<Engine> {
-    const e = new Engine(api, params, vkTreeRoot, clientVks);
-    await M.initModel(e.h);
-    e.accounts = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACCT_NODE).init();
-    e.activity = await new MerkleTree(e.h, M.ACCOUNTS_HEIGHT, M.DS.ACTV_NODE).init();
+  static async create(
+    api: Barretenberg,
+    params: M.Params,
+    vkTreeRoot: bigint,
+    protocol: ProtocolAccount[],
+    clientVks: Record<string, bigint> = {},
+    opts: { lite?: boolean } = {},
+  ): Promise<Engine> {
+    const e = new Engine(api, params, vkTreeRoot, clientVks, !!opts.lite);
+    await M.initModel(e.hs);
+    const tree = (height: number, ds: bigint) => (e.lite ? (new NullTree(height) as unknown as MerkleTree) : new MerkleTree(e.h, height, ds));
+    const book = () => (e.lite ? (new NullBook(M.BOOK_HEIGHT) as unknown as BookTree) : new BookTree(api, M.BOOK_HEIGHT));
+    e.accounts = tree(M.ACCOUNTS_HEIGHT, M.DS.ACCT_NODE);
+    e.activity = tree(M.ACCOUNTS_HEIGHT, M.DS.ACTV_NODE);
     for (let m = 0; m < M.MARKETS; m++) {
-      e.books.push(await new BookTree(api, M.BOOK_HEIGHT).init());
-      e.orders.push(new Map());
-      e.triggerTrees.push(await new BookTree(api, M.BOOK_HEIGHT).init());
-      e.triggers.push(new Map());
+      e.books.push(book());
+      e.orders.push(new Orders(e.undo));
+      e.triggerTrees.push(book());
+      e.triggers.push(new JMap(e.undo));
       e.markets.push(M.genesisMarket(e.books[m].root));
     }
     for (const [i, a] of protocol.entries()) {
@@ -170,7 +243,7 @@ export class Engine {
       await e.activity.set(idx, await M.activityHash(e.h, M.newActivity()));
     }
     e.numAccounts = BigInt(protocol.length);
-    e.domain = await M.domainOf(e.h, params);
+    e.domain = await M.domainOf(e.hs, params);
     return e;
   }
 
@@ -232,6 +305,7 @@ export class Engine {
   }
 
   private async absorb(x: bigint) {
+    if (this.lite) return;
     const [da, len] = await daAbsorb(this.api, this.running.da, this.running.daLen, x);
     this.running.da = da;
     this.running.daLen = len;
@@ -239,6 +313,7 @@ export class Engine {
   }
 
   private async emitCiphertexts(rec: AccountRecord, daNonce: bigint, pos: number) {
+    if (this.lite) return;
     const pt = M.plaintext(rec.priv);
     for (let i = 0; i < pt.length; i++) {
       await this.absorb((pt[i] + (await M.keystream(this.h, rec.kEnc, rec.index, daNonce, pos, i))) % R);
@@ -247,6 +322,7 @@ export class Engine {
 
   /** A change entry (public part unchanged). */
   private async emitChange(rec: AccountRecord, leaf: bigint, daNonce: bigint) {
+    if (this.lite) return;
     const pos = this.running.daLen;
     for (const x of [M.TAG.CHANGE, rec.index, leaf]) await this.absorb(x);
     await this.emitCiphertexts(rec, daNonce, pos);
@@ -254,6 +330,7 @@ export class Engine {
 
   /** A full entry with the public part in clear (registration, refresh). */
   private async emitFull(tag: bigint, rec: AccountRecord, leaf: bigint, daNonce: bigint) {
+    if (this.lite) return;
     const pos = this.running.daLen;
     for (const x of [tag, rec.index, leaf, rec.pub.owner, rec.pub.masterAuth, rec.pub.encCommitment, rec.pub.class]) await this.absorb(x);
     await this.emitCiphertexts(rec, daNonce, pos);
@@ -264,12 +341,35 @@ export class Engine {
    * [D1]); nothing for an undisplayed order. The entry never names the owner.
    */
   private async emitDisplay(m: number, o: { side: bigint; price: bigint; seq: bigint; display?: boolean }, lots: bigint) {
-    if (!o.display) return;
+    if (!o.display || this.lite) return;
     for (const x of [M.TAG.DISPLAY, M.displayKey(BigInt(m), o.side, o.price, o.seq), lots]) await this.absorb(x);
+  }
+
+  /**
+   * Replaces fields of an account record in place, as the record may be held elsewhere; in
+   * sequencer mode the step's rollback restores them. Records are changed only through here.
+   */
+  private setRec(rec: AccountRecord, patch: Partial<Pick<AccountRecord, 'pub' | 'priv' | 'kEnc'>>) {
+    if (this.undo.active) {
+      const old = { pub: rec.pub, priv: rec.priv, kEnc: rec.kEnc };
+      this.undo.push(() => Object.assign(rec, old));
+    }
+    Object.assign(rec, patch);
+  }
+
+  /** An account's leaf in the activity tree; witness-only, so sequencer mode skips it. */
+  private async writeActivity(index: bigint, act: M.Activity) {
+    if (this.lite) return;
+    await this.activity.set(index, await M.activityHash(this.h, act));
   }
 
   /** Writes an account's new private part with the blind for the current DA position. */
   private async writeAccount(rec: AccountRecord, priv: M.AccountPriv, daNonce: bigint) {
+    if (this.lite) {
+      // The blind only enters the leaf and the DA, which sequencer mode does not build.
+      this.setRec(rec, { priv: { ...priv, blind: 0n } });
+      return 0n;
+    }
     rec.priv = { ...priv, blind: await M.blindOf(this.h, rec.kEnc, rec.index, daNonce, this.running.daLen) };
     const leaf = await M.accountLeaf(this.h, rec.pub, rec.priv);
     await this.accounts.set(rec.index, leaf);
@@ -288,6 +388,7 @@ export class Engine {
   }
 
   private async finishSegment(pkg: string, label: string, inputs: Record<string, unknown>, receiptLeaves?: bigint[], clientProofs?: ClientProof[]) {
+    if (this.lite) return;
     this.running.state = await this.trees();
     const receiptsRoot = receiptLeaves ? await this.h([DS0.RECEIPT_NODE, receiptLeaves[0], receiptLeaves[1]]) : 0n;
     this.segments.push({ pkg, label, inputs, expectedEnd: copyRunning(this.running), receiptsRoot, receiptLeaves, clientProofs });
@@ -321,7 +422,7 @@ export class Engine {
         order: orderToNoir(best),
         path: siblingsToNoir(this.books[m].path(index)),
         owner_actv: M.activityToNoir(this.actv.get(best.account)!),
-        owner_actv_path: this.activity.path(best.account).map(hex),
+        owner_actv_path: hexPath(this.activity.path(best.account)),
       },
     };
   }
@@ -357,10 +458,8 @@ export class Engine {
       const dead: { market: number; index: bigint; o: X.Order }[] = [];
       for (const m of new Set(markets)) {
         for (const side of [M.SIDE.BID, M.SIDE.ASK]) {
-          const ranked = [...this.orders[m].entries()]
-            .filter(([, o]) => o.side === side)
-            .sort(([a], [b]) => (side === M.SIDE.ASK ? (a < b ? -1 : 1) : a > b ? -1 : 1));
-          for (const [index, o] of ranked) {
+          for (const index of this.orders[m].ranked(side)) {
+            const o = this.orders[m].get(index)!;
             if (!this.dead(o, time)) break;
             dead.push({ market: m, index, o });
           }
@@ -374,6 +473,10 @@ export class Engine {
 
   /** Block segment: opens an L3 block at `time`, with up to four signed index updates. */
   async block(time: bigint, updates: OracleUpdate[] = []) {
+    return this.atomic(() => this.blockImpl(time, updates));
+  }
+
+  private async blockImpl(time: bigint, updates: OracleUpdate[] = []) {
     if (updates.length && !this.relax.has('cleanup')) await this.clearTops(time, updates.map((u) => Number(u.market)));
     assert(updates.length <= UPDATES_PER_BLOCK, 'too many updates for one block segment');
     const start = copyRunning(this.running);
@@ -387,12 +490,12 @@ export class Engine {
       const m = Number(u.market);
       const mp = this.params.markets[m];
       assert(m < M.MARKETS && mp.imrPpm > 0n, 'market not listed');
-      const msg = await M.oracleMessage(this.h, this.domain, u.market, u.price, u.external, u.time);
+      const msg = await M.oracleMessage(this.hs, this.domain, u.market, u.price, u.external, u.time);
       let count = 0n;
       for (let j = 0; j < M.N_ORACLES; j++) {
         const s = u.sigs[j];
         if (!s) continue;
-        assert(await verify(this.h, { x: this.params.oraclePkX[j], y: this.params.oraclePkY[j] }, s, msg), `bad oracle signature ${j}`);
+        assert(await verify(this.hs, { x: this.params.oraclePkX[j], y: this.params.oraclePkY[j] }, s, msg), `bad oracle signature ${j}`);
         count++;
       }
       if (!this.relax.has('oracle-sigs')) assert(count >= this.params.oracleK, 'not enough oracle signatures');
@@ -452,6 +555,10 @@ export class Engine {
    * per seg_forced segment.
    */
   async priority(reqs: M.Request[]) {
+    return this.atomic(() => this.priorityImpl(reqs));
+  }
+
+  private async priorityImpl(reqs: M.Request[]) {
     const needsBook = (q: M.Request) => q.kind === M.KIND.FORCED_CLOSE || q.kind === M.KIND.FORCED_CANCEL_ALL;
     let i = 0;
     while (i < reqs.length) {
@@ -514,13 +621,13 @@ export class Engine {
       const rec: AccountRecord = { index: idx, pub: { owner: q.sender, masterAuth: q.a, encCommitment: q.b, class: M.CLASS.USER }, priv: M.emptyPriv(), kEnc };
       Object.assign(item, {
         account_index: idx.toString(),
-        acct_path: this.accounts.path(idx).map(hex),
-        actv_path: this.activity.path(idx).map(hex),
+        acct_path: hexPath(this.accounts.path(idx)),
+        actv_path: hexPath(this.activity.path(idx)),
         k_enc: hex(kEnc),
       });
       const leaf = await this.writeAccount(rec, M.emptyPriv(), daNonce);
       const act = M.newActivity();
-      await this.activity.set(idx, await M.activityHash(this.h, act));
+      await this.writeActivity(idx, act);
       this.accts.set(idx, rec);
       this.actv.set(idx, act);
       await this.initKeys(idx);
@@ -535,7 +642,7 @@ export class Engine {
     // delivery at deposit time (SPEC.md §10.3).
     const opening = q.deposit;
     assert(opening !== undefined, `no opening for the deposit committed in ${hex(q.b)}`);
-    assert((await M.depositCommitment(this.h, opening.amount, opening.salt)) === q.b, 'deposit opening does not match its commitment');
+    assert((await M.depositCommitment(this.hs, opening.amount, opening.salt)) === q.b, 'deposit opening does not match its commitment');
     const amount = opening.amount;
     Object.assign(item, { dep_amount: amount.toString(), dep_salt: hex(opening.salt) });
     const rec = q.a < this.numAccounts ? this.accts.get(q.a)! : undefined;
@@ -546,7 +653,7 @@ export class Engine {
         account_index: q.a.toString(),
         acct_pub: M.pubToNoir(rec.pub),
         acct_priv: M.privToNoir(rec.priv),
-        acct_path: this.accounts.path(q.a).map(hex),
+        acct_path: hexPath(this.accounts.path(q.a)),
         k_enc: hex(rec.kEnc),
       });
     }
@@ -578,19 +685,18 @@ export class Engine {
       account_index: q.a.toString(),
       acct_pub: M.pubToNoir(rec.pub),
       acct_priv: M.privToNoir(rec.priv),
-      acct_path: this.accounts.path(q.a).map(hex),
+      acct_path: hexPath(this.accounts.path(q.a)),
       actv: M.activityToNoir(act),
-      actv_path: this.activity.path(q.a).map(hex),
+      actv_path: hexPath(this.activity.path(q.a)),
       k_enc: hex(kEnc ?? 0n),
     });
     if (rec.pub.owner !== q.sender && !this.relax.has('rekey-owner')) return item;
     assert(kEnc !== undefined, `no encryption key delivered for commitment ${hex(c)}`);
-    rec.pub = { ...rec.pub, masterAuth: q.b, encCommitment: c };
-    rec.kEnc = kEnc;
+    this.setRec(rec, { pub: { ...rec.pub, masterAuth: q.b, encCommitment: c }, kEnc });
     const leaf = await this.writeAccount(rec, rec.priv, daNonce);
     const nact = { ...this.voidOrders(act), keyEpoch: act.keyEpoch + 1n };
     this.actv.set(q.a, nact);
-    await this.activity.set(q.a, await M.activityHash(this.h, nact));
+    await this.writeActivity(q.a, nact);
     await this.emitFull(M.TAG.FULL, rec, leaf, daNonce);
     return item;
   }
@@ -605,8 +711,8 @@ export class Engine {
       acct_pub: M.pubToNoir(rec.pub),
       acct_priv: M.privToNoir(rec.priv),
       actv: M.activityToNoir(act),
-      actv_path: this.activity.path(q.a).map(hex),
-      acct_path: this.accounts.path(q.a).map(hex),
+      actv_path: hexPath(this.activity.path(q.a)),
+      acct_path: hexPath(this.accounts.path(q.a)),
       k_enc: hex(rec.kEnc),
     });
     let amount = 0n;
@@ -689,10 +795,10 @@ export class Engine {
         effect = `voided ${act.openOrders} orders`;
         act = this.voidOrders(act);
       }
-      w.actv_path = this.activity.path(idx).map(hex);
+      w.actv_path = hexPath(this.activity.path(idx));
       this.actv.set(idx, act);
-      await this.activity.set(idx, await M.activityHash(this.h, act));
-      w.acct_path = this.accounts.path(idx).map(hex);
+      await this.writeActivity(idx, act);
+      w.acct_path = hexPath(this.accounts.path(idx));
       if (traded) {
         const leaf = await this.writeAccount(rec, priv, daNonce);
         await this.emitChange(rec, leaf, daNonce);
@@ -709,10 +815,10 @@ export class Engine {
     return {
       pub_part: M.pubToNoir(rec.pub),
       priv_part: M.privToNoir(rec.priv),
-      path: this.accounts.path(rec.index).map(hex),
+      path: hexPath(this.accounts.path(rec.index)),
       k_enc: hex(rec.kEnc),
       actv: M.activityToNoir(this.actv.get(rec.index)!),
-      actv_path: this.activity.path(rec.index).map(hex),
+      actv_path: hexPath(this.activity.path(rec.index)),
     };
   }
 
@@ -738,6 +844,10 @@ export class Engine {
    * relaxed ('cleanup').
    */
   async maintenance(opts: { sweep?: boolean; refresh?: number; clean?: { market: number; index: bigint }[]; tiers?: { account: bigint; tier: bigint }[] }) {
+    return this.atomic(() => this.maintenanceImpl(opts));
+  }
+
+  private async maintenanceImpl(opts: { sweep?: boolean; refresh?: number; clean?: { market: number; index: bigint }[]; tiers?: { account: bigint; tier: bigint }[] }) {
     const n = opts.refresh ?? 0;
     const clean = opts.clean ?? [];
     const tiers = opts.tiers ?? [];
@@ -762,7 +872,7 @@ export class Engine {
         order: orderToNoir(o),
         path: siblingsToNoir(this.books[c.market].path(c.index)),
         owner_actv: M.activityToNoir(owner),
-        owner_actv_path: this.activity.path(o.account).map(hex),
+        owner_actv_path: hexPath(this.activity.path(o.account)),
       });
       await this.books[c.market].set(c.index, 0n, 0n, 0n);
       this.orders[c.market].delete(c.index);
@@ -776,7 +886,7 @@ export class Engine {
         }
         nact.openOrders -= 1n;
         this.actv.set(o.account, nact);
-        await this.activity.set(o.account, await M.activityHash(this.h, nact));
+        await this.writeActivity(o.account, nact);
       }
       const msg = await this.h([M.DS.CLEAN, BigInt(c.market), o.side, o.price, o.seq]);
       this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, msg, M.LOG.CLEANUP);
@@ -787,10 +897,10 @@ export class Engine {
       const act = this.actv.get(c.account);
       assert(act, 'no such account');
       assert(c.tier < BigInt(M.FEE_TIERS) || this.relax.has('tiers'), 'fee tier');
-      tierChanges.push({ account_index: c.account.toString(), tier: c.tier.toString(), actv: M.activityToNoir(act), actv_path: this.activity.path(c.account).map(hex) });
+      tierChanges.push({ account_index: c.account.toString(), tier: c.tier.toString(), actv: M.activityToNoir(act), actv_path: hexPath(this.activity.path(c.account)) });
       const nact = { ...M.copyActivity(act), feeTier: c.tier };
       this.actv.set(c.account, nact);
-      await this.activity.set(c.account, await M.activityHash(this.h, nact));
+      await this.writeActivity(c.account, nact);
       this.running.actionLog = await M.logAppend(this.h, this.running.actionLog, await this.h([M.DS.TIER, c.account, c.tier]), M.LOG.TIER);
     }
     const daNonce = await M.segmentNonce(this.h, start.batch, this.running.actionLog, start.daLen);
@@ -858,19 +968,75 @@ export class Engine {
     return this.maintenance({ refresh: n });
   }
 
+  // ---- Sequencer mode (P2.24) ----
+
+  /**
+   * Runs `f` as one step. In sequencer mode, if it throws, everything it changed is undone; a
+   * step inside another rolls back to its own savepoint. The witness builder's engine runs `f`
+   * as it is: it only replays steps the sequencer applied.
+   */
+  async atomic<T>(f: () => Promise<T>): Promise<T> {
+    if (!this.lite) return f();
+    const outer = !this.undo.active;
+    if (outer) this.undo.begin();
+    const sp = this.snapshot();
+    try {
+      const v = await f();
+      if (outer) this.undo.commit();
+      return v;
+    } catch (e) {
+      this.restore(sp);
+      if (outer) this.undo.commit();
+      throw e;
+    }
+  }
+
+  /**
+   * Sequencer mode: applies one signed action atomically, giving it the next sequence number
+   * (SPEC.md §11), or refuses it with nothing changed by throwing the reason. Returns its fills and
+   * where its remainder rests.
+   */
+  async sequence(a: SignedAction): Promise<Execution> {
+    if (!this.lite) throw new Error('sequence() is for sequencer mode');
+    const x: Execution = { fills: [] };
+    this.onFill = (f) => x.fills.push(f);
+    this.onRest = (r) => (x.rested = r);
+    try {
+      await this.atomic(async () => {
+        a.seq = this.lastSeq + 1n;
+        await this.execAction(a, 0n);
+        this.lastSeq = a.seq;
+      });
+      return x;
+    } finally {
+      this.onFill = undefined;
+      this.onRest = undefined;
+    }
+  }
+
   // ---- Trading (seg_trade, SPEC.md §8) ----
 
-  snapshot() {
+  snapshot(): Snapshot {
+    if (this.lite) {
+      if (!this.undo.active) throw new Error('sequencer mode snapshots only inside an atomic step');
+      return { lite: true, mark: this.undo.savepoint(), ...this.scalars() };
+    }
+    return this.fullSnapshot();
+  }
+
+  /** A deep copy of the whole state (the witness builder's engine). */
+  fullSnapshot() {
     return {
+      lite: false as const,
       accounts: this.accounts.snapshot(),
       activity: this.activity.snapshot(),
       books: this.books.map((b) => b.snapshot()),
       triggerTrees: this.triggerTrees.map((b) => b.snapshot()),
-      triggers: this.triggers.map((t) => new Map([...t].map(([k, v]) => [k, { ...v }]))),
-      accts: new Map([...this.accts].map(([k, v]) => [k, { ...v, pub: { ...v.pub }, priv: M.copyPriv(v.priv) }])),
-      actv: new Map([...this.actv].map(([k, v]) => [k, M.copyActivity(v)])),
-      orders: this.orders.map((o) => new Map([...o].map(([k, v]) => [k, { ...v }]))),
-      keys: new Map([...this.keys].map(([k, v]) => [k, new Map([...v].map(([i, x]) => [i, { ...x }]))])),
+      triggers: this.triggers.map((t) => new JMap(this.undo, [...t].map(([k, v]) => [k, { ...v }] as const))),
+      accts: new JMap(this.undo, [...this.accts].map(([k, v]) => [k, { ...v, pub: { ...v.pub }, priv: M.copyPriv(v.priv) }] as const)),
+      actv: new JMap(this.undo, [...this.actv].map(([k, v]) => [k, M.copyActivity(v)] as const)),
+      orders: this.orders.map((o) => o.clone()),
+      keys: new JMap(this.undo, [...this.keys].map(([k, v]) => [k, new JMap(this.undo, [...v].map(([i, x]) => [i, { ...x }] as const))] as const)),
       keyTrees: new Map([...this.keyTrees].map(([k, t]) => [k, t.snapshot()])),
       markets: this.markets.map((m) => ({ ...m })),
       feesPending: this.feesPending,
@@ -886,7 +1052,42 @@ export class Engine {
     };
   }
 
-  restore(s: ReturnType<Engine['snapshot']>) {
+  /** The scalars, markets and batch-building state a sequencer-mode savepoint restores. */
+  private scalars(): Scalars {
+    return {
+      markets: this.markets.map((m) => ({ ...m })),
+      feesPending: this.feesPending,
+      insurancePending: this.insurancePending,
+      insuranceMicro: this.insuranceMicro,
+      lastSeq: this.lastSeq,
+      refreshCursor: this.refreshCursor,
+      cycleStart: this.cycleStart,
+      numAccounts: this.numAccounts,
+      running: this.running ? copyRunning(this.running) : this.running,
+      lengths: [this.receipts.length, this.daPayload.length, this.wdRecords.length, this.segments.length, this.rejected.length],
+    };
+  }
+
+  restore(s: Snapshot) {
+    if (s.lite) {
+      this.undo.rollbackTo(s.mark);
+      this.markets = s.markets.map((m) => ({ ...m }));
+      this.feesPending = s.feesPending;
+      this.insurancePending = s.insurancePending;
+      this.insuranceMicro = s.insuranceMicro;
+      this.lastSeq = s.lastSeq;
+      this.refreshCursor = s.refreshCursor;
+      this.cycleStart = s.cycleStart;
+      this.numAccounts = s.numAccounts;
+      this.running = s.running ? copyRunning(s.running) : s.running;
+      const [rc, da, wd, sg, rj] = s.lengths;
+      this.receipts.length = rc;
+      this.daPayload.length = da;
+      this.wdRecords.length = wd;
+      this.segments.length = sg;
+      this.rejected.length = rj;
+      return;
+    }
     this.accounts.restore(s.accounts);
     this.activity.restore(s.activity);
     this.books.forEach((b, i) => b.restore(s.books[i]));
@@ -920,6 +1121,16 @@ export class Engine {
    * in `rejected`, as a gateway would refuse it before sequencing.
    */
   async trade(actions: SignedAction[]) {
+    if (this.lite) {
+      for (const a of actions) {
+        try {
+          await this.sequence(a);
+        } catch (e: any) {
+          this.rejected.push({ action: a, reason: String(e.message ?? e) });
+        }
+      }
+      return;
+    }
     const queue = [...actions];
     while (queue.length) {
       // Fill a segment from the queue; a rejected action is dropped and its slot refilled.
@@ -1059,6 +1270,10 @@ export class Engine {
    * it before aggregating its proof.
    */
   async proven(actions: ProvenAction[]) {
+    return this.atomic(() => this.provenImpl(actions));
+  }
+
+  private async provenImpl(actions: ProvenAction[]) {
     const queue = [...actions];
     while (queue.length) await this.provenSegment(queue);
   }
@@ -1123,10 +1338,10 @@ export class Engine {
     const rec = this.accts.get(account);
     const oldAct = this.actv.get(account);
     if (!rec || !oldAct) throw new Error('account');
-    if (!this.relax.has('client-auth') && (await M.masterAuthP(this.h, vkHash, binding)) !== rec.pub.masterAuth) {
+    if (!this.relax.has('client-auth') && (await M.masterAuthP(this.hs, vkHash, binding)) !== rec.pub.masterAuth) {
       throw new Error('client proof does not control the account');
     }
-    if (msg !== (await X.actionMsg(this.h, this.domain, a.kind, account, M.MASTER_KEY, a.nonce, a.p))) throw new Error('proof authorizes another action');
+    if (msg !== (await X.actionMsg(this.hs, this.domain, a.kind, account, M.MASTER_KEY, a.nonce, a.p))) throw new Error('proof authorizes another action');
     if (oldAct.nonce + 1n !== a.nonce) throw new Error('nonce');
     const { ADD_KEY, REVOKE_KEY, WITHDRAW } = X.KIND_ACT;
     if (a.kind !== ADD_KEY && a.kind !== REVOKE_KEY && a.kind !== WITHDRAW) throw new Error('client proofs only manage session keys and withdraw');
@@ -1178,12 +1393,7 @@ export class Engine {
 
   /** The best resting order on `side` of market m: the lowest ask or the highest bid (SPEC.md §6.5). */
   private best(m: number, side: bigint): BookOrder | undefined {
-    let best: [bigint, BookOrder] | undefined;
-    for (const [idx, o] of this.orders[m]) {
-      if (o.side !== side) continue;
-      if (!best || (side === M.SIDE.ASK ? idx < best[0] : idx > best[0])) best = [idx, o];
-    }
-    return best?.[1];
+    return this.orders[m].bestOn(side);
   }
 
   private crosses(side: bigint, price: bigint, o: BookOrder | undefined) {
@@ -1199,8 +1409,8 @@ export class Engine {
 
   /** Gives a new account an empty keys tree. */
   private async initKeys(index: bigint) {
-    this.keys.set(index, new Map());
-    this.keyTrees.set(index, await new MerkleTree(this.h, M.KEYS_HEIGHT, M.DS.KEY_NODE).init());
+    this.keys.set(index, new JMap(this.undo));
+    this.keyTrees.set(index, this.lite ? (new NullTree(M.KEYS_HEIGHT) as unknown as MerkleTree) : await new MerkleTree(this.h, M.KEYS_HEIGHT, M.DS.KEY_NODE).init());
   }
 
   keyOf(account: bigint, slot: number): M.Key {
@@ -1218,13 +1428,15 @@ export class Engine {
     const rec = this.accts.get(a.account);
     const oldAct = this.actv.get(a.account);
     if (!rec || !oldAct) throw new Error('no such account');
-    const msg = await X.actionMsg(this.h, this.domain, a.kind, a.account, a.keyId, a.nonce, a.p);
+    // The gateway's checks when it made them (P2.24); otherwise the engine's own.
+    const msg = a.prepared?.msg ?? (await X.actionMsg(this.hs, this.domain, a.kind, a.account, a.keyId, a.nonce, a.p));
+    const signed = async () => a.prepared?.ok ?? (await verify(this.hs, a.pk, a.sig, msg));
     // Authorization (SPEC.md §7.2): the master key, or a session key within its scope.
     const act = M.copyActivity(oldAct);
-    let keyWitness = { key: M.keyToNoir(M.emptyKey()), key_path: zeros(M.KEYS_HEIGHT) };
+    let keyWitness: { key: unknown; key_path: string[] } | undefined;
     if (a.keyId === M.MASTER_KEY) {
-      if ((await M.masterAuthOf(this.h, a.pk.x, a.pk.y)) !== rec.pub.masterAuth) throw new Error("signing key is not the account's");
-      if (!(await verify(this.h, a.pk, a.sig, msg))) throw new Error('bad signature');
+      if ((a.prepared?.masterAuth ?? (await M.masterAuthOf(this.hs, a.pk.x, a.pk.y))) !== rec.pub.masterAuth) throw new Error("signing key is not the account's");
+      if (!(await signed())) throw new Error('bad signature');
       if (oldAct.nonce + 1n !== a.nonce) throw new Error('nonce');
       act.nonce = a.nonce;
     } else {
@@ -1232,7 +1444,7 @@ export class Engine {
       if (a.keyId < 0n || slot >= M.KEY_SLOTS) throw new Error('key slot');
       const key = this.keyOf(a.account, slot);
       if (key.pkX !== a.pk.x || key.pkY !== a.pk.y || (a.pk.x === 0n && a.pk.y === 0n)) throw new Error("signing key is not the slot's");
-      if (!(await verify(this.h, a.pk, a.sig, msg))) throw new Error('bad signature');
+      if (!(await signed())) throw new Error('bad signature');
       if (key.nonce + 1n !== a.nonce) throw new Error('nonce');
       if (this.running.time > key.expiry) throw new Error('session key expired');
       if (key.epoch !== oldAct.keyEpoch && !this.relax.has('revoked-keys')) throw new Error('session key revoked by a rekey');
@@ -1240,8 +1452,13 @@ export class Engine {
       if (![PLACE, CANCEL, MODIFY, CANCEL_ALL, PLACE_TRIGGER, CANCEL_TRIGGER].includes(a.kind as any)) throw new Error('session keys only place, cancel, modify and cancel all');
       if (a.kind !== CANCEL_ALL && (a.p[0] >= BigInt(M.MARKETS) || ((key.marketMask >> a.p[0]) & 1n) !== 1n)) throw new Error('market not allowed for the session key');
       if ((a.kind === PLACE || a.kind === PLACE_TRIGGER) && a.p[2] * a.p[3] > key.maxNotional) throw new Error("order above the session key's notional limit");
-      keyWitness = { key: M.keyToNoir(key), key_path: this.keyTrees.get(a.account)!.path(BigInt(slot)).map(hex) };
+      if (!this.lite) keyWitness = { key: M.keyToNoir(key), key_path: hexPath(this.keyTrees.get(a.account)!.path(BigInt(slot))) };
       act.keysRoot = await this.writeKey(a.account, slot, { ...key, nonce: a.nonce });
+    }
+    if (this.lite) {
+      // Sequencer mode builds no witness: the same rules, then nothing to return.
+      await this.dispatch(a, rec, oldAct, act, daNonce);
+      return {};
     }
     const common = {
       kind: hex(a.kind),
@@ -1252,20 +1469,25 @@ export class Engine {
       pk_x: hex(a.pk.x),
       pk_y: hex(a.pk.y),
       sig: sigToNoir(a.sig),
-      ...keyWitness,
+      ...(keyWitness ?? { key: M.keyToNoir(M.emptyKey()), key_path: zeros(M.KEYS_HEIGHT) }),
       taker_pub: M.pubToNoir(rec.pub),
       taker_priv: M.privToNoir(rec.priv),
       taker_k_enc: hex(rec.kEnc),
       taker_actv: M.activityToNoir(oldAct),
     };
-    if (a.kind === X.KIND_ACT.PLACE) return { ...this.emptyAction(), ...common, ...(await this.execPlace(a, rec, oldAct, act, daNonce)) };
-    if (a.kind === X.KIND_ACT.CANCEL || a.kind === X.KIND_ACT.MODIFY) return { ...this.emptyAction(), ...common, ...(await this.execCancel(a, act)) };
-    if (a.kind === X.KIND_ACT.WITHDRAW) return { ...this.emptyAction(), ...common, ...(await this.execWithdraw(a, rec, act, daNonce)) };
-    if (a.kind === X.KIND_ACT.TRANSFER) return { ...this.emptyAction(), ...common, ...(await this.execTransfer(a, rec, act, daNonce)) };
-    if (a.kind === X.KIND_ACT.CANCEL_ALL) return { ...this.emptyAction(), ...common, ...(await this.execCancelAll(a, act)) };
-    if (a.kind === X.KIND_ACT.ADD_KEY || a.kind === X.KIND_ACT.REVOKE_KEY) return { ...this.emptyAction(), ...common, ...(await this.execSetKey(a, act)) };
-    if (a.kind === X.KIND_ACT.PLACE_TRIGGER || a.kind === X.KIND_ACT.CANCEL_TRIGGER) return { ...this.emptyAction(), ...common, ...(await this.execTrigger(a, act)) };
-    if (a.kind === X.KIND_ACT.SET_MASTER_AUTH) return { ...this.emptyAction(), ...common, ...(await this.execSetMasterAuth(a, rec, act, daNonce)) };
+    return { ...this.emptyAction(), ...common, ...(await this.dispatch(a, rec, oldAct, act, daNonce)) };
+  }
+
+  /** The rules of each kind of signed action, after its authorization. */
+  private async dispatch(a: SignedAction, rec: AccountRecord, oldAct: M.Activity, act: M.Activity, daNonce: bigint): Promise<Record<string, unknown>> {
+    if (a.kind === X.KIND_ACT.PLACE) return this.execPlace(a, rec, oldAct, act, daNonce);
+    if (a.kind === X.KIND_ACT.CANCEL || a.kind === X.KIND_ACT.MODIFY) return this.execCancel(a, act);
+    if (a.kind === X.KIND_ACT.WITHDRAW) return this.execWithdraw(a, rec, act, daNonce);
+    if (a.kind === X.KIND_ACT.TRANSFER) return this.execTransfer(a, rec, act, daNonce);
+    if (a.kind === X.KIND_ACT.CANCEL_ALL) return this.execCancelAll(a, act);
+    if (a.kind === X.KIND_ACT.ADD_KEY || a.kind === X.KIND_ACT.REVOKE_KEY) return this.execSetKey(a, act);
+    if (a.kind === X.KIND_ACT.PLACE_TRIGGER || a.kind === X.KIND_ACT.CANCEL_TRIGGER) return this.execTrigger(a, act);
+    if (a.kind === X.KIND_ACT.SET_MASTER_AUTH) return this.execSetMasterAuth(a, rec, act, daNonce);
     throw new Error('unknown action kind');
   }
 
@@ -1279,7 +1501,7 @@ export class Engine {
     if (a.p[0] < 0n || m >= M.MARKETS) throw new Error('market');
     const mk = this.markets[m];
     const witness: Record<string, unknown> = {};
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     if (a.kind === X.KIND_ACT.PLACE_TRIGGER) {
       const [, side, limit, lots, dir, price, p6, p7] = a.p;
       if (this.params.markets[m].imrPpm === 0n) throw new Error('market not listed');
@@ -1307,9 +1529,9 @@ export class Engine {
       this.triggers[m].delete(index);
     }
     mk.triggerRoot = this.triggerTrees[m].root;
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, act);
-    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    await this.writeActivity(a.account, act);
     return { taker_acct_path: acctPath, taker_actv_path: actvPath, ...witness };
   }
 
@@ -1329,6 +1551,10 @@ export class Engine {
 
   /** Fires the triggers due in the given markets, one seg_trigger segment each, until none is. */
   async fireTriggers(markets: number[] = [...Array(M.MARKETS).keys()]) {
+    return this.atomic(() => this.fireTriggersImpl(markets));
+  }
+
+  private async fireTriggersImpl(markets: number[] = [...Array(M.MARKETS).keys()]) {
     for (const m of markets) {
       for (let guard = 0; this.markets[m].triggerPending; guard++) {
         assert(guard < 64, `trigger firing in market ${m} does not converge`);
@@ -1346,6 +1572,10 @@ export class Engine {
    * when the matching steps ran out.
    */
   async triggerSegment(m: number, index: bigint, t: X.Trigger) {
+    return this.atomic(() => this.triggerSegmentImpl(m, index, t));
+  }
+
+  private async triggerSegmentImpl(m: number, index: bigint, t: X.Trigger) {
     const start = copyRunning(this.running);
     const before = this.state();
     const r = this.running;
@@ -1426,10 +1656,10 @@ export class Engine {
     const down = this.triggerTop(m, X.DIR.DOWN);
     this.markets[m].triggerPending = X.due(up.price, down.price, this.markets[m].markPrice);
     Object.assign(w, { up: up.witness, down: down.witness });
-    w.actv_path = this.activity.path(t.account).map(hex);
+    w.actv_path = hexPath(this.activity.path(t.account));
     this.actv.set(t.account, act);
-    await this.activity.set(t.account, await M.activityHash(this.h, act));
-    w.acct_path = this.accounts.path(t.account).map(hex);
+    await this.writeActivity(t.account, act);
+    w.acct_path = hexPath(this.accounts.path(t.account));
     if (traded) {
       const leaf = await this.writeAccount(rec, priv, daNonce);
       await this.emitChange(rec, leaf, daNonce);
@@ -1443,7 +1673,7 @@ export class Engine {
     const slot = Number(a.p[0]);
     if (a.p[0] < 0n || slot >= M.KEY_SLOTS) throw new Error('key slot');
     const old = this.keyOf(a.account, slot);
-    const keyPath = this.keyTrees.get(a.account)!.path(BigInt(slot)).map(hex);
+    const keyPath = hexPath(this.keyTrees.get(a.account)!.path(BigInt(slot)));
     let k: M.Key;
     if (a.kind === X.KIND_ACT.ADD_KEY) {
       if (a.p[3] >= 1n << 32n || a.p[4] >= 1n << 64n || a.p[5] >= 1n << 64n) throw new Error('key parameters out of range');
@@ -1452,11 +1682,11 @@ export class Engine {
     } else {
       k = { ...M.emptyKey(), nonce: old.nonce, epoch: old.epoch };
     }
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     act.keysRoot = await this.writeKey(a.account, slot, k);
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, act);
-    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    await this.writeActivity(a.account, act);
     return { key: M.keyToNoir(old), key_path: keyPath, taker_acct_path: acctPath, taker_actv_path: actvPath };
   }
 
@@ -1512,6 +1742,7 @@ export class Engine {
         this.orders[m].set(slot, o);
         await this.emitDisplay(m, o, remaining);
         this.markets[m].nextSeq = seq + 1n;
+        this.onRest?.({ market: m, side, price, seq, lots: remaining });
         // A reduce-only order holds no open lots: it can never add exposure.
         if (!o.reduceOnly) {
           if (side === M.SIDE.BID) act.openBid[m] += remaining;
@@ -1523,14 +1754,14 @@ export class Engine {
     }
     this.markets[m].bookRoot = book.root;
 
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     if (traded) {
       const leaf = await this.writeAccount(rec, taker, daNonce);
       await this.emitChange(rec, leaf, daNonce);
     }
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, act);
-    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    await this.writeActivity(a.account, act);
 
     const wBefore = X.worst(sizeBefore, oldAct.openBid[m], oldAct.openAsk[m]);
     const wAfter = X.worst(rec.priv.positions[m].size, act.openBid[m], act.openAsk[m]);
@@ -1538,6 +1769,7 @@ export class Engine {
       if (!X.exposureFresh(rec.priv, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old for a risk-increasing order');
       if (!X.covers(X.equity(rec.priv, this.markets), X.initialMargin(rec.priv, act, this.markets, this.params))) throw new Error('insufficient margin');
     }
+    if (this.lite) return {};
     return {
       taker_acct_path: acctPath,
       taker_actv_path: actvPath,
@@ -1573,7 +1805,7 @@ export class Engine {
       if (postOnly) throw new Error('post-only order would take liquidity');
       const o = best!;
       const index = X.orderIndex(o.side, o.price, o.seq);
-      const fillWitness: any = { ...this.emptyFill(), index: hex(index), price: o.price.toString(), seq: o.seq.toString(), order: orderToNoir(o), book_path: siblingsToNoir(book.path(index)) };
+      const fillWitness: any = this.lite ? {} : { ...this.emptyFill(), index: hex(index), price: o.price.toString(), seq: o.seq.toString(), order: orderToNoir(o), book_path: siblingsToNoir(book.path(index)) };
       if (o.account === t.index) {
         // Self-trade prevention: the taker's own resting order is cancelled; only a live one still
         // counts toward its open lots.
@@ -1593,7 +1825,7 @@ export class Engine {
       if (o.epoch !== this.actv.get(o.account)!.epoch) {
         // A void order (its owner cancelled all since) is removed; the owner's activity is proved unchanged.
         const oact = this.actv.get(o.account)!;
-        Object.assign(fillWitness, { maker_actv: M.activityToNoir(oact), maker_actv_path: this.activity.path(o.account).map(hex) });
+        if (!this.lite) Object.assign(fillWitness, { maker_actv: M.activityToNoir(oact), maker_actv_path: hexPath(this.activity.path(o.account)) });
         await book.set(index, 0n, 0n, 0n);
         this.orders[m].delete(index);
         await this.emitDisplay(m, o, 0n);
@@ -1603,7 +1835,7 @@ export class Engine {
       if (X.expired(o, this.running.time)) {
         // An expired GTT order is removed instead of filled; its owner's open lots shrink.
         const oact = this.actv.get(o.account)!;
-        Object.assign(fillWitness, { maker_actv: M.activityToNoir(oact), maker_actv_path: this.activity.path(o.account).map(hex) });
+        if (!this.lite) Object.assign(fillWitness, { maker_actv: M.activityToNoir(oact), maker_actv_path: hexPath(this.activity.path(o.account)) });
         await book.set(index, 0n, 0n, 0n);
         this.orders[m].delete(index);
         await this.emitDisplay(m, o, 0n);
@@ -1614,19 +1846,19 @@ export class Engine {
         }
         nact.openOrders -= 1n;
         this.actv.set(o.account, nact);
-        await this.activity.set(o.account, await M.activityHash(this.h, nact));
+        await this.writeActivity(o.account, nact);
         fills.push(fillWitness);
         continue;
       }
       const maker = this.accts.get(o.account)!;
       const mact = this.actv.get(o.account)!;
-      Object.assign(fillWitness, {
+      if (!this.lite) Object.assign(fillWitness, {
         maker_pub: M.pubToNoir(maker.pub),
         maker_priv: M.privToNoir(maker.priv),
-        maker_acct_path: this.accounts.path(o.account).map(hex),
+        maker_acct_path: hexPath(this.accounts.path(o.account)),
         maker_k_enc: hex(maker.kEnc),
         maker_actv: M.activityToNoir(mact),
-        maker_actv_path: this.activity.path(o.account).map(hex),
+        maker_actv_path: hexPath(this.activity.path(o.account)),
       });
       fills.push(fillWitness);
       // A reduce-only order fills at most its owner's position on its other side and keeps at
@@ -1638,7 +1870,7 @@ export class Engine {
         await this.emitDisplay(m, o, 0n);
         const nact = { ...M.copyActivity(mact), openOrders: mact.openOrders - 1n };
         this.actv.set(o.account, nact);
-        await this.activity.set(o.account, await M.activityHash(this.h, nact));
+        await this.writeActivity(o.account, nact);
         continue;
       }
       const avail = o.reduceOnly && held < o.lots ? held : o.lots;
@@ -1671,7 +1903,7 @@ export class Engine {
       }
       if (left === 0n) nact.openOrders -= 1n;
       this.actv.set(maker.index, nact);
-      await this.activity.set(maker.index, await M.activityHash(this.h, nact));
+      await this.writeActivity(maker.index, nact);
 
       // Taker, in memory.
       if (!t.traded) {
@@ -1692,6 +1924,7 @@ export class Engine {
       notional += q * o.price;
       remaining -= q;
       this.markets[m] = M.recordPrint(this.markets[m], this.running.batch, o.price, q);
+      this.onFill?.({ market: m, side, price: o.price, lots: q, maker: o.account, taker: t.index, makerLeft: left });
     }
     if (this.markets[m].oiLong !== this.markets[m].oiShort) throw new Error('open interest out of balance');
     return { fills, remaining, notional };
@@ -1708,7 +1941,7 @@ export class Engine {
     if (!o || o.account !== a.account || o.epoch !== act.epoch) throw new Error('no such order');
     const lots = modify ? newLots : 0n;
     if (modify && !(lots > 0n && lots < o.lots)) throw new Error('a modification only reduces an order');
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     const restPath = siblingsToNoir(this.books[m].path(index));
     if (modify) {
       await this.books[m].set(index, await X.orderLeaf(this.h, side, a.account, lots, o.expiry, o.epoch, o.display, o.reduceOnly), X.askLots({ side, lots }), X.bidLots({ side, lots }));
@@ -1724,9 +1957,9 @@ export class Engine {
       if (side === M.SIDE.BID) nact.openBid[m] -= o.lots - lots;
       else nact.openAsk[m] -= o.lots - lots;
     }
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, nact);
-    await this.activity.set(a.account, await M.activityHash(this.h, nact));
+    await this.writeActivity(a.account, nact);
     return { taker_acct_path: acctPath, taker_actv_path: actvPath, rest_path: restPath, cancel_lots: o.lots.toString(), cancel_expiry: o.expiry.toString(), cancel_display: !!o.display, cancel_reduce_only: !!o.reduceOnly };
   }
 
@@ -1737,15 +1970,15 @@ export class Engine {
     if (old.collateral < amount) throw new Error('collateral below the amount');
     if (!X.exposureFresh(old, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old to move collateral');
     if (!X.covers(X.equity(old, this.markets) - amount, X.initialMargin(old, act, this.markets, this.params))) throw new Error('insufficient margin');
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     const leaf = await this.writeAccount(rec, { ...old, collateral: old.collateral - amount }, daNonce);
     await this.emitChange(rec, leaf, daNonce);
     const salt = await this.h([M.DS.WDSALT, rec.kEnc, this.running.batch, BigInt(this.running.withdrawalsCount)]);
     await this.appendWithdrawal(recipient, amount, salt);
     const nact: M.Activity = M.copyActivity(act);
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, nact);
-    await this.activity.set(a.account, await M.activityHash(this.h, nact));
+    await this.writeActivity(a.account, nact);
     return { taker_acct_path: acctPath, taker_actv_path: actvPath };
   }
 
@@ -1761,23 +1994,23 @@ export class Engine {
   private async execSetMasterAuth(a: SignedAction, rec: AccountRecord, act: M.Activity, daNonce: bigint) {
     if (a.p[0] === 0n) throw new Error('empty master authorization');
     if (a.p.slice(1).some((x) => x !== 0n)) throw new Error('master authorization payload');
-    const acctPath = this.accounts.path(a.account).map(hex);
-    rec.pub = { ...rec.pub, masterAuth: a.p[0] };
+    const acctPath = hexPath(this.accounts.path(a.account));
+    this.setRec(rec, { pub: { ...rec.pub, masterAuth: a.p[0] } });
     const leaf = await this.writeAccount(rec, rec.priv, daNonce);
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, act);
-    await this.activity.set(a.account, await M.activityHash(this.h, act));
+    await this.writeActivity(a.account, act);
     await this.emitFull(M.TAG.FULL, rec, leaf, daNonce);
     return { taker_acct_path: acctPath, taker_actv_path: actvPath };
   }
 
   /** CancelAll (seg_trade `cancel_all`): every order the account placed so far is void at once. */
   private async execCancelAll(a: SignedAction, act: M.Activity) {
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     const nact = this.voidOrders(act);
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, nact);
-    await this.activity.set(a.account, await M.activityHash(this.h, nact));
+    await this.writeActivity(a.account, nact);
     return { taker_acct_path: acctPath, taker_actv_path: actvPath };
   }
 
@@ -1794,17 +2027,17 @@ export class Engine {
     if (!X.exposureFresh(old, act, this.markets, this.params.maxAge, this.running.time)) throw new Error('index too old to move collateral');
     if (!X.covers(X.equity(old, this.markets) - amount, X.initialMargin(old, act, this.markets, this.params))) throw new Error('insufficient margin');
     if (dest.priv.collateral + amount >= X.MAX_COLLATERAL) throw new Error('collateral out of range');
-    const acctPath = this.accounts.path(a.account).map(hex);
+    const acctPath = hexPath(this.accounts.path(a.account));
     const leaf = await this.writeAccount(rec, { ...old, collateral: old.collateral - amount }, daNonce);
     await this.emitChange(rec, leaf, daNonce);
     const destPriv = M.privToNoir(dest.priv);
-    const destPath = this.accounts.path(to).map(hex);
+    const destPath = hexPath(this.accounts.path(to));
     const destLeaf = await this.writeAccount(dest, { ...dest.priv, collateral: dest.priv.collateral + amount }, daNonce);
     await this.emitChange(dest, destLeaf, daNonce);
     const nact: M.Activity = M.copyActivity(act);
-    const actvPath = this.activity.path(a.account).map(hex);
+    const actvPath = hexPath(this.activity.path(a.account));
     this.actv.set(a.account, nact);
-    await this.activity.set(a.account, await M.activityHash(this.h, nact));
+    await this.writeActivity(a.account, nact);
     return {
       taker_acct_path: acctPath,
       taker_actv_path: actvPath,
@@ -1882,6 +2115,10 @@ export class Engine {
    * throws: liquidations are the operator's own actions.
    */
   async liquidate(steps: LiqStep[]) {
+    return this.atomic(() => this.liquidateImpl(steps));
+  }
+
+  private async liquidateImpl(steps: LiqStep[]) {
     for (let i = 0; i < steps.length; i += LIQ_PER_SEGMENT) await this.liquidationSegment(steps.slice(i, i + LIQ_PER_SEGMENT));
   }
 
@@ -2029,7 +2266,7 @@ export class Engine {
       need(cpos.size !== 0n && cpos.size > 0n !== pos.size > 0n, 'counterparty not opposite');
       need(X.exposureFresh(insRec.priv, insAct, this.markets, this.params.maxAge, this.running.time), 'index too old for the insurance account');
       need(!insuranceCovers(X.takeover(a0, insRec.priv, this.markets[m], m).ins), 'insurance can absorb');
-      Object.assign(w, { ins_pub: M.pubToNoir(insRec.pub), ins_priv: M.privToNoir(insRec.priv), ins_path: this.accounts.path(M.INSURANCE_INDEX).map(hex) });
+      Object.assign(w, { ins_pub: M.pubToNoir(insRec.pub), ins_priv: M.privToNoir(insRec.priv), ins_path: hexPath(this.accounts.path(M.INSURANCE_INDEX)) });
       const market = this.markets[m];
       const q = X.abs(pos.size) < X.abs(cpos.size) ? X.abs(pos.size) : X.abs(cpos.size);
       const price = X.bankruptcyPrice(pos.size, market.markPrice, eq);
@@ -2053,19 +2290,19 @@ export class Engine {
     if (this.markets[m].oiLong !== this.markets[m].oiShort) throw new Error('open interest out of balance');
 
     // The liquidated account's activity, then the insurance account's (read only).
-    w.actv_path = this.activity.path(idx).map(hex);
+    w.actv_path = hexPath(this.activity.path(idx));
     this.actv.set(idx, act);
-    await this.activity.set(idx, await M.activityHash(this.h, act));
-    if (usesInsurance) Object.assign(w, { ins_actv: M.activityToNoir(insAct), ins_actv_path: this.activity.path(M.INSURANCE_INDEX).map(hex) });
+    await this.writeActivity(idx, act);
+    if (usesInsurance) Object.assign(w, { ins_actv: M.activityToNoir(insAct), ins_actv_path: hexPath(this.activity.path(M.INSURANCE_INDEX)) });
     // The liquidated account's leaf, then the other account's.
-    w.acct_path = this.accounts.path(idx).map(hex);
+    w.acct_path = hexPath(this.accounts.path(idx));
     if (writeA) {
       const leaf = await this.writeAccount(rec, a, daNonce);
       await this.emitChange(rec, leaf, daNonce);
     }
     if (otherRec && other) {
       plan.other = otherRec.index;
-      Object.assign(w, { other_index: otherRec.index.toString(), other_pub: M.pubToNoir(otherRec.pub), other_priv: M.privToNoir(otherRec.priv), other_k_enc: hex(otherRec.kEnc), other_path: this.accounts.path(otherRec.index).map(hex) });
+      Object.assign(w, { other_index: otherRec.index.toString(), other_pub: M.pubToNoir(otherRec.pub), other_priv: M.privToNoir(otherRec.priv), other_k_enc: hex(otherRec.kEnc), other_path: hexPath(this.accounts.path(otherRec.index)) });
       const leaf = await this.writeAccount(otherRec, other, daNonce);
       await this.emitChange(otherRec, leaf, daNonce);
     }
@@ -2080,6 +2317,10 @@ export class Engine {
    * absorb any deficit. Returns the steps taken.
    */
   async liquidateAccount(index: bigint, counterparty?: (market: number) => bigint | undefined): Promise<LiqStep[]> {
+    return this.atomic(() => this.liquidateAccountImpl(index, counterparty));
+  }
+
+  private async liquidateAccountImpl(index: bigint, counterparty?: (market: number) => bigint | undefined): Promise<LiqStep[]> {
     const snap = this.snapshot();
     const steps: LiqStep[] = [];
     const run = async (s: LiqStep) => {
