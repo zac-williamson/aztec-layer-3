@@ -1,5 +1,6 @@
 pub mod hash;
 pub mod merge;
+pub mod batch;
 
 use hash::hash;
 

@@ -5,7 +5,7 @@
 import { cpus } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { AztecClientBackend, type Barretenberg, UltraHonkBackend } from '@aztec-foundation/bb.js';
+import { AztecClientBackend, type Barretenberg, UltraHonkBackend, flattenChonkProofFields } from '@aztec-foundation/bb.js';
 import { Noir } from '@aztec-foundation/noir-noir_js';
 import {
   BB,
@@ -31,6 +31,7 @@ import {
 } from './lib.ts';
 import { type P256Key, bytes32, halves, p256Sign } from './exchange/p256.ts';
 import { CLIENT_DATA_MAX, makeAssertion, rpHalves } from './exchange/webauthn.ts';
+import { execPool } from './exec_pool.ts';
 
 const CircuitKind = { App: 0, Kernel: 1, HidingKernel: 2 } as const;
 const IVC = ['agg_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'] as const;
@@ -58,7 +59,14 @@ export type Running = {
 /** Mirror of l3x_types::NodeOutput, the public output of every merge-tree node. */
 export type NodeOutput = { configHash: bigint; start: Running; end: Running; receiptsRoot: bigint };
 
-export type ProvedNode = { pkg: string; proof: bigint[]; out: NodeOutput; ms: number };
+/** `ms` is the proof's time in bb; `execMs` the witness execution, `verifyMs` the native check. */
+export type ProvedNode = { pkg: string; proof: bigint[]; out: NodeOutput; ms: number; execMs?: number; verifyMs?: number };
+
+/** bb.js's proof settings for a verifier target (its own mapping is not exported). */
+const SETTINGS = {
+  'noir-recursive': { ipaAccumulation: false, oracleHashType: 'poseidon2', disableZk: false, optimizedSolidityVerifier: false },
+  'noir-rollup-no-zk': { ipaAccumulation: true, oracleHashType: 'poseidon2', disableZk: true, optimizedSolidityVerifier: false },
+} as const;
 
 export function runningFields(r: Running): bigint[] {
   return [
@@ -159,6 +167,10 @@ export type ClientProof = { pkg: string; proof: string[]; publicInputs: string[]
 const CLIENT_PROOF_FIELDS = 458;
 /** The client circuits of the VK tree's client subtree. */
 export const CLIENT_CIRCUITS = ['client_auth', 'client_p256', 'client_webauthn'] as const;
+/** Segment apps a batch kernel folds (l3x_types::batch::APPS_PER_KERNEL). */
+export const APPS_PER_KERNEL = 5;
+/** bb's limit on apps in one Chonk run (CHONK_MAX_NUM_APPS). */
+export const CHONK_MAX_APPS = 45;
 /** Fields of AggOutput, the Chonk proof's public inputs: actions_hash, count, vk_tree_root. */
 const AGG_OUTPUT_LEN = 3;
 
@@ -224,21 +236,43 @@ export class Prover {
     };
   }
 
+  private bytecodes = new Map<string, Uint8Array>();
+  private vks = new Map<string, Uint8Array>();
+
+  /**
+   * Proves `pkg` with UltraHonk, handing bb the build's VK (bb.js's backend passes an empty one,
+   * so every proof would recompute it), then verifies natively against the same VK (bb.js's
+   * verifyProof recomputes the VK first: about a minute for the root). P2.28.
+   */
+  async ultraProve(pkg: string, witness: Uint8Array, target: keyof typeof SETTINGS) {
+    if (!this.bytecodes.has(pkg)) {
+      this.bytecodes.set(pkg, new Uint8Array(gunzipSync(Buffer.from(readCircuit(pkg).bytecode, 'base64'))));
+      this.vks.set(pkg, readVkBinary(pkg));
+    }
+    const settings = SETTINGS[target];
+    const verificationKey = this.vks.get(pkg)!;
+    const [r, ms] = await timed(() =>
+      this.api.circuitProve({ witness: new Uint8Array(gunzipSync(witness)), circuit: { name: pkg, bytecode: this.bytecodes.get(pkg)!, verificationKey }, settings }),
+    );
+    const t0 = performance.now();
+    const { verified } = await this.api.circuitVerify({ verificationKey, publicInputs: r.publicInputs, proof: r.proof, settings });
+    const verifyMs = performance.now() - t0;
+    return { proof: r.proof.map(fromBytes32), publicInputs: r.publicInputs.map(fromBytes32), ms, verified, verifyMs };
+  }
+
   /** Executes a rollup-target circuit, proves and verifies it, and checks its public inputs. */
   async proveNode(pkg: string, inputs: Record<string, unknown>): Promise<ProvedNode> {
-    const c = readCircuit(pkg);
-    const { witness, returnValue } = await new Noir(c as any).execute(inputs as any);
-    const backend = new UltraHonkBackend(c.bytecode, this.api);
-    const [pd, ms] = await timed(() => backend.generateProof(witness, ROLLUP));
-    assert(await backend.verifyProof(pd, ROLLUP), `${pkg} proof does not verify`);
+    const [{ witness, returnValue }, execMs] = await timed(() => execPool().execute(pkg, inputs));
+    const pd = await this.ultraProve(pkg, witness, 'noir-rollup-no-zk');
+    assert(pd.verified, `${pkg} proof does not verify`);
     // Padding and rogue_segment take their output as a public input instead of returning it.
     const out = nodeFromNoir(returnValue ?? inputs.out);
     const fields = nodeFields(out);
     assert(
-      pd.publicInputs.length === fields.length && pd.publicInputs.every((x, i) => BigInt(x) === fields[i]),
+      pd.publicInputs.length === fields.length && pd.publicInputs.every((x, i) => x === fields[i]),
       `${pkg} public inputs != its NodeOutput`,
     );
-    return { pkg, proof: bytesToFields(pd.proof), out, ms };
+    return { pkg, proof: pd.proof, out, ms: pd.ms, execMs, verifyMs: pd.verifyMs };
   }
 
   private clientCircuits = new Map<string, { noir: Noir; backend: UltraHonkBackend }>();
@@ -432,6 +466,17 @@ export class Prover {
     return { node, chonk: seg };
   }
 
+  /**
+   * A Chonk run over consecutive X-segments (SPEC.md §9.2, P2.28), all at once: a ChonkStream
+   * sized to them (whole groups of five), fed every segment, then finished.
+   */
+  async chonkRun(segs: { pkg: string; inputs: Record<string, unknown> }[], log = console.log): Promise<ChonkRunResult> {
+    assert(segs.length > 0 && segs.length <= CHONK_MAX_APPS, `${segs.length} segments in one Chonk run`);
+    const s = ChonkStream.open(this, Math.ceil(segs.length / APPS_PER_KERNEL) * APPS_PER_KERNEL);
+    for (const seg of segs) s.add(seg);
+    return s.finish(log);
+  }
+
   padding(at: Running, configHash = this.configHash): Promise<ProvedNode> {
     return this.proveNode('padding', { out: nodeToNoir({ configHash, start: at, end: at, receiptsRoot: 0n }) });
   }
@@ -468,12 +513,9 @@ export class Prover {
 
   /** Proves the root: an UltraHonk ZK proof whose only public input is H(header). */
   async proveRoot(inputs: Record<string, unknown>) {
-    const c = readCircuit('root');
-    const { witness, returnValue } = await new Noir(c as any).execute(inputs as any);
-    const backend = new UltraHonkBackend(c.bytecode, this.api);
-    const [pd, ms] = await timed(() => backend.generateProof(witness, RECURSIVE));
-    const verified = await backend.verifyProof(pd, RECURSIVE);
-    return { headerHash: BigInt(returnValue as string), proof: bytesToFields(pd.proof), publicInputs: pd.publicInputs.map((x) => BigInt(x)), ms, verified };
+    const [{ witness, returnValue }, execMs] = await timed(() => execPool().execute('root', inputs));
+    const pd = await this.ultraProve('root', witness, 'noir-recursive');
+    return { headerHash: BigInt(returnValue as string), proof: pd.proof, publicInputs: pd.publicInputs, ms: pd.ms, verified: pd.verified, execMs, verifyMs: pd.verifyMs };
   }
 }
 
@@ -529,6 +571,7 @@ export type ProvedBatch = {
   receiptsRoot: bigint;
   segmentRoots: bigint[];
   segmentLeaves: bigint[][];
+  receiptShape: ReceiptShape;
   end: Running;
   shape: string;
   ms: Record<string, number>;
@@ -570,17 +613,51 @@ export async function executeBatch(prover: Prover, w: BatchWitness, log = consol
 }
 
 /** The receipts tree of a batch, built as proveBatch builds the merge tree (SPEC.md §11). */
-async function receiptsOf(api: Barretenberg, w: BatchWitness) {
-  const segmentRoots = w.segments.map((s) => s.receiptsRoot ?? 0n);
-  const segmentLeaves = w.segments.map((s) => s.receiptLeaves ?? [0n, 0n]);
-  const node = (l: bigint, r: bigint) => l3xHash(api, [DS.RECEIPT_NODE, l, r]);
-  let level = segmentRoots.length === 1 ? [segmentRoots[0], 0n] : [...segmentRoots];
+/**
+ * The shape of a batch's receipts tree above its segments' own trees: a segment index, an empty
+ * slot (null, a padding app's zero root), or a node over two subtrees. It follows the
+ * aggregation: merges pair nodes level by level, and a Chonk run's kernels pair apps within a
+ * group of five and chain the groups (P2.28).
+ */
+export type ReceiptShape = number | null | [ReceiptShape, ReceiptShape];
+
+/** Merge-tree pairing, level by level with an odd node carried up, until the root's two children. */
+export function mergeShape(leaves: ReceiptShape[]): ReceiptShape {
+  let level = leaves.length === 1 ? [leaves[0], null] : [...leaves];
   while (level.length > 2) {
-    const next: bigint[] = [];
-    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? await node(level[k], level[k + 1]) : level[k]);
+    const next: ReceiptShape[] = [];
+    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? [level[k], level[k + 1]] : level[k]);
     level = next;
   }
-  return { receiptsRoot: await node(level[0], level[1]), segmentRoots, segmentLeaves };
+  return [level[0], level[1]];
+}
+
+/** A Chonk run over `segments` (l3x_types::batch): groups of five, padded, chained left to right. */
+export function chonkRunShape(segments: number[]): ReceiptShape {
+  let acc: ReceiptShape | undefined;
+  for (let i = 0; i < segments.length; i += APPS_PER_KERNEL) {
+    const g: ReceiptShape[] = segments.slice(i, i + APPS_PER_KERNEL);
+    while (g.length < APPS_PER_KERNEL) g.push(null);
+    const group: ReceiptShape = [[[g[0], g[1]], [g[2], g[3]]], g[4]];
+    acc = acc === undefined ? group : [acc, group];
+  }
+  assert(acc !== undefined, 'empty Chonk run');
+  return acc;
+}
+
+async function foldShape(api: Barretenberg, shape: ReceiptShape, roots: bigint[]): Promise<bigint> {
+  if (shape === null) return 0n;
+  if (typeof shape === 'number') return roots[shape];
+  return l3xHash(api, [DS.RECEIPT_NODE, await foldShape(api, shape[0], roots), await foldShape(api, shape[1], roots)]);
+}
+
+const shapeHas = (shape: ReceiptShape, i: number): boolean =>
+  shape === i || (Array.isArray(shape) && (shapeHas(shape[0], i) || shapeHas(shape[1], i)));
+
+async function receiptsOf(api: Barretenberg, w: BatchWitness, shape = mergeShape(w.segments.map((_, i) => i))) {
+  const segmentRoots = w.segments.map((s) => s.receiptsRoot ?? 0n);
+  const segmentLeaves = w.segments.map((s) => s.receiptLeaves ?? [0n, 0n]);
+  return { receiptsRoot: await foldShape(api, shape, segmentRoots), segmentRoots, segmentLeaves, receiptShape: shape };
 }
 
 /**
@@ -588,7 +665,12 @@ async function receiptsOf(api: Barretenberg, w: BatchWitness) {
  * tree, as Bridge.answer takes it: siblings from the leaf up, and for each level whether the node
  * is the right child. A node carried up unpaired adds no level.
  */
-export async function receiptPath(api: Barretenberg, b: Pick<ProvedBatch, 'segmentRoots' | 'segmentLeaves'>, segment: number, slot: number) {
+export async function receiptPath(
+  api: Barretenberg,
+  b: Pick<ProvedBatch, 'segmentRoots' | 'segmentLeaves'> & { receiptShape?: ReceiptShape },
+  segment: number,
+  slot: number,
+) {
   const node = (l: bigint, r: bigint) => l3xHash(api, [DS.RECEIPT_NODE, l, r]);
   // First up the segment's own receipts tree: two leaves for seg_trade, 32 for seg_quote.
   const path: bigint[] = [];
@@ -601,21 +683,20 @@ export async function receiptPath(api: Barretenberg, b: Pick<ProvedBatch, 'segme
     for (let k = 0; k < leaves.length; k += 2) up.push(await node(leaves[k], leaves[k + 1]));
     leaves = up;
   }
-  // Then up the merge tree from the segment's root.
-  let level = b.segmentRoots.length === 1 ? [b.segmentRoots[0], 0n] : [...b.segmentRoots];
-  let i = segment;
-  while (level.length > 2) {
-    const next: bigint[] = [];
-    for (let k = 0; k < level.length; k += 2) next.push(k + 1 < level.length ? await node(level[k], level[k + 1]) : level[k]);
-    if (!(i === level.length - 1 && level.length % 2 === 1)) {
-      if (i & 1) bits |= 1 << path.length;
-      path.push(level[i ^ 1]);
-    }
-    i >>= 1;
-    level = next;
+  // Then up the aggregation's shape from the segment's root: collect siblings top-down, then reverse.
+  const shape = b.receiptShape ?? mergeShape(b.segmentRoots.map((_, i) => i));
+  const above: { sibling: bigint; right: boolean }[] = [];
+  let at: ReceiptShape = shape;
+  while (at !== segment) {
+    assert(Array.isArray(at), `segment ${segment} is not in the receipts shape`);
+    const right = shapeHas(at[1], segment);
+    above.push({ sibling: await foldShape(api, right ? at[0] : at[1], b.segmentRoots), right });
+    at = right ? at[1] : at[0];
   }
-  if (i & 1) bits |= 1 << path.length;
-  path.push(level[i ^ 1]);
+  for (const { sibling, right } of above.reverse()) {
+    if (right) bits |= 1 << path.length;
+    path.push(sibling);
+  }
   return { depth: path.length, bits, path };
 }
 
@@ -627,6 +708,171 @@ export async function foldReceipt(api: Barretenberg, leaf: bigint, p: { depth: n
 }
 
 export const receiptLeaf = (api: Barretenberg, seq: bigint, msg: bigint) => l3xHash(api, [DS.RECEIPT, seq, msg]);
+
+export type ChonkRunResult = ProvedNode & {
+  chonkMs: number;
+  tubeMs: number;
+  deciderMs: number;
+  chonkExecMs: number;
+  byPkg: Record<string, { n: number; ms: number }>;
+  sizes: Record<string, number>;
+};
+
+/**
+ * A Chonk run fed one segment at a time (SPEC.md §9.2, P2.28), so a proving service can fold a
+ * batch's segments while the batch is still open. bb fixes a run's circuits when it starts
+ * (chonkStart takes every circuit's kind), so a stream has a capacity in whole groups of five; at
+ * `finish` the unused slots are filled with padding apps. Each segment is executed as its Mega
+ * app on the witness workers as soon as it arrives and accumulated in order: app by app, and the
+ * batch kernel after every fifth (bk_init, then bk_inner); `finish` adds bk_tail and bk_hiding,
+ * proves the run (the HyperNova decider, ECCVM, translator) and the batch tube.
+ *
+ * The stream holds its prover's bb process from `open` to `finish`.
+ */
+/** Per-circuit accumulation totals and the decider of run `r`, under keys that do not sum into proving time. */
+function recordRun(ms: Record<string, number>, r: number, res: ChonkRunResult) {
+  for (const [pkg, b] of Object.entries(res.byPkg)) {
+    ms[`acc.${pkg}.n`] = (ms[`acc.${pkg}.n`] ?? 0) + b.n;
+    ms[`acc.${pkg}.ms`] = (ms[`acc.${pkg}.ms`] ?? 0) + b.ms;
+  }
+  ms[`decider.${r}`] = res.deciderMs;
+}
+
+export class ChonkStream {
+  readonly capacity: number;
+  readonly prover: Prover;
+  private chain: Promise<void>;
+  private group: { pkg: string; out: any }[] = [];
+  private prev?: { pkg: string; out: any };
+  private last?: any;
+  private accumulated = 0;
+  private added = 0;
+  private bytecodes = new Map<string, Uint8Array>();
+  execMs = 0;
+  accumulateMs = 0;
+  /** Accumulation time and count by circuit. */
+  readonly byPkg: Record<string, { n: number; ms: number }> = {};
+  readonly openedAt = performance.now();
+
+  private constructor(prover: Prover, capacity: number) {
+    assert(capacity > 0 && capacity % APPS_PER_KERNEL === 0 && capacity <= CHONK_MAX_APPS, `Chonk stream capacity ${capacity}`);
+    this.prover = prover;
+    this.capacity = capacity;
+    const kinds: number[] = [];
+    for (let g = 0; g < capacity / APPS_PER_KERNEL; g++) kinds.push(...Array<number>(APPS_PER_KERNEL).fill(CircuitKind.App), CircuitKind.Kernel);
+    kinds.push(CircuitKind.Kernel, CircuitKind.HidingKernel);
+    this.chain = prover.api.chonkStart({ kinds: kinds as any }).then(() => {});
+    this.chain.catch(() => {});
+  }
+
+  /** Starts a run of `capacity` apps (a multiple of five, at most 45) on `prover`. */
+  static open(prover: Prover, capacity: number) {
+    return new ChonkStream(prover, capacity);
+  }
+
+  get size() {
+    return this.added;
+  }
+  get full() {
+    return this.added === this.capacity;
+  }
+
+  private step(f: () => Promise<void>) {
+    this.chain = this.chain.then(f);
+    this.chain.catch(() => {});
+  }
+
+  private bytecode(pkg: string) {
+    if (!this.bytecodes.has(pkg)) this.bytecodes.set(pkg, new Uint8Array(gunzipSync(Buffer.from(readCircuit(pkg).bytecode, 'base64'))));
+    return this.bytecodes.get(pkg)!;
+  }
+
+  private async exec(pkg: string, inputs: Record<string, unknown>) {
+    const [r, ms] = await timed(() => execPool().execute(pkg, inputs));
+    this.execMs += ms;
+    return r;
+  }
+
+  private async accumulate(pkg: string, kind: number, witness: Uint8Array) {
+    const api = this.prover.api;
+    const t0 = performance.now();
+    await api.chonkLoad({ circuit: { name: pkg, bytecode: this.bytecode(pkg), verificationKey: readVkBinary(pkg) }, kind: kind as any });
+    await api.chonkAccumulate({ witness: new Uint8Array(gunzipSync(witness)) });
+    const ms = performance.now() - t0;
+    this.accumulateMs += ms;
+    const b = (this.byPkg[pkg] ??= { n: 0, ms: 0 });
+    b.n++;
+    b.ms += ms;
+    this.accumulated++;
+  }
+
+  private kernelRef(pkg: string) {
+    const p = this.prover;
+    return { prev_vk: readVkJson(pkg).vk, prev_vk_hash: p.manifest.vkHashByPkg[pkg], prev_membership: p.membership(pkg) };
+  }
+
+  private async app(pkg: string, r: { witness: Uint8Array; returnValue: any }) {
+    await this.accumulate(pkg, CircuitKind.App, r.witness);
+    this.group.push({ pkg, out: r.returnValue });
+    this.last = r.returnValue;
+    if (this.group.length < APPS_PER_KERNEL) return;
+    const p = this.prover;
+    const common = { vk_tree_root: hex(p.vkTreeRoot), params_hash: hex(p.paramsHash) };
+    const appInputs = {
+      ...Object.fromEntries(this.group.map((a, j) => [`a${j}`, a.out])),
+      vks: this.group.map((a) => readVkJson(a.pkg).vk),
+      vk_hashes: this.group.map((a) => p.manifest.vkHashByPkg[a.pkg]),
+      memberships: this.group.map((a) => p.membership(a.pkg)),
+    };
+    const kpkg = this.prev ? 'bk_inner' : 'bk_init';
+    const k = await this.exec(kpkg, this.prev ? { ...common, prev: this.prev.out, ...this.kernelRef(this.prev.pkg), ...appInputs } : { ...common, ...appInputs });
+    await this.accumulate(kpkg, CircuitKind.Kernel, k.witness);
+    this.prev = { pkg: kpkg, out: k.returnValue };
+    this.group = [];
+  }
+
+  /** Adds the next segment of the run; its witness executes at once, its accumulation in turn. */
+  add(seg: { pkg: string; inputs: Record<string, unknown> }) {
+    assert(this.added < this.capacity, 'Chonk stream is full');
+    assert(seg.pkg.startsWith('seg_'), `${seg.pkg} has no app build`);
+    const pkg = `app_${seg.pkg.slice(4)}`;
+    const r = this.exec(pkg, seg.inputs);
+    r.catch(() => {});
+    this.added++;
+    this.step(async () => this.app(pkg, await r));
+  }
+
+  /** Pads the run, adds the tail and hiding kernels, proves it and its batch tube. */
+  async finish(log = console.log): Promise<ChonkRunResult> {
+    assert(this.added > 0, 'empty Chonk stream');
+    const t0 = performance.now();
+    await this.chain;
+    const p = this.prover;
+    const pads = this.capacity - this.added;
+    const padOut = { config_hash: this.last.config_hash, start: this.last.end, end: this.last.end, receipts_root: hex(0n) };
+    for (let i = 0; i < pads; i++) await this.app('app_pad', await this.exec('app_pad', { out: padOut }));
+    const common = { vk_tree_root: hex(p.vkTreeRoot), params_hash: hex(p.paramsHash) };
+    const tail = await this.exec('bk_tail', { ...common, prev: this.prev!.out, ...this.kernelRef(this.prev!.pkg) });
+    await this.accumulate('bk_tail', CircuitKind.Kernel, tail.witness);
+    const hiding = await this.exec('bk_hiding', { prev: tail.returnValue, prev_vk: readVkJson('bk_tail').vk });
+    await this.accumulate('bk_hiding', CircuitKind.HidingKernel, hiding.witness);
+    const out = nodeFromNoir(hiding.returnValue);
+    const [res, proveMs] = await timed(() => p.api.chonkProve({}));
+    const fields = flattenChonkProofFields(res.proof).map(fromBytes32);
+    const outFields = nodeFields(out);
+    assert(fields.length === SHAPE.CHONK_PROOF_LENGTH + outFields.length, `batch Chonk proof has ${fields.length} fields`);
+    assert(outFields.every((x, i) => fields[i] === x), "batch Chonk public inputs != the run's NodeOutput");
+    const finishMs = performance.now() - t0;
+    const node = await p.proveNode('btube', { chonk_vk: readVkJson('bk_hiding').vk, chonk_proof: fields.slice(outFields.length).map(hex), out: nodeToNoir(out) });
+    const chonkMs = this.accumulateMs + proveMs;
+    const sizes = { apps: this.added, pads, kernels: this.capacity / APPS_PER_KERNEL + 2 };
+    log(
+      `  chonk run: ${this.added} apps (+${pads} pads), ${sizes.kernels} kernels: accumulation ${(this.accumulateMs / 1000).toFixed(1)} s, decider ${(proveMs / 1000).toFixed(1)} s, ` +
+        `finish ${(finishMs / 1000).toFixed(1)} s from the last segment, batch tube ${(node.ms / 1000).toFixed(1)} s`,
+    );
+    return { ...node, chonkMs, tubeMs: node.ms, deciderMs: proveMs, chonkExecMs: this.execMs, byPkg: this.byPkg, sizes };
+  }
+}
 
 /**
  * Provers that work at once, each with its own bb process (P2.26, SPEC.md §9.2): `run` lends one
@@ -650,14 +896,23 @@ export class ProverPool {
     return new ProverPool(provers);
   }
 
+  /** Lends a prover until `release`, waiting for one if all are lent. */
+  async acquire(): Promise<Prover> {
+    return this.free.pop() ?? (await new Promise<Prover>((ok) => this.waiting.push(ok)));
+  }
+
+  release(p: Prover) {
+    const next = this.waiting.shift();
+    if (next) next(p);
+    else this.free.push(p);
+  }
+
   async run<T>(f: (p: Prover) => Promise<T>): Promise<T> {
-    const p = this.free.pop() ?? (await new Promise<Prover>((ok) => this.waiting.push(ok)));
+    const p = await this.acquire();
     try {
       return await f(p);
     } finally {
-      const next = this.waiting.shift();
-      if (next) next(p);
-      else this.free.push(p);
+      this.release(p);
     }
   }
 
@@ -687,8 +942,20 @@ export async function proveBatchParallel(pool: ProverPool, w: BatchWitness, log 
       return node;
     }),
   );
+  const { top, shape, root } = await mergeAndRoot(pool, w, leafPs, w.segments.map((s) => s.pkg.replace('seg_', '')), ms);
+  const leaves = await Promise.all(leafPs);
+  const wallMs = performance.now() - t0;
+  log(`  ${leaves.length} segments, ${Object.keys(ms).filter((k) => k.startsWith('merge')).length} merges and the root on ${pool.provers.length} provers in ${(wallMs / 1000).toFixed(1)} s (root ${(root.ms / 1000).toFixed(1)} s)`);
+  return { ...(await finishBatch(pool.provers[0], w, leaves, top, shape, root, ms)), wallMs };
+}
+
+/**
+ * The merge tree over a batch's leaf nodes, each merge as soon as both its children are proved,
+ * then the root (P2.26). `names` label the leaves in the batch's shape string.
+ */
+async function mergeAndRoot(pool: ProverPool, w: BatchWitness, leafPs: Promise<ProvedNode>[], names: string[], ms: Record<string, number>) {
   let level: Promise<ProvedNode>[] = leafPs;
-  let shape = w.segments.map((s) => s.pkg.replace('seg_', ''));
+  let shape = names;
   if (level.length === 1) {
     level = [level[0], level[0].then((n) => pool.run((p) => p.padding(n.out.end)))];
     shape = [shape[0], 'pad'];
@@ -718,14 +985,175 @@ export async function proveBatchParallel(pool: ProverPool, w: BatchWitness, log 
     level = next;
     shape = nextShape;
   }
-  const leaves = await Promise.all(leafPs);
   const top = await Promise.all(level);
   const root = await pool.run((p) => p.proveRoot(p.rootInputs(top[0], top[1], w.endState, w.withdrawalRecords, w.batchNumber)));
   assert(root.verified, 'root proof does not verify');
   ms.root_prove = root.ms;
+  console.log(`  root: witness ${(root.execMs / 1000).toFixed(1)} s, proof ${(root.ms / 1000).toFixed(1)} s, check ${(root.verifyMs / 1000).toFixed(1)} s`);
+  return { top, shape, root };
+}
+
+/**
+ * Proves a batch with Chonk aggregation (SPEC.md §9.2, P2.28): each run of up to `runApps`
+ * consecutive X-segments (split evenly) is one Chonk run (segment apps folded by batch kernels) and one batch
+ * tube; a P-segment stays a tube of its own. The runs prove at once on the pool, then the merge
+ * tree over the runs and the root. Each run's output is checked against the engine's transition.
+ */
+export async function proveBatchChonk(pool: ProverPool, w: BatchWitness, runApps = CHONK_MAX_APPS, log = console.log): Promise<ProvedBatch & { wallMs: number }> {
+  const t0 = performance.now();
+  const ms: Record<string, number> = {};
+  const configHash = pool.provers[0].configHash;
+  assert(runApps >= 1 && runApps <= CHONK_MAX_APPS, `runs of ${runApps} apps`);
+  // Each maximal block of consecutive X-segments splits into the fewest runs of at most
+  // `runApps`, of near-equal size; a P-segment is a run of its own.
+  const runs: number[][] = [];
+  const blocks: number[][] = [];
+  for (const [i, seg] of w.segments.entries()) {
+    const cur = blocks[blocks.length - 1];
+    if (seg.pkg !== 'tube' && cur && w.segments[cur[0]].pkg !== 'tube') cur.push(i);
+    else blocks.push([i]);
+  }
+  for (const b of blocks) {
+    const k = Math.ceil(b.length / runApps);
+    for (let j = 0, at = 0; j < k; j++) {
+      const size = Math.floor(b.length / k) + (j < b.length % k ? 1 : 0);
+      runs.push(b.slice(at, at + size));
+      at += size;
+    }
+  }
+  const roots = w.segments.map((s) => s.receiptsRoot ?? 0n);
+  const leafPs = runs.map((run, r) =>
+    pool.run(async (prover) => {
+      const first = run[0];
+      const lastSeg = run[run.length - 1];
+      const start = first === 0 ? w.start : w.segments[first - 1].expectedEnd;
+      let node: ProvedNode;
+      let receiptsRoot: bigint;
+      if (w.segments[first].pkg === 'tube') {
+        const seg = w.segments[first];
+        node = (await prover.proveTube(seg.inputs, seg.clientProofs ?? [], log)).node;
+        receiptsRoot = roots[first];
+        ms[`tube_${first}`] = node.ms;
+      } else {
+        const res = await prover.chonkRun(run.map((i) => w.segments[i]), log);
+        node = res;
+        receiptsRoot = await foldShape(prover.api, chonkRunShape(run), roots);
+        ms[`chonk_${r}`] = res.chonkMs;
+        ms[`btube_${r}`] = res.tubeMs;
+        recordRun(ms, r, res);
+      }
+      const got = nodeFields(node.out);
+      const want = nodeFields({ configHash, start, end: w.segments[lastSeg].expectedEnd, receiptsRoot });
+      const bad = got.findIndex((x, j) => x !== want[j]);
+      assert(bad < 0, `run ${r} (segments ${first}..${lastSeg}): output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
+      return node;
+    }),
+  );
+  const names = runs.map((run) => (w.segments[run[0]].pkg === 'tube' ? 'tube' : `chonk(${run.length})`));
+  const { top, shape, root } = await mergeAndRoot(pool, w, leafPs, names, ms);
+  const leaves = await Promise.all(leafPs);
   const wallMs = performance.now() - t0;
-  log(`  ${leaves.length} segments, ${merges} merges and the root on ${pool.provers.length} provers in ${(wallMs / 1000).toFixed(1)} s (root ${(root.ms / 1000).toFixed(1)} s)`);
-  return { ...(await finishBatch(pool.provers[0], w, leaves, top, shape, root, ms)), wallMs };
+  log(`  ${w.segments.length} segments in ${runs.length} runs, ${Object.keys(ms).filter((k) => k.startsWith('merge')).length} merges and the root on ${pool.provers.length} provers in ${(wallMs / 1000).toFixed(1)} s (root ${(root.ms / 1000).toFixed(1)} s)`);
+  const receiptShape = mergeShape(runs.map((run) => (w.segments[run[0]].pkg === 'tube' ? run[0] : chonkRunShape(run))));
+  return { ...(await finishBatch(pool.provers[0], w, leaves, top, shape, root, ms, receiptShape)), wallMs };
+}
+
+/**
+ * Proves a batch while it is still open (SPEC.md §9.2, P2.28): the proving service pushes each
+ * segment as the engine closes it. Consecutive X-segments go to a ChonkStream of `capacity` apps,
+ * which takes a prover from the pool when it opens and accumulates them as they arrive; a full
+ * stream is finished and the next one opened, and a P-segment ends the stream and proves as its
+ * own tube. When the batch closes, `finish` finishes the last stream (padding it), then the merge
+ * tree over the runs and the root: what is left after the close is the last stream's remaining
+ * accumulation, its decider and batch tube, any merges, and the root.
+ */
+export class BatchStream {
+  private runs: { segs: number[]; leaf?: Promise<ProvedNode>; stream?: Promise<ChonkStream> }[] = [];
+  private segments: SegmentWitness[] = [];
+  readonly ms: Record<string, number> = {};
+  readonly t0 = performance.now();
+
+  readonly pool: ProverPool;
+  readonly capacity: number;
+  readonly log: (m: string) => void;
+
+  constructor(pool: ProverPool, capacity = 20, log: (m: string) => void = console.log) {
+    this.pool = pool;
+    this.capacity = capacity;
+    this.log = log;
+    assert(capacity % APPS_PER_KERNEL === 0 && capacity > 0 && capacity <= CHONK_MAX_APPS, `stream capacity ${capacity}`);
+  }
+
+  private finishRun(r: (typeof this.runs)[number]) {
+    if (!r.stream || r.leaf) return;
+    const k = this.runs.indexOf(r);
+    r.leaf = r.stream.then(async (s) => {
+      try {
+        const res = await s.finish(this.log);
+        this.ms[`chonk_${k}`] = res.chonkMs;
+        this.ms[`btube_${k}`] = res.tubeMs;
+        recordRun(this.ms, k, res);
+        return res;
+      } finally {
+        this.pool.release(s.prover);
+      }
+    });
+    r.leaf.catch(() => {});
+  }
+
+  /** The batch's next segment, in order. */
+  push(seg: SegmentWitness) {
+    const i = this.segments.length;
+    this.segments.push(seg);
+    const cur = this.runs[this.runs.length - 1];
+    if (seg.pkg === 'tube') {
+      if (cur) this.finishRun(cur);
+      const leaf = this.pool.run(async (p) => (await p.proveTube(seg.inputs, seg.clientProofs ?? [], this.log)).node);
+      leaf.catch(() => {});
+      this.runs.push({ segs: [i], leaf });
+      return;
+    }
+    let run = cur;
+    if (!run || run.leaf || run.segs.length === this.capacity) {
+      if (run) this.finishRun(run);
+      const stream = this.pool.acquire().then((p) => ChonkStream.open(p, this.capacity));
+      stream.catch(() => {});
+      run = { segs: [], stream };
+      this.runs.push(run);
+    }
+    run.segs.push(i);
+    run.stream!.then((s) => s.add(seg));
+  }
+
+  /** The closed batch (its segments must be the ones pushed, and more may follow here): proves the rest. */
+  async finish(w: BatchWitness): Promise<ProvedBatch & { wallMs: number; closeToRootMs: number }> {
+    const tClose = performance.now();
+    for (const seg of w.segments.slice(this.segments.length)) this.push(seg);
+    assert(w.segments.length === this.segments.length && w.segments.every((s, i) => s === this.segments[i]), 'stream segments != the batch');
+    assert(this.runs.length > 0, 'empty batch');
+    this.finishRun(this.runs[this.runs.length - 1]);
+    const configHash = this.pool.provers[0].configHash;
+    const roots = w.segments.map((s) => s.receiptsRoot ?? 0n);
+    const leafPs = this.runs.map(async (run, r) => {
+      const node = await run.leaf!;
+      const first = run.segs[0];
+      const last = run.segs[run.segs.length - 1];
+      const tube = w.segments[first].pkg === 'tube';
+      const receiptsRoot = tube ? roots[first] : await foldShape(this.pool.provers[0].api, chonkRunShape(run.segs), roots);
+      const start = first === 0 ? w.start : w.segments[first - 1].expectedEnd;
+      const got = nodeFields(node.out);
+      const want = nodeFields({ configHash, start, end: w.segments[last].expectedEnd, receiptsRoot });
+      const bad = got.findIndex((x, j) => x !== want[j]);
+      assert(bad < 0, `run ${r} (segments ${first}..${last}): output differs from the engine at field ${bad} (${got[bad]} != ${want[bad]})`);
+      return node;
+    });
+    const names = this.runs.map((run) => (w.segments[run.segs[0]].pkg === 'tube' ? 'tube' : `chonk(${run.segs.length})`));
+    const { top, shape, root } = await mergeAndRoot(this.pool, w, leafPs, names, this.ms);
+    const leaves = await Promise.all(leafPs);
+    const end = performance.now();
+    const receiptShape = mergeShape(this.runs.map((run) => (w.segments[run.segs[0]].pkg === 'tube' ? run.segs[0] : chonkRunShape(run.segs))));
+    return { ...(await finishBatch(this.pool.provers[0], w, leaves, top, shape, root, this.ms, receiptShape)), wallMs: end - this.t0, closeToRootMs: end - tClose };
+  }
 }
 
 /**
@@ -803,6 +1231,7 @@ async function finishBatch(
   shape: string[],
   root: Awaited<ReturnType<Prover['proveRoot']>>,
   ms: Record<string, number>,
+  receiptShape?: ReceiptShape,
 ): Promise<ProvedBatch> {
   const api = prover.api;
   const s = leaves[0].out.start;
@@ -832,7 +1261,7 @@ async function finishBatch(
   assert(headerHash === root.headerHash, 'TS header hash != root circuit output');
   assert(headerHash === root.publicInputs[0], 'TS header hash != root proof public input');
   assert((await daHash(api, w.daPayload)) === header[13], 'flat DA hash != segment sponge');
-  const receipts = await receiptsOf(api, w);
+  const receipts = await receiptsOf(api, w, receiptShape);
   assert(receipts.receiptsRoot === header[17], 'TS receipts tree != the root circuit\'s');
 
   return {

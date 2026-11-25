@@ -4,9 +4,11 @@
 // pool, the sum of every proof's time (what one prover would take), and signed actions proved per
 // second of wall time.
 // Usage: node src/perf/prove_bench.ts [rounds] [makers] [takers] [provers] [threads]
+// AGG=chonk proves with Chonk aggregation (P2.28; RUN_APPS segments a run, default 45) instead of
+// the RollupHonk merge tree.
 import { join } from 'node:path';
 import { OUT, randomField, readJson, writeJson } from '../lib.ts';
-import { ProverPool, newApi, proveBatchParallel } from '../pipeline.ts';
+import { CHONK_MAX_APPS, ProverPool, newApi, proveBatchChonk, proveBatchParallel } from '../pipeline.ts';
 import { Engine, type SignedAction, signAction, signUpdate } from '../exchange/engine.ts';
 import { keysFromSeed } from '../exchange/grumpkin.ts';
 import * as M from '../exchange/model.ts';
@@ -78,16 +80,23 @@ const kinds = new Map<string, number>();
 for (const s of w.segments) kinds.set(s.pkg, (kinds.get(s.pkg) ?? 0) + 1);
 log(`${actions} signed actions in ${w.segments.length} segments (${[...kinds].map(([k, v]) => `${v} ${k}`).join(', ')}), witnesses in ${(witnessMs / 1000).toFixed(1)} s; ${w.daPayload.length} DA fields`);
 
-const b = await proveBatchParallel(pool, w, log);
-const sum = Object.values(b.ms).reduce((x, y) => x + y, 0);
+const AGG = process.env.AGG ?? 'merge';
+const RUN_APPS = Number(process.env.RUN_APPS ?? CHONK_MAX_APPS);
+const loadBefore = (await import('node:os')).loadavg()[0];
+const b = AGG === 'chonk' ? await proveBatchChonk(pool, w, RUN_APPS, log) : await proveBatchParallel(pool, w, log);
+const loadAfter = (await import('node:os')).loadavg()[0];
+const sum = Object.entries(b.ms).filter(([k]) => !k.startsWith('acc.') && !k.startsWith('decider.')).reduce((x, [, y]) => x + y, 0);
+const acc = Object.keys(b.ms).filter((k) => k.startsWith('acc.') && k.endsWith('.n')).map((k) => k.slice(4, -2));
+if (acc.length) log(`accumulation per circuit: ${acc.map((p) => `${p} ${b.ms[`acc.${p}.n`]} × ${(b.ms[`acc.${p}.ms`] / b.ms[`acc.${p}.n`] / 1000).toFixed(2)} s`).join(', ')}`);
 const byKind = (prefix: string) => {
   const xs = Object.entries(b.ms).filter(([k]) => k.startsWith(prefix)).map(([, v]) => v);
   return xs.length ? `${xs.length} × ${(xs.reduce((x, y) => x + y, 0) / xs.length / 1000).toFixed(1)} s` : 'none';
 };
-log(`proofs: seg_quote ${byKind('seg_quote')}, seg_trade ${byKind('seg_trade')}, seg_block ${byKind('seg_block')}, merges ${byKind('merge')}, root ${(b.ms.root_prove / 1000).toFixed(1)} s`);
+log(`proofs: seg_quote ${byKind('seg_quote')}, seg_trade ${byKind('seg_trade')}, seg_block ${byKind('seg_block')}, chonk runs ${byKind('chonk')}, batch tubes ${byKind('btube')}, merges ${byKind('merge')}, root ${(b.ms.root_prove / 1000).toFixed(1)} s`);
+log(`aggregation ${AGG}${AGG === 'chonk' ? ` (runs of ≤ ${RUN_APPS})` : ''}, shape ${b.shape}; host load ${loadBefore.toFixed(0)} → ${loadAfter.toFixed(0)}`);
 log(`wall ${(b.wallMs / 1000).toFixed(1)} s on ${PROVERS} provers × ${THREADS} threads; one prover would take ${(sum / 1000).toFixed(0)} s (${(sum / b.wallMs).toFixed(1)}× faster)`);
 log(`${(actions / (b.wallMs / 1000)).toFixed(1)} signed actions proved a second of wall time; ${(actions / (sum / 1000)).toFixed(2)} a second of one prover's time`);
-writeJson(join(OUT, 'prove-bench.json'), { actions, segments: Object.fromEntries(kinds), wallMs: Math.round(b.wallMs), sumMs: Math.round(sum), provers: PROVERS, threads: THREADS, ms: b.ms });
+writeJson(join(OUT, `prove-bench-${AGG}.json`), { agg: AGG, runApps: RUN_APPS, shape: b.shape, load: [loadBefore, loadAfter], actions, segments: Object.fromEntries(kinds), wallMs: Math.round(b.wallMs), sumMs: Math.round(sum), provers: PROVERS, threads: THREADS, ms: b.ms });
 await pool.destroy();
 await api.destroy();
 process.exit(0);

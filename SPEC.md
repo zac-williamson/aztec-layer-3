@@ -1,6 +1,6 @@
 # L3X: confidential order-book exchange rollup on Aztec
 
-Status: draft 0.15, 2026-11-23. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), the operator's cryptography in process (P2.23), the operator's sequencer with gateway threads, receipts and a journal (P2.24), and quote segments (P2.25), parallel batch proving (P2.26), and a proving service that follows the journal (P2.27), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
+Status: draft 0.16, 2026-11-25. Decisions D1–D13 are resolved (§16). Phase P0 (§15) is complete in this repository on Aztec 6.0.0, because the 6.1.0 toolchain is not yet published to the installer or npm; see `README.md`. P1, a single-market exchange, is built and passed its exit test on the public Aztec testnet (§15, P1 profile and Testnet run). P2 is in progress: multiple markets with mark, funding, fees and the protocol accounts (P2.1), liquidation with the insurance backstop (P2.2), session keys, GTT orders and forced requests (P2.3), refresh enforcement with the desert seniority rules (P2.4), receipts with accountability and client-proof actions (P2.5), client-proof withdrawals (P2.6), the client subtree with a P-256 client circuit (P2.7), order modification and transfers (P2.8), constant-time cancel-all (P2.9), dead-order removal with live-only ticks (P2.10), the risk sweep at refresh (P2.11), a WebAuthn passkey client circuit (P2.12), C1 custody over the D7 collateral token, amounts hidden and addresses public (P2.13), the token's bridge to L1 (P2.14), stop and take-profit triggers (P2.15), the print summary with bucketed volume and open interest (P2.16), key rotation by the account's owner (P2.17), fee tiers (P2.18), displayed orders (P2.19), stops that open a position (P2.20), resting reduce-only orders (P2.21), a master-key rotation (P2.22), the operator's cryptography in process (P2.23), the operator's sequencer with gateway threads, receipts and a journal (P2.24), and quote segments (P2.25), parallel batch proving (P2.26), a proving service that follows the journal (P2.27), and Chonk batch aggregation with streamed proving (P2.28), are built (§15, P2 profile). Before P0, only the proof-compression proof of concept in [`zac-williamson/rollup-on-aztec`](https://github.com/zac-williamson/rollup-on-aztec) existed (§3). Draft 0.4 records P0's findings: the merge tree and VK tree as built (§9), and a Mode R capacity well below the public-log cap (§9.5, M5). Draft 0.2 incorporated findings from an internal adversarial review; there has been no external review. Target: Aztec `v6.1.0` with its pinned Noir and Barretenberg. "L3X" is a working name. MUST, SHOULD and MAY are used as in RFC 2119. **[D#]** refers to a recorded decision (§16); **[M#]** marks a figure that depends on measurement (§14).
 
 ## 1. Purpose and scope
 
@@ -412,16 +412,40 @@ Bridge     Aztec private function    verify_honk_proof against root_vk_hash
 - Within a segment, touched leaves and tree nodes are read once into in-circuit RAM, mutated there, and written back once at the end. A market maker's repeated actions on its own account cost RAM operations, not Merkle paths. Order-book paths still cost one 80-level path per matching step.
 - Segments are proved in parallel: the engine has already computed every intermediate root.
 
+**Chonk batch aggregation** (P2.28). A merge verifies its two children as RollupHonk proofs: 1,479,769 gates, about 740k a child, almost all of it non-native elliptic-curve arithmetic and a full PCS check. A batch SHOULD instead fold its X-segments with Chonk (HyperNova folding with Goblin, §9.3's Chonk role), which leaves each folded proof's elliptic-curve work to the ECCVM and its PCS opening to one decider:
+
+```
+run      app_k … app_k (≤ 5) → bk_init → app_k … (≤ 5) → bk_inner → … → bk_tail → bk_hiding     Chonk, ≤ 45 apps
+batch    btube(run) … , tube(P-segment) …  → merges → root
+```
+
+- **Segment apps.** Every X-segment circuit `seg_k` has a Mega build `app_k`, generated from the same source with its `NodeOutput` on the databus (`return_data`) instead of in public inputs. A run's apps are the consecutive segments it covers, in order.
+- **Batch kernels.** `bk_init` folds the run's first five apps (the first by its Oink proof, the rest by HyperNova); `bk_inner` folds the previous kernel and the next five. Each reads its apps' outputs from the databus (`call_data(1..5)`, which bb binds to each app's return data) and MUST check that:
+  - every app used the configuration `config_hash(vk_tree_root, params_hash)`, from its own witnesses;
+  - every app's VK is in the segment-app role (6) of the VK tree, or is `app_pad`;
+  - the apps chain (`end` of one is `start` of the next), and the group chains onto the previous kernel's transition;
+  - a previous kernel's VK is `bk_init`'s or `bk_inner`'s, by membership in the batch role (7).
+
+  The kernel outputs the run's transition so far. A group's receipts root pairs its five apps level by level, `((r0, r1), (r2, r3)), r4`, and each inner kernel hashes the previous root with its group's.
+- **Padding.** A group of fewer than five segments is filled with `app_pad`, whose transition is the identity and whose receipts root is zero, as the padding segment's.
+- **Closing a run.** `bk_tail` folds the last kernel; `bk_hiding` (MegaZK) verifies `bk_tail` and exposes the run's `NodeOutput` as the Chonk proof's public inputs. `btube` verifies the Chonk proof against the pinned `bk_hiding` VK hash and outputs that `NodeOutput` as a RollupHonk proof with the run's IPA claim, so a run is one merge-tree node, in the tube role (2, slot 1).
+- **Runs.** bb folds at most `CHONK_MAX_NUM_APPS` = 45 apps in one run and at most five per kernel. A P-segment, already a Chonk run of client proofs, ends a run and enters the merge tree as its own tube. A batch of up to two runs needs no merge: the root verifies them directly.
+- **Receipts.** The receipts tree follows the aggregation: the merge tree's pairing over runs and tubes, and within a run the kernels' grouping. `receiptPath` takes the batch's shape.
+
+Cost: verifying a folded proof costs a kernel about 11k gates (`bk_init` 50,010 gates for five apps; `bk_inner` 61,160 for the previous kernel and five apps), against about 740k in a merge, about 67 times fewer. A run adds `bk_tail` (15,901), `bk_hiding` (36,995) and `btube` (1,474,438), and its decider proof (ECCVM, translator, the HyperNova decider) took 1.6–3.8 s. §14 has the measurements.
+
+**Streaming** (P2.28). Every segment's transition is fixed when the engine closes it, so a run can fold segments while its batch is still open. bb fixes the circuits of a run when it starts, so a streamed run has a capacity in whole groups of five, and the slots left at the batch's close are filled with `app_pad`. The proving service MAY therefore hold one open run a batch: what remains at the close is the open run's remaining accumulation and decider, its `btube`, any merges and the root.
+
 ### 9.3 Verification-key discipline
 
 The VK tree, whose root is committed in `config_hash`, is partitioned by role: segments, merges, Chonk apps and kernels, tubes, and client circuits. Every circuit that verifies a proof MUST pin the child VK hash, by constant or by membership in the subtree for the role it expects, so a merge cannot accept a client proof as a child. The root circuit takes the VK tree root from the configuration it commits to in the header. The Bridge checks that configuration against its own `config_hash` and stores only the root VK hash. This closes G2.
 
 As built in P0:
 
-- The tree has height 6: eight roles (client, Chonk, tube, segment, merge, a second segment role from P2.25, and two reserved) of eight slots each, at leaf index `role·8 + slot`. Leaves are VK hashes; empty slots are zero.
+- The tree has height 6: eight roles (client, Chonk, tube, segment, merge, a second segment role from P2.25, segment apps and batch kernels from P2.28) of eight slots each, at leaf index `role·8 + slot`. Leaves are VK hashes; empty slots are zero. The segment apps take the role-3 segments' slots, with `app_quote` in padding's slot 0; the batch role holds `bk_init`, `bk_inner`, `bk_tail` and `app_pad`; `btube` is the tube role's slot 1. All eight roles are now used.
 - `config_hash = H(DS_CONFIG, vk_tree_root, params_hash)`.
-- Merges and the root accept children in the tube, segment (both roles) and merge subtrees only. A merge verifies merges, so it cannot contain its own VK hash as a constant; it takes the VK tree root as a witness bound by `config_hash`.
-- Circuits with a single possible child, the Chonk chain and the tube, pin that child's VK hash as a constant.
+- Merges and the root accept children in the tube, segment (both roles) and merge subtrees only; batch kernels accept apps from the segment-app role and `app_pad` only, and previous kernels that are `bk_init` or `bk_inner` only. A merge verifies merges, so it cannot contain its own VK hash as a constant; it takes the VK tree root as a witness bound by `config_hash`.
+- Circuits with a single possible child, the Chonk chain, the tube, `bk_hiding` and `btube`, pin that child's VK hash as a constant.
 - bb constrains `hash(vk) == vk_hash` inside every recursive verification, so a child cannot present one VK and claim another's tree slot.
 
 ### 9.4 Batch header
@@ -786,9 +810,62 @@ So the pool proves about 0.7 signed actions a second of wall time, and one 16-th
 
 End to end (P2.27): the operator with 100 demo accounts, a block every 5 s and a batch every 30 s, driven at 2 signed actions a second, and the proving service following its journal on the same six provers. Each 30-second batch held 60 actions in 39 segments (6 block, 18 quote, 15 trade): at this rate quotes, takers and blocks interleave in sequence order, so quote segments averaged under four actions. Two batches proved in 848 s and 832 s from their close, concurrently, at host load 270–320: an F0→F1 lag of about 14 minutes, three times the target. Per prover-second, a quote action costs about 1.2 s with its share of a merge when its segment is full, a taker action about 12 s, and every block about 24 s.
 
-So the receipt latency and sustained throughput targets above are met on this host at 5,000 actions a second, but the proof lag target is not: proving capacity, not sequencing, bounds L3X's sustained throughput. Bursts near 20,000 a second saturate the sequencer thread, whose work per action in the server, about 40 µs with messaging, is the limit; the longest tails (p99.9) come from garbage-collection pauses and from the host's other load.
+So the receipt latency and sustained throughput targets above are met on this host at 5,000 actions a second, but the proof lag target was not until P2.28 (below): proving capacity, not sequencing, bounds L3X's sustained throughput. Bursts near 20,000 a second saturate the sequencer thread, whose work per action in the server, about 40 µs with messaging, is the limit; the longest tails (p99.9) come from garbage-collection pauses and from the host's other load.
 
 On this hardware the root alone takes 35–52 s, half to three quarters of a 72-second slot depending on load. It therefore bounds the settlement cadence (D10) until the root is proved on faster hardware, or the IPA closure moves elsewhere. Settling on Aztec is cheap by comparison: verifying the 2^23-gate root proof costs the `settle` function about 29k of its 191k gates. Per segment, the tube (4.5–5 s) costs more than aggregating ten client proofs (1.6 s), and a merge costs about as much as a tube.
+
+**Proof lag** (P2.28), on zac-box. Each figure is one run on one or more provers of 16 threads, with the host's load from other users.
+
+*Prover throughput.* bb's UltraHonk prover (rollup target, VK supplied) on generated circuits of Poseidon2 permutations and arithmetic filling about 85% of 2^k, `bench/throughput.sh` (bench/results/ultra-rollup.tsv), seconds a proof:
+
+| Size | 4 threads | 8 | 16 | 32 | 64 | 128 | Host load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2^18 | 5.6 | 3.7 | 2.5 | 2.2 | 2.5 | 3.3 | 128–151 |
+| 2^20 | 14.9 | 8.6 | 6.1 | 5.8 | 4.9 | 5.7 | 144–151 |
+| 2^22 | 57.0 | 37.4 | 21.4 | 20.5 | 24.7 | 19.6 | 152–317 |
+| 2^23 | 108.7 | 81.1 | 65.7 | 47.9 | 50.0 | 43.6 | 152–261 |
+
+One thread proves 2^20 in 47 s (about 22k rows a second), and 16 threads at about 150–200k rows a second, which more threads barely improve on this shared host. Chonk accumulates a Mega app at about 260k of bb's gates a second on 16 threads (`app_quote`, 590,719 gates, in 2.28 s), and its cost follows the gate count rather than the power of two above it (`app_trade`, 236,815 gates, 0.87 s).
+
+*Three overheads the proofs did not need,* removed before comparing aggregation:
+
+- bb.js's `generateProof` hands bb an empty VK, so every proof recomputed its VK, and `verifyProof` recomputed it again before checking. The prover now passes the build's VK to both: the root's proof fell from 76 to 57 s and its check from about a minute to under 0.1 s; a `seg_quote` proof from 16.4 to 5.5 s and a merge from 18.8 to 8.8 s, at lower host load.
+- noir_js executed every circuit's witness on the service's main thread, one after another: 54.5 s for a 23-segment run. A pool of worker threads (`exec_pool.ts`) cut it to 4.4 s.
+
+*One batch,* `npm run prove-bench -- 16 16 4 6 16`: 1,026 signed actions in 95 segments (47 `seg_quote`, 32 `seg_trade`, 16 `seg_block`) on six provers, host load 85–160:
+
+| Aggregation | Wall, close to root | Prover work | Proofs |
+| --- | --- | --- | --- |
+| Merge tree (P2.26, VK fix included) | 285.7 s | 1,228 s | 95 segments (quote 5.5 s, trade 2.5 s, block 1.9 s), 93 merges at 8.8 s, root 47 s |
+| Chonk, 3 runs of 31–32 | 132.0 s | 250 s | runs 50–55 s of accumulation and 1.6 s of decider, batch tubes 8.5 s, 1 merge 8.1 s, root 56 s |
+| Chonk, 5 runs of 19 (greedy split) | 138.0 s | 331 s | runs 43–49 s, batch tubes 8.4 s, 3 merges, root 50 s |
+
+Accumulation by circuit: `app_quote` 2.28 s, `app_trade` 0.87 s, `app_block` 0.62 s, `bk_inner` 0.29 s, `bk_init` 0.24 s, `app_pad` 0.08 s, `bk_tail` 1.17 s, `bk_hiding` 0.04 s. Folding costs the prover almost nothing; what is left of aggregation is a batch tube per run, merges between runs, and the root. On 234 actions (23 segments) the batch went from 350 s to 123 s.
+
+*End to end,* P2.27's run repeated: the operator with 100 demo accounts, a block every 5 s and a batch every 30 s, driven at 2 signed actions a second, and the proving service streaming each batch's segments into Chonk runs of 20 on six provers (`--agg stream`). Six consecutive batches (56–64 actions, 16–20 segments each) were proved 77–82 s after they closed, mean 78 s, at host load 130–170, against about 14 minutes in P2.27. The root (55–61 s) is three quarters of the lag.
+
+*Constraint budget for 1,024 actions* (`bench/lag_model.py bench/results/model-inputs.json`, the 95-segment batch above, bb's gate counts):
+
+| | Execution | Aggregation | Aggregation a folded proof |
+| --- | --- | --- | --- |
+| Merge tree | 69.0M (UltraHonk segments) | 146.0M: 93 merges at 1,479,769, root 8,388,352 | 740k |
+| Chonk, 3 runs | 38.0M (the same segments as Mega apps) | 15.7M: kernels 1.41M, batch tubes 4.42M, one merge 1.48M, root 8.39M | 11k |
+
+bb counts each segment's Mega build at about 55% of its UltraHonk count (`app_quote` 590,719 against 1,043,851, both finalized). Aggregation falls from twice the execution to 40% of it, and 8.4M of what remains is the root, whose full IPA verification of the ECCVM's 2^15-point claim is about three quarters of its size: a fixed cost a batch, whatever its size. Folding alone, the part that grows with the batch, is under 1.5M gates for 1,024 actions, about 1.4k gates an action.
+
+*Critical path after the close,* with a prover for every run (model, calibrated on the runs above): merge tree 112 s (a segment, five merge levels, the root), with 1,215 s of work; Chonk in 3 runs 127 s with 250 s of work, at best about 103 s in many small runs at twice the work; streamed, about 78 s (the open run's last segments and decider, its batch tube, the root).
+
+*Speedup needed.* An F1 lag under five minutes needs two things: the path after the close under 300 s, and provers that keep up, `work a batch ≤ N · S · period`. With streaming, the path is 78–154 s on today's CPU prover from 2 to 5,000 actions a second (more runs add merge levels), so the target binds only through throughput. Proving costs about 0.19 prover-seconds an action (the measured mix; 0.08 for a quote, 0.44 for a taker, 0.62 a block), plus a root a batch. The core-prover speedup S over one 16-thread CPU prover, for N provers and a batch every 72 s (D10):
+
+| Rate (actions/s) | Actions a batch | Runs | Path at S = 1 | N = 1 | N = 6 | N = 16 | N = 64 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2 | 144 | 1 | 78 s | 1.2× | ≤ 1× | ≤ 1× | ≤ 1× |
+| 14 | 1,008 | 3 | 86 s | 3.4× | ≤ 1× | ≤ 1× | ≤ 1× |
+| 100 | 7,200 | 15 | 103 s | 19× | 3.2× | 1.2× | ≤ 1× |
+| 1,000 | 72,000 | 149 | 137 s | 189× | 31× | 12× | 2.9× |
+| 5,000 | 360,000 | 741 | 154 s | 940× | 157× | 59× | 15× |
+
+So a batch of 1,024 actions already proves within the target on this host's CPU (132 s on six provers, about 80 s streamed). The §14 throughput target of 5,000 actions a second needs about 940 CPU provers of 16 threads, or a prover 59 times faster than one of them across sixteen GPUs, 15 times across 64. At S = 15 the streamed lag would be about 10 s. Execution, not aggregation, is now 85% of the work, so packing and cheaper taker slots (§15) lower every figure in proportion.
 
 Measure before fixing circuit shapes (M1–M4 above are first P0 results):
 
@@ -1626,11 +1703,25 @@ Gate counts are for the P2.3 build. P2.3 added 27% to `seg_trade`: each action p
 - **Native**, batch 6: Grace's second P-segment revokes her session key and withdraws 100,000 by client proof. The engine refuses a third proof, for a withdrawal beyond her collateral. Conservation holds with the withdrawal, and the DA reopens her account after it.
 - **Adversarial:** 3 more tube witnesses, 60 in all: a withdrawal sent to another recipient, a withdrawal above the collateral, and a withdrawal published under another key. The case of a proof whose action kind is not allowed now uses an order.
 
+**Chonk batch aggregation** (P2.28, §9.2):
+
+- **Circuits.** `app_<kind>` for each X-segment kind, generated by `build.ts` from `seg_<kind>` with `-> return_data NodeOutput`; `app_pad`; `bk_init`, `bk_inner`, `bk_tail` and `bk_hiding`, with the checks in `l3x_types::batch`; `btube`. VK roles 6 (segment apps) and 7 (batch kernels and `app_pad`); `btube` in the tube role.
+- **Prover.** `ChonkStream` drives bb's incremental Chonk calls (`chonkStart` with the run's circuit kinds, then `chonkLoad` and `chonkAccumulate` a circuit at a time, then `chonkProve`): segments' witnesses execute on worker threads as they arrive, and their accumulation follows in order. `Prover.chonkRun` proves a run at once; `proveBatchChonk(pool, w, runApps)` splits each block of consecutive X-segments into the fewest runs of at most `runApps`, of near-equal size, proves them on the pool, then the merge tree over runs and tubes and the root; `BatchStream` does the same while the batch is open (§9.2, Streaming).
+- **Proofs.** `Prover.ultraProve` proves and checks UltraHonk with the build's VK (bb.js's backend recomputed it for every proof and every check).
+- **Service.** `prover.ts --agg stream` (the default) streams each batch into runs of `--run-apps` (20); `--agg chonk` and `--agg merge` prove after the close.
+- **Measurement.** `bench/` (prover throughput by size and threads; `lag_model.py`); `prove-bench` with `AGG=chonk`. Results in §14.
+
+**Tests** (P2.28):
+
+- **Native** proves every other batch with Chonk aggregation in runs of at most three segments, so padding apps, several runs, merges over runs and P-segment tubes between runs are all proved (7 of the 15 batches); every output equals the engine's and every receipt's path folds to its batch's root through the new shape. An out-of-order run is refused by `bk_init` ("apps do not chain").
+- **Every suite** passes: native, e2e, l1bridge, adversarial, VK substitution, prove, M1, operator, sequencer and native checks, circuits and contracts.
+- **End to end**, by hand: six streamed batches (§14).
+
 **Next increments.** The operator's next steps are proving throughput and F1 latency (§14):
 
-1. Packing. In sequence order, quotes, takers and blocks interleave, so at low rates segments are nearly empty. Options: maker-first ordering within an L3 block (cancels and resting orders before takers, as some exchanges do), which keeps receipts per action only if sequence numbers are reserved by class; a block folded into the segment after it; and time-only blocks dropped when no action falls between them.
+1. Packing, now the largest lever: since P2.28 execution is 85% of proving. In sequence order, quotes, takers and blocks interleave, so at low rates segments are nearly empty. Options: maker-first ordering within an L3 block (cancels and resting orders before takers, as some exchanges do), which keeps receipts per action only if sequence numbers are reserved by class; a block folded into the segment after it; and time-only blocks dropped when no action falls between them.
 2. A taker segment: a slot that only places with fills, without the cancellation, trigger, transfer and key branches every `seg_trade` slot pays for, eight to a 2^20 proof.
-3. Wider merges, or larger leaves, since the merge tree is now the largest share of proving.
+3. A root without the second IPA claim: bb's root-rollup verifier requires exactly two, so a batch of one run pays for a padding segment, and the root (2^23, three quarters IPA verification) is most of the remaining lag. A prover with more threads for the root alone (2^23 in 44–48 s on 32–128 threads against 66 s on 16).
 4. The settler: settling each proved batch on Aztec as the service proves it.
 
 v1 scope (§1, §7, §8) not yet built, each with a policy choice to settle first:

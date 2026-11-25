@@ -53,7 +53,7 @@ export const SHAPE = {
 } as const;
 
 /** VK tree roles (SPEC.md §9.3); leaf index = role * VK_ROLE_SLOTS + slot. */
-export const ROLE = { CLIENT: 0, CHONK: 1, TUBE: 2, SEGMENT: 3, MERGE: 4, SEGMENT2: 5 } as const;
+export const ROLE = { CLIENT: 0, CHONK: 1, TUBE: 2, SEGMENT: 3, MERGE: 4, SEGMENT2: 5, SEGMENT_APP: 6, BATCH: 7 } as const;
 
 export function run(cmd: string, args: string[], cwd = CIRCUITS): string {
   return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 });

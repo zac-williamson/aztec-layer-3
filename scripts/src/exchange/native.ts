@@ -4,7 +4,7 @@
 // every batch, and every account is then reconstructed and opened from the DA payloads alone.
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
-import { type BatchWitness, type ProvedBatch, Prover, assert, executeBatch, foldReceipt, newApi, proveBatch, receiptLeaf, receiptPath } from '../pipeline.ts';
+import { type BatchWitness, type ProvedBatch, Prover, ProverPool, assert, executeBatch, foldReceipt, newApi, proveBatch, proveBatchChonk, receiptLeaf, receiptPath } from '../pipeline.ts';
 import { decodeBatch, displayedBook, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
@@ -46,9 +46,26 @@ async function main() {
   const prover = await Prover.create(api, manifest, await M.paramsHash(h, params));
   const settled: ProvedBatch[] = [];
   let receiptCount = 0;
-  /** Proves (or executes) a batch, then checks every receipt's path to its receipts root (SPEC.md §11). */
+  const pool = new ProverPool([prover]);
+  let chonkChecked = false;
+  /**
+   * Proves (or executes) a batch, then checks every receipt's path to its receipts root (SPEC.md §11).
+   * Every other batch is proved with Chonk aggregation (P2.28) in runs of at most three segments,
+   * so runs, padding apps, P-segments between runs and merges over runs are all exercised.
+   */
   const settle = async (w: BatchWitness) => {
-    const b = await (EXECUTE_ONLY ? executeBatch(prover, w, log) : proveBatch(prover, w, log));
+    const chonk = !EXECUTE_ONLY && settled.length % 2 === 1;
+    if (chonk && !chonkChecked && w.segments.filter((s) => s.pkg !== 'tube').length >= 2) {
+      // A run whose apps do not chain is refused by the batch kernel.
+      const xs = w.segments.filter((s) => s.pkg !== 'tube');
+      let refused = '';
+      await prover.chonkRun([xs[1], xs[0]], () => {}).catch((e) => (refused = String(e.message ?? e)));
+      assert(refused.includes('apps do not chain'), `out-of-order Chonk run not refused (${refused})`);
+      chonkChecked = true;
+      log('  chonk: an out-of-order run is refused (apps do not chain)');
+    }
+    const b = await (EXECUTE_ONLY ? executeBatch(prover, w, log) : chonk ? proveBatchChonk(pool, w, 3, log) : proveBatch(prover, w, log));
+    if (chonk) log(`  chonk aggregation: ${b.shape}`);
     for (const r of engine.receipts) {
       const p = await receiptPath(api, b, r.segment, r.slot);
       assert(p.depth <= 24, 'receipt path too deep');
