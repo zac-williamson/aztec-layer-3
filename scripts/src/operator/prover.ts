@@ -6,7 +6,8 @@
 //
 // Usage: node src/operator/prover.ts --journal path [--provers 6] [--threads 16] [--from 2]
 //                                     [--batches N] [--idle-exit 60] [--agg stream|chonk|merge]
-//                                     [--run-apps 20]
+//                                     [--run-apps 20] [--root-threads 0]
+//   --root-threads: a separate prover of that many threads for roots (0: roots use the pool).
 //   --agg: stream (default, P2.28) folds each batch's segments into Chonk runs of --run-apps
 //   apps as the engine closes them, while the batch is open; chonk does the same once the batch
 //   has closed; merge is P2.27's RollupHonk merge tree over every segment.
@@ -31,6 +32,7 @@ const { values: a } = parseArgs({
     'idle-exit': { type: 'string', default: '60' },
     agg: { type: 'string', default: 'stream' },
     'run-apps': { type: 'string', default: '20' },
+    'root-threads': { type: 'string', default: '0' },
   },
 });
 const log = (m: string) => console.log(`[prover] ${m}`);
@@ -40,9 +42,9 @@ const manifest = readJson(join(OUT, 'manifest.json'));
 const api = await newApi();
 const h = M.hasher(api);
 const { params } = await testParams(h);
-const pool = await ProverPool.create(Number(a.provers), Number(a.threads), manifest, await M.paramsHash(h, params));
+const pool = await ProverPool.create(Number(a.provers), Number(a.threads), manifest, await M.paramsHash(h, params), Number(a['root-threads']));
 const rep = await Replayer.create(api, pool.provers[0]);
-log(`${a.provers} provers × ${a.threads} threads, ${a.agg} aggregation; following ${journal}`);
+log(`${a.provers} provers × ${a.threads} threads${a['root-threads'] !== '0' ? `, a root prover of ${a['root-threads']}` : ''}, ${a.agg} aggregation; following ${journal}`);
 
 type Done = { batch: string; actions: number; segments: number; provingMs: number; lagFromOpenMs: number; lagFromCloseMs: number };
 const done: Done[] = [];

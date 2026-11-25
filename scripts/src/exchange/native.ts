@@ -4,7 +4,7 @@
 // every batch, and every account is then reconstructed and opened from the DA payloads alone.
 import { join } from 'node:path';
 import { OUT, hex, randomField, readJson, writeJson } from '../lib.ts';
-import { type BatchWitness, type ProvedBatch, Prover, ProverPool, assert, executeBatch, foldReceipt, newApi, proveBatch, proveBatchChonk, receiptLeaf, receiptPath } from '../pipeline.ts';
+import { type BatchWitness, BatchStream, type ProvedBatch, Prover, ProverPool, assert, executeBatch, foldReceipt, newApi, proveBatch, proveBatchChonk, receiptLeaf, receiptPath } from '../pipeline.ts';
 import { decodeBatch, displayedBook, openAccount, rebuildAccounts } from './da.ts';
 import { Engine, proveAction, signAction, signUpdate } from './engine.ts';
 import { keysFromSeed } from './grumpkin.ts';
@@ -50,8 +50,10 @@ async function main() {
   let chonkChecked = false;
   /**
    * Proves (or executes) a batch, then checks every receipt's path to its receipts root (SPEC.md §11).
-   * Every other batch is proved with Chonk aggregation (P2.28) in runs of at most three segments,
-   * so runs, padding apps, P-segments between runs and merges over runs are all exercised.
+   * Every other batch is proved with Chonk aggregation (P2.28): alternately in runs of at most
+   * three segments, so runs, padding apps, P-segments between runs and merges over runs are all
+   * exercised, and streamed segment by segment into runs of capacity ten, whose unused groups are
+   * all padding.
    */
   const settle = async (w: BatchWitness) => {
     const chonk = !EXECUTE_ONLY && settled.length % 2 === 1;
@@ -64,8 +66,14 @@ async function main() {
       chonkChecked = true;
       log('  chonk: an out-of-order run is refused (apps do not chain)');
     }
-    const b = await (EXECUTE_ONLY ? executeBatch(prover, w, log) : chonk ? proveBatchChonk(pool, w, 3, log) : proveBatch(prover, w, log));
-    if (chonk) log(`  chonk aggregation: ${b.shape}`);
+    const streamed = chonk && settled.length % 4 === 3;
+    const stream = () => {
+      const st = new BatchStream(pool, 10, log);
+      for (const seg of w.segments) st.push(seg);
+      return st.finish(w);
+    };
+    const b = await (EXECUTE_ONLY ? executeBatch(prover, w, log) : streamed ? stream() : chonk ? proveBatchChonk(pool, w, 3, log) : proveBatch(prover, w, log));
+    if (chonk) log(`  chonk aggregation${streamed ? ', streamed' : ''}: ${b.shape}`);
     for (const r of engine.receipts) {
       const p = await receiptPath(api, b, r.segment, r.slot);
       assert(p.depth <= 24, 'receipt path too deep');

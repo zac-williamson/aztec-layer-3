@@ -632,10 +632,13 @@ export function mergeShape(leaves: ReceiptShape[]): ReceiptShape {
   return [level[0], level[1]];
 }
 
-/** A Chonk run over `segments` (l3x_types::batch): groups of five, padded, chained left to right. */
-export function chonkRunShape(segments: number[]): ReceiptShape {
+/**
+ * A Chonk run over `segments` (l3x_types::batch): groups of five, chained left to right, padded
+ * with empty slots up to the run's capacity (a streamed run's unused groups are all padding).
+ */
+export function chonkRunShape(segments: number[], capacity = Math.ceil(segments.length / APPS_PER_KERNEL) * APPS_PER_KERNEL): ReceiptShape {
   let acc: ReceiptShape | undefined;
-  for (let i = 0; i < segments.length; i += APPS_PER_KERNEL) {
+  for (let i = 0; i < capacity; i += APPS_PER_KERNEL) {
     const g: ReceiptShape[] = segments.slice(i, i + APPS_PER_KERNEL);
     while (g.length < APPS_PER_KERNEL) g.push(null);
     const group: ReceiptShape = [[[g[0], g[1]], [g[2], g[3]]], g[4]];
@@ -880,20 +883,43 @@ export class ChonkStream {
  */
 export class ProverPool {
   readonly provers: Prover[];
+  /**
+   * A prover kept for roots (P2.28), usually with more threads: the root is a fixed 2^23 proof on
+   * every batch's critical path. Without one, roots take a pool prover.
+   */
+  readonly rootProver?: Prover;
   private free: Prover[];
   private waiting: ((p: Prover) => void)[] = [];
+  private rootBusy = false;
 
-  constructor(provers: Prover[]) {
+  constructor(provers: Prover[], rootProver?: Prover) {
     this.provers = provers;
+    this.rootProver = rootProver;
     this.free = [...provers];
   }
 
-  /** `n` provers whose bb processes use `threads` threads each. */
-  static async create(n: number, threads: number, manifest: any, paramsHash?: bigint): Promise<ProverPool> {
+  /** `n` provers whose bb processes use `threads` threads each, and a root prover of `rootThreads` if not 0. */
+  static async create(n: number, threads: number, manifest: any, paramsHash?: bigint, rootThreads = 0): Promise<ProverPool> {
     const { Barretenberg } = await import('@aztec-foundation/bb.js');
     const provers: Prover[] = [];
     for (let i = 0; i < n; i++) provers.push(await Prover.create(await Barretenberg.new({ threads }), manifest, paramsHash));
-    return new ProverPool(provers);
+    const root = rootThreads ? await Prover.create(await Barretenberg.new({ threads: rootThreads }), manifest, paramsHash) : undefined;
+    return new ProverPool(provers, root);
+  }
+
+  /**
+   * Runs `f` on the root prover when it is idle, else on a pool prover: one root prover cannot keep
+   * up when roots take longer than the batch interval.
+   */
+  async runRoot<T>(f: (p: Prover) => Promise<T>): Promise<T> {
+    const rp = this.rootProver;
+    if (!rp || this.rootBusy) return this.run(f);
+    this.rootBusy = true;
+    try {
+      return await f(rp);
+    } finally {
+      this.rootBusy = false;
+    }
   }
 
   /** Lends a prover until `release`, waiting for one if all are lent. */
@@ -918,6 +944,7 @@ export class ProverPool {
 
   async destroy() {
     for (const p of this.provers) await p.api.destroy();
+    if (this.rootProver) await this.rootProver.api.destroy();
   }
 }
 
@@ -986,7 +1013,7 @@ async function mergeAndRoot(pool: ProverPool, w: BatchWitness, leafPs: Promise<P
     shape = nextShape;
   }
   const top = await Promise.all(level);
-  const root = await pool.run((p) => p.proveRoot(p.rootInputs(top[0], top[1], w.endState, w.withdrawalRecords, w.batchNumber)));
+  const root = await pool.runRoot((p) => p.proveRoot(p.rootInputs(top[0], top[1], w.endState, w.withdrawalRecords, w.batchNumber)));
   assert(root.verified, 'root proof does not verify');
   ms.root_prove = root.ms;
   console.log(`  root: witness ${(root.execMs / 1000).toFixed(1)} s, proof ${(root.ms / 1000).toFixed(1)} s, check ${(root.verifyMs / 1000).toFixed(1)} s`);
@@ -1139,7 +1166,7 @@ export class BatchStream {
       const first = run.segs[0];
       const last = run.segs[run.segs.length - 1];
       const tube = w.segments[first].pkg === 'tube';
-      const receiptsRoot = tube ? roots[first] : await foldShape(this.pool.provers[0].api, chonkRunShape(run.segs), roots);
+      const receiptsRoot = tube ? roots[first] : await foldShape(this.pool.provers[0].api, chonkRunShape(run.segs, this.capacity), roots);
       const start = first === 0 ? w.start : w.segments[first - 1].expectedEnd;
       const got = nodeFields(node.out);
       const want = nodeFields({ configHash, start, end: w.segments[last].expectedEnd, receiptsRoot });
@@ -1151,7 +1178,7 @@ export class BatchStream {
     const { top, shape, root } = await mergeAndRoot(this.pool, w, leafPs, names, this.ms);
     const leaves = await Promise.all(leafPs);
     const end = performance.now();
-    const receiptShape = mergeShape(this.runs.map((run) => (w.segments[run.segs[0]].pkg === 'tube' ? run.segs[0] : chonkRunShape(run.segs))));
+    const receiptShape = mergeShape(this.runs.map((run) => (w.segments[run.segs[0]].pkg === 'tube' ? run.segs[0] : chonkRunShape(run.segs, this.capacity))));
     return { ...(await finishBatch(this.pool.provers[0], w, leaves, top, shape, root, this.ms, receiptShape)), wallMs: end - this.t0, closeToRootMs: end - tClose };
   }
 }
