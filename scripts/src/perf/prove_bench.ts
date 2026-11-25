@@ -23,6 +23,7 @@ const h = M.hasher(api);
 const { params, oracleSks } = await testParams(h);
 const pool = await ProverPool.create(PROVERS, THREADS, manifest, await M.paramsHash(h, params), Number(process.env.ROOT_THREADS ?? 0));
 const engine = await Engine.create(api, params, BigInt(manifest.vkTree.root), await protocolAccounts(h), pool.provers[0].clientVks);
+engine.takeSegments = process.env.TAKE !== '0';
 const users = await Promise.all([...Array(MAKERS + TAKERS).keys()].map(async (i) => ({ index: BigInt(2 + i), addr: randomField(), keys: await keysFromSeed(h, 3000n + BigInt(i)) })));
 
 // Genesis batch (not timed): registrations and deposits.

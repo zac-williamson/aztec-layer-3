@@ -79,9 +79,13 @@ type BookOrder = X.Order & { market: bigint };
 
 const PRIORITY_PER_SEGMENT = 4;
 const TRADE_PER_SEGMENT = 2;
+/** seg_take (P2.29): PlaceOrder actions per segment, and the leaves of its receipts tree. */
+const TAKE_PER_SEGMENT = 4;
 /** seg_quote (P2.25): signed actions per segment, and the leaves of its receipts tree. */
 const QUOTES_PER_SEGMENT = 30;
 const QUOTE_RECEIPT_LEAVES = 32;
+/** seg_quote8 (P2.29): seg_quote with 8 slots, for short runs (quotes interleaved with takers). */
+const QUOTES_PER_SHORT = 8;
 const UPDATES_PER_BLOCK = 4;
 const REFRESH_PER_SEGMENT = 4;
 const CLEANUPS_PER_SEGMENT = 4;
@@ -158,6 +162,10 @@ export class Engine {
    * DA nonce depends on its action log, so the segment opens after its actions are chosen.
    */
   private daDefer?: bigint[];
+  /** Runs of non-quote orders go to seg_take (P2.29); off, they go to seg_trade two at a time. */
+  takeSegments = true;
+  /** A run of at most eight quotes goes to seg_quote8 (P2.29). */
+  shortQuotes = true;
   /**
    * Whether `trade` puts runs of quote actions in seg_quote segments (P2.25). Tests that build
    * seg_trade witnesses of quote actions turn it off.
@@ -1135,7 +1143,8 @@ export class Engine {
       await this.absorb(M.TAG.SEG);
       await this.absorb(daNonce);
       for (const x of deferred) await this.absorb(x);
-      const leaves = Array<bigint>(QUOTE_RECEIPT_LEAVES).fill(0n);
+      const short = this.shortQuotes && taken.length <= QUOTES_PER_SHORT;
+      const leaves = Array<bigint>(short ? QUOTES_PER_SHORT : QUOTE_RECEIPT_LEAVES).fill(0n);
       for (const [i, a] of taken.entries()) {
         leaves[i] = await this.h([DS0.RECEIPT, a.seq!, msgs[i]]);
         this.receipts.push({ msg: msgs[i], seq: a.seq!, segment: this.segments.length, slot: i });
@@ -1146,9 +1155,9 @@ export class Engine {
         return (a.kind === K.CANCEL_ALL ? 'cancel all' : `${a.kind === K.PLACE ? 'place' : a.kind === K.CANCEL ? 'cancel' : 'modify'} m${a.p[0]}`) + by;
       };
       await this.finishSegment(
-        'seg_quote',
+        short ? 'seg_quote8' : 'seg_quote',
         `quote [${taken.map(label).join(', ')}]`,
-        { ...this.base(start, before), n: taken.length, actions: pad(items, QUOTES_PER_SEGMENT, () => this.emptyQuote()) },
+        { ...this.base(start, before), n: taken.length, actions: pad(items, short ? QUOTES_PER_SHORT : QUOTES_PER_SEGMENT, () => this.emptyQuote()) },
         leaves,
       );
       return;
@@ -1305,15 +1314,20 @@ export class Engine {
         await this.quoteSegment(queue);
         continue;
       }
-      // Fill a segment from the queue; a rejected action is dropped and its slot refilled. A second
-      // action joins only if it is not of a kind seg_quote takes.
+      // Runs of orders that are not quotes (they fill, or never rest) go to seg_take (P2.29), whose
+      // slots only place. Like seg_quote, it is off when quote segments are.
+      const take = this.quoteSegments && this.takeSegments && queue[0].kind === X.KIND_ACT.PLACE;
+      const slots = take ? TAKE_PER_SEGMENT : TRADE_PER_SEGMENT;
+      const joins = (a: SignedAction) =>
+        take ? a.kind === X.KIND_ACT.PLACE && !this.quoteEligible(a) : !this.quoteSegments || (!quoteKind(a) && (a.kind !== X.KIND_ACT.PLACE || !this.takeSegments));
+      // Fill a segment from the queue; a rejected action is dropped and its slot refilled.
       const batch: SignedAction[] = [];
       for (;;) {
-        while (batch.length < TRADE_PER_SEGMENT && queue.length && (batch.length === 0 || !this.quoteSegments || !quoteKind(queue[0]))) batch.push(queue.shift()!);
+        while (batch.length < slots && queue.length && (batch.length === 0 || joins(queue[0]))) batch.push(queue.shift()!);
         if (!batch.length) break;
         const snap = this.snapshot();
         try {
-          await this.tradeSegment(batch);
+          await this.tradeSegment(batch, take ? 'seg_take' : 'seg_trade');
           break;
         } catch (e: any) {
           this.restore(snap);
@@ -1325,7 +1339,8 @@ export class Engine {
     }
   }
 
-  private async tradeSegment(actions: SignedAction[]) {
+  private async tradeSegment(actions: SignedAction[], pkg: 'seg_trade' | 'seg_take' = 'seg_trade') {
+    const slots = pkg === 'seg_take' ? TAKE_PER_SEGMENT : TRADE_PER_SEGMENT;
     const start = copyRunning(this.running);
     const before = this.state();
     const r = this.running;
@@ -1337,7 +1352,7 @@ export class Engine {
     await this.absorb(daNonce);
     const items: unknown[] = [];
     // Each action gets the next sequence number and a receipt leaf (SPEC.md §11).
-    const leaves = [0n, 0n];
+    const leaves = Array<bigint>(slots).fill(0n);
     for (const [i, a] of actions.entries()) {
       a.seq = ++this.lastSeq;
       const msg = await X.actionMsg(this.h, this.domain, a.kind, a.account, a.keyId, a.nonce, a.p);
@@ -1375,9 +1390,9 @@ export class Engine {
       return (book ? `${book} m${a.p[0]}` : names[a.kind.toString()]) + by;
     });
     await this.finishSegment(
-      'seg_trade',
-      `trade [${labels.join(', ')}]`,
-      { ...this.base(start, before), n: actions.length, actions: pad(items, TRADE_PER_SEGMENT, () => this.emptyAction()) },
+      pkg,
+      `${pkg === 'seg_take' ? 'take' : 'trade'} [${labels.join(', ')}]`,
+      { ...this.base(start, before), n: actions.length, actions: pad(items, slots, () => this.emptyAction()) },
       leaves,
     );
   }

@@ -115,6 +115,8 @@ async function main() {
   t = clone(buy);
   t.actions[0].pk_x = hex(users[2].pk!.x);
   t.actions[0].pk_y = hex(users[2].pk!.y);
+  // A valid signature by that key: what refuses it is the binding to the account.
+  t.actions[0].sig = sigToNoir(await sign(h, users[2].sk, await X.actionMsg(h, engine.domain, PLACE, idx(1), M.MASTER_KEY, 1n, t.actions[0].p.map((x: string) => BigInt(x)))));
   await expectFail("another account's key", 'seg_trade', t, "signing key is not the account's");
   // The operator swaps in its own key as the account's master authorization, for an order with no
   // fill (no other leaf write would expose it).
@@ -154,6 +156,21 @@ async function main() {
   t = clone(buy);
   await resign(t, 0, 1, 1n, PLACE, [0n, BID, 2200n, 5n, IOC, 0n]);
   await expectFail('limit price outside the band', 'seg_trade', t, 'limit price outside the band');
+
+  // seg_take (P2.29) takes seg_trade's witness slot for slot, in four slots, and only places.
+  const takeOf = (inputs: any) => {
+    const x = clone(inputs);
+    x.actions = [...x.actions, ...Array.from({ length: 4 - x.actions.length }, () => clone(x.actions[x.actions.length - 1]))];
+    return x;
+  };
+  await execute('seg_take', takeOf(buy));
+  t = takeOf(buy);
+  t.actions[0].sig.s = scalarToNoir(12345n);
+  await expectFail('seg_take: forged signature', 'seg_take', t);
+  t = takeOf(buy);
+  Object.assign(t.actions[0].fills[0], { index: hex(worse), price: '2001', seq: '1', book_path: worsePath });
+  await expectFail('seg_take: fill skips the best ask', 'seg_take', t, 'not the best ask');
+  await expectFail('seg_take: a withdrawal in a taker segment', 'seg_take', takeOf(quiet), 'a taker segment only places orders');
 
   // Order types: the same partial fill re-signed with a different time in force or flag.
   t = clone(buy);
@@ -798,6 +815,7 @@ async function main() {
 
   // Quote segments (P2.25): an honest resting bid and an honest cancellation, then tampered with.
   engine.quoteSegments = true;
+  engine.shortQuotes = false; // these runs are short; seg_quote8 gets the same witnesses below
   const nonceOf = (u: number) => engine.actv.get(idx(u))!.nonce;
   await engine.trade([await act(0, nonceOf(0) + 1n, PLACE, [0n, ASK, 2005n, 5n, GTC, 0n])]); // an ask for the crossing case
   const bestAsk = [...engine.orders[0].values()].filter((o) => o.side === ASK).reduce((m, o) => (o.price < m ? o.price : m), X.MAX_PRICE);
@@ -828,6 +846,16 @@ async function main() {
   t = clone(cancelQ);
   t.actions[0].order_lots = '1';
   await expectFail('a cancellation that misstates the order', 'seg_quote', t, 'book path does not match root');
+  // seg_quote8 (P2.29): seg_quote with eight slots, over the same witnesses' first eight.
+  const short = (x: any) => ({ ...clone(x), actions: x.actions.slice(0, 8) });
+  await execute('seg_quote8', short(quote));
+  t = short(quote);
+  await resign(t, 0, 1, nq, PLACE, [0n, BID, bestAsk, 2n, GTC, 0n]);
+  t.actions[0].book_path = crossPath;
+  await expectFail('seg_quote8: a quote that would fill', 'seg_quote8', t, 'the order would fill');
+  t = short(quote);
+  t.n = '9';
+  await expectFail('seg_quote8: nine actions', 'seg_quote8', t, 'too many actions');
 
   for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.name}  (${r.how})`);
   console.log(`${results.filter((r) => r.pass).length}/${results.length} rejected as intended`);

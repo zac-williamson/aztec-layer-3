@@ -13,18 +13,20 @@ pub global APPS_PER_KERNEL: u32 = 5;
 /// Segment apps: the role-3 segments' Mega builds, slot for slot, and seg_quote's at slot 0
 /// (padding, slot 0 of role 3, has no app: a kernel group is padded with APP_PAD instead).
 pub global ROLE_SEGMENT_APP: u32 = 6;
-/// Batch kernels and the padding app.
+/// Batch kernels in slots 0–2; apps in slots 3–7: the padding app, then segment apps beyond role
+/// 6's eight (P2.29: app_take in slot 4).
 pub global ROLE_BATCH: u32 = 7;
 pub global SLOT_BK_INIT: u32 = 0;
 pub global SLOT_BK_INNER: u32 = 1;
 pub global SLOT_BK_TAIL: u32 = 2;
 pub global SLOT_APP_PAD: u32 = 3;
 
-/// A kernel's app: any segment app, or the padding app.
+/// A kernel's app: any segment app (role 6, or role 7 from the padding app's slot on).
 pub fn assert_app_vk(vk_hash: Field, m: VkMembership, vk_tree_root: Field) {
     let role = m.index / VK_ROLE_SLOTS;
+    let slot = m.index % VK_ROLE_SLOTS;
     assert(
-        (role == ROLE_SEGMENT_APP) | (m.index == ROLE_BATCH * VK_ROLE_SLOTS + SLOT_APP_PAD),
+        (role == ROLE_SEGMENT_APP) | ((role == ROLE_BATCH) & (slot >= SLOT_APP_PAD)),
         "app VK role not allowed",
     );
     assert(vk_tree_root_from(vk_hash, m) == vk_tree_root, "app VK not in VK tree");

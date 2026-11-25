@@ -44,6 +44,9 @@ const h = M.hasher(api);
 const { params } = await testParams(h);
 const pool = await ProverPool.create(Number(a.provers), Number(a.threads), manifest, await M.paramsHash(h, params), Number(a['root-threads']));
 const rep = await Replayer.create(api, pool.provers[0]);
+// P2.29's segment choices, switchable for comparisons: TAKE=0 (takers in seg_trade), SHORT_QUOTES=0.
+rep.engine.takeSegments = process.env.TAKE !== '0';
+rep.engine.shortQuotes = process.env.SHORT_QUOTES !== '0';
 log(`${a.provers} provers × ${a.threads} threads${a['root-threads'] !== '0' ? `, a root prover of ${a['root-threads']}` : ''}, ${a.agg} aggregation; following ${journal}`);
 
 type Done = { batch: string; actions: number; segments: number; provingMs: number; lagFromOpenMs: number; lagFromCloseMs: number };

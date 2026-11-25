@@ -1,21 +1,61 @@
 {
-  "_source": "zac-box 2026-11-25, one 16-thread prover each, host load 85-160: prove-bench 16 16 4 6 16 (1,026 actions, 95 segments), merge tree and AGG=chonk RUN_APPS=45; streamed end to end at 2 actions/s (prover.ts --agg stream). Gates from bb gates.",
+  "_source": "zac-box 2026-11-25, one 16-thread prover each, host load 85-160: prove-bench 16 16 4 6 16 (1,026 actions, 95 segments), merge tree and AGG=chonk RUN_APPS=45; streamed end to end at 2 actions/s (prover.ts --agg stream). Gates from bb gates. P2.29: the takers in seg_take (16 segments of four); acc_take 1.00 s measured at a host 12% slower than the rest (app_quote 2.55 against 2.28 s), so 0.89 s here; ultra_take is seg_trade's (same size).",
   "actions_1024": 1026,
-  "mix_1024": { "quote": 47, "trade": 32, "block": 16 },
+  "mix_1024": {
+    "quote": 47,
+    "take": 16,
+    "block": 16
+  },
   "gates": {
-    "seg_quote": 1043851, "seg_trade": 461991, "seg_block": 319862,
-    "app_quote": 590719, "app_trade": 236815, "app_block": 168859,
-    "bk_init": 50010, "bk_inner": 61160, "bk_tail": 15901, "bk_hiding": 36995,
-    "btube": 1474438, "merge": 1479769, "padding": 3675, "root": 8388352
+    "seg_quote": 1043851,
+    "seg_trade": 461991,
+    "seg_block": 319862,
+    "app_quote": 590719,
+    "app_trade": 236815,
+    "app_block": 168859,
+    "bk_init": 50010,
+    "bk_inner": 61160,
+    "bk_tail": 15901,
+    "bk_hiding": 36995,
+    "btube": 1474438,
+    "merge": 1479769,
+    "padding": 3675,
+    "root": 8388352,
+    "seg_take": 451474,
+    "app_take": 246904
   },
   "seconds": {
-    "ultra_quote": 5.5, "ultra_trade": 2.5, "ultra_block": 1.9,
-    "acc_quote": 2.28, "acc_trade": 0.87, "acc_block": 0.62, "acc_pad": 0.08,
-    "acc_bk_init": 0.24, "acc_bk_inner": 0.29, "acc_tail_hiding": 1.21, "decider": 1.6,
-    "btube": 8.5, "merge": 8.5, "padding": 0.5, "root": 56.0,
-    "stream_finish": 13.0
+    "ultra_quote": 5.5,
+    "ultra_trade": 2.5,
+    "ultra_block": 1.9,
+    "acc_quote": 2.28,
+    "acc_trade": 0.87,
+    "acc_block": 0.62,
+    "acc_pad": 0.08,
+    "acc_bk_init": 0.24,
+    "acc_bk_inner": 0.29,
+    "acc_tail_hiding": 1.21,
+    "decider": 1.6,
+    "btube": 8.5,
+    "merge": 8.5,
+    "padding": 0.5,
+    "root": 56.0,
+    "stream_finish": 13.0,
+    "acc_take": 0.89,
+    "ultra_take": 2.5
   },
   "batch_period_s": 72,
-  "rates": [2, 14, 100, 1000, 5000],
-  "pools": [1, 6, 16, 64]
+  "rates": [
+    2,
+    14,
+    100,
+    1000,
+    5000
+  ],
+  "pools": [
+    1,
+    6,
+    16,
+    64
+  ]
 }

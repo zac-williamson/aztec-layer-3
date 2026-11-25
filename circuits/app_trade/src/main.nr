@@ -127,9 +127,11 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
     // keys tree. Either way the signing key's nonce advances by one.
     let msg = action_msg(domain, a.kind, a.account_index, a.key_id, a.nonce, a.p);
     let mut act = a.taker_actv;
+    // One signature check for either key (ACIR evaluates both branches, so a check in each would
+    // cost two); the branches bind (pk_x, pk_y) to the account or to the session-key slot.
+    assert_signed(a.pk_x, a.pk_y, a.sig, msg);
     if a.key_id == MASTER_KEY {
         assert(master_auth_of(a.pk_x, a.pk_y) == a.taker_pub.master_auth, "signing key is not the account's");
-        assert_signed(a.pk_x, a.pk_y, a.sig, msg);
         assert(a.taker_actv.nonce + 1 == a.nonce, "nonce");
         act.nonce = a.nonce;
     } else {
@@ -142,7 +144,6 @@ fn apply(state: State, running: Running, a: Action, da_nonce: Field, params: Par
             (a.key.pk_x == a.pk_x) & (a.key.pk_y == a.pk_y) & ((a.pk_x != 0) | (a.pk_y != 0)),
             "signing key is not the slot's",
         );
-        assert_signed(a.pk_x, a.pk_y, a.sig, msg);
         assert(a.key.nonce + 1 == a.nonce, "nonce");
         assert(running.time <= a.key.expiry, "session key expired");
         assert(a.key.epoch == a.taker_actv.key_epoch, "session key revoked by a rekey");

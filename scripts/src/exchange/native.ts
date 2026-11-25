@@ -81,6 +81,8 @@ async function main() {
       receiptCount++;
     }
     settled.push(b);
+    // Alternate seg_quote8 and seg_quote for short quote runs (P2.29), so both are proved.
+    engine.shortQuotes = !engine.shortQuotes;
     return b;
   };
   const protocol = await protocolAccounts(h);
